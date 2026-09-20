@@ -1,0 +1,67 @@
+name: WebDAV Writeback Tests
+
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "internal/writeback/**"
+      - "server/webdav/**"
+      - "drivers/115_open/**"
+      - "internal/model/webdav_writeback.go"
+      - "internal/conf/**"
+      - ".github/workflows/writeback.yml"
+  push:
+    branches: ["main", "feature/cloudsync-writeback"]
+    paths:
+      - "internal/writeback/**"
+      - "server/webdav/**"
+      - "drivers/115_open/**"
+      - "internal/model/webdav_writeback.go"
+      - "internal/conf/**"
+      - ".github/workflows/writeback.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go writeback tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.27.1"
+          cache: true
+
+      - name: Format check
+        run: |
+          files=(
+            internal/model/webdav_writeback.go
+            internal/writeback/writeback.go
+            internal/writeback/writeback_test.go
+            server/webdav/file.go
+            server/webdav/webdav.go
+            server/webdav/precondition.go
+            server/webdav/precondition_test.go
+            drivers/115_open/driver.go
+            drivers/115_open/types.go
+            drivers/115_open/upload.go
+          )
+          unformatted="$(gofmt -l "${files[@]}")"
+          if [[ -n "$unformatted" ]]; then
+            echo "The following files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Unit and compile tests
+        run: go test ./internal/writeback ./server/webdav ./drivers/115_open
