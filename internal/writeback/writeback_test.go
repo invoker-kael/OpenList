@@ -714,8 +714,11 @@ func TestDirectoryMutationFenceScope(t *testing.T) {
 func TestMarkCanonicalAckedStampsCurrentTakeover(t *testing.T) {
 	old := time.Unix(100, 0)
 	fresh := time.Unix(200, 0)
-	row := &model.WebDAVWritebackObject{CanonicalState: CanonicalStateAcked, DurableAt: &old}
+	row := &model.WebDAVWritebackObject{CanonicalState: CanonicalStateAcked, AckTime: &old, DurableAt: &old}
 	markCanonicalAcked(row, fresh)
+	if row.AckTime == nil || !row.AckTime.Equal(fresh) {
+		t.Fatalf("ack_time = %v, want %v", row.AckTime, fresh)
+	}
 	if row.DurableAt == nil || !row.DurableAt.Equal(fresh) {
 		t.Fatalf("durable_at = %v, want %v", row.DurableAt, fresh)
 	}
@@ -733,6 +736,31 @@ func TestCanonicalStateSeparatesClientAckFromReplication(t *testing.T) {
 	}
 	if !canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: CanonicalStateAcked, State: StateFailed}) {
 		t.Fatal("remote replication failure must not revoke the client ACK")
+	}
+	if !canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: canonicalStateLegacyAck, State: StateFailed}) {
+		t.Fatal("legacy acked rows must migrate logically to DURABLE_ACKED")
+	}
+}
+
+func TestRemoteSyncStateSchemaSeparatesReplicaLifecycle(t *testing.T) {
+	typ := reflect.TypeOf(model.WebDAVWritebackObject{})
+	remote, ok := typ.FieldByName("RemoteSyncState")
+	if !ok || !strings.Contains(remote.Tag.Get("gorm"), "index") {
+		t.Fatal("remote_sync_state must be persisted and indexed independently from canonical_state")
+	}
+	ack, ok := typ.FieldByName("AckTime")
+	if !ok || ack.Type != reflect.TypeOf((*time.Time)(nil)) {
+		t.Fatal("ack_time must persist the Durable ACK commit timestamp")
+	}
+
+	row := &model.WebDAVWritebackObject{State: StateUploading}
+	if got := remoteSyncState(row); got != StateUploading {
+		t.Fatalf("legacy remote state = %q, want %q", got, StateUploading)
+	}
+	row.CanonicalState = CanonicalStateAcked
+	row.RemoteSyncState = StateFailed
+	if !canonicalAcked(row) || remoteSyncState(row) != StateFailed {
+		t.Fatal("remote failure must remain independent from the client Durable ACK")
 	}
 }
 
@@ -777,6 +805,9 @@ func TestReceiveFenceSchemaKeepsPathOrderingDurable(t *testing.T) {
 	}
 	if _, ok := typ.FieldByName("ReceiveLeaseUntil"); !ok {
 		t.Fatal("receive fence must persist a crash-expiring receive lease")
+	}
+	if _, ok := typ.FieldByName("ReceiveState"); !ok {
+		t.Fatal("receive fence must persist the RECEIVING lifecycle across restart")
 	}
 }
 
@@ -2056,7 +2087,7 @@ func TestProviderMoveSourceTombstone(t *testing.T) {
 	}
 }
 
-func TestCanReverifyCompletedDuplicatePut(t *testing.T) {
+func TestCanCoalesceCompletedDuplicatePut(t *testing.T) {
 	sha := strings.Repeat("e", 40)
 	row := &model.WebDAVWritebackObject{
 		Size:        64 * 1024,
@@ -2064,14 +2095,14 @@ func TestCanReverifyCompletedDuplicatePut(t *testing.T) {
 		State:       StateCompleted,
 		PayloadSHA1: sha,
 	}
-	if !canReverifyCompletedDuplicatePut(row, row.Size, strings.ToUpper(sha)) {
-		t.Fatal("completed same-content PUT without a spool should use remote re-verification")
+	if !canCoalesceCompletedDuplicatePut(row, row.Size, strings.ToUpper(sha)) {
+		t.Fatal("completed same-content PUT without a spool should converge as an ACK-only duplicate")
 	}
-	if canReverifyCompletedDuplicatePut(row, row.Size, strings.Repeat("f", 40)) {
+	if canCoalesceCompletedDuplicatePut(row, row.Size, strings.Repeat("f", 40)) {
 		t.Fatal("different encrypted content must create a new canonical generation")
 	}
 	row.State = StateQueued
-	if canReverifyCompletedDuplicatePut(row, row.Size, sha) {
+	if canCoalesceCompletedDuplicatePut(row, row.Size, sha) {
 		t.Fatal("only a completed generation may be revived for duplicate re-verification")
 	}
 
@@ -2079,11 +2110,11 @@ func TestCanReverifyCompletedDuplicatePut(t *testing.T) {
 	row.PayloadSHA1 = ""
 	row.RemoteSHA1 = sha
 	row.RemoteGeneration = row.Generation
-	if !canReverifyCompletedDuplicatePut(row, row.Size, sha) {
+	if !canCoalesceCompletedDuplicatePut(row, row.Size, sha) {
 		t.Fatal("current-generation verified SHA1 should identify duplicate content after spool cleanup")
 	}
 	row.RemoteGeneration--
-	if canReverifyCompletedDuplicatePut(row, row.Size, sha) {
+	if canCoalesceCompletedDuplicatePut(row, row.Size, sha) {
 		t.Fatal("stale remote evidence must not coalesce a newer canonical generation")
 	}
 }

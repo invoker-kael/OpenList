@@ -23,8 +23,10 @@ type WebDAVWritebackObject struct {
 	// CanonicalState is the client-visible lifecycle. State below is retained as
 	// the provider-replication lifecycle so ACKed WebDAV identity cannot flap as
 	// the backing provider moves through queued/uploading/verifying/failed.
-	CanonicalState   string     `json:"canonical_state" gorm:"size:16"`
+	CanonicalState   string     `json:"canonical_state" gorm:"size:24"`
+	AckTime          *time.Time `json:"ack_time"`
 	DurableAt        *time.Time `json:"durable_at"`
+	RemoteSyncState  string     `json:"remote_sync_state" gorm:"size:16;index"`
 	State            string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1"`
 	SpoolPath        string     `json:"spool_path" gorm:"type:text"`
 	PayloadSHA1      string     `json:"payload_sha1" gorm:"size:40"`
@@ -58,6 +60,8 @@ type WebDAVWritebackReceiveFence struct {
 	LatestExpectedSize    int64      `json:"latest_expected_size"`
 	LatestStartedAt       *time.Time `json:"latest_started_at"`
 	ReceiveLeaseUntil     *time.Time `json:"receive_lease_until"`
+	ReceiveState          string     `json:"receive_state" gorm:"size:16;index"`
+	ReceiveUpdatedAt      *time.Time `json:"receive_updated_at"`
 	CreatedAt             time.Time  `json:"created_at"`
 	UpdatedAt             time.Time  `json:"updated_at"`
 }
