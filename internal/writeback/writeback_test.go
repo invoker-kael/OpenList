@@ -933,7 +933,6 @@ func TestCanReverifyCompletedDuplicatePut(t *testing.T) {
 	}
 }
 
-
 func TestApplyDuplicatePutMetadataKeepsContentGenerationStable(t *testing.T) {
 	oldMod := time.Date(2026, time.September, 20, 1, 0, 0, 0, time.UTC)
 	oldCreate := oldMod.Add(-time.Hour)
@@ -961,7 +960,6 @@ func TestApplyDuplicatePutMetadataKeepsContentGenerationStable(t *testing.T) {
 		t.Fatal("metadata-only duplicate PUT must not manufacture a new content generation or ETag")
 	}
 }
-
 
 func TestApplyDuplicatePutMetadataPreservesOmittedTimes(t *testing.T) {
 	oldMod := time.Date(2026, time.September, 20, 1, 0, 0, 0, time.UTC)

@@ -232,7 +232,6 @@ func TestProviderConsistencyConfirmationDelay(t *testing.T) {
 	}
 }
 
-
 func TestRetryMetadataReconciliation(t *testing.T) {
 	attempts := 0
 	err := retryMetadataReconciliation(context.Background(), func() error {
