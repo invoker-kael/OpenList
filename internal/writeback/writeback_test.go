@@ -14,6 +14,72 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
+func TestProviderOperationTreeDepth(t *testing.T) {
+	if got := providerOperationTreeDepth(ProviderOperationMove, 0); got != -1 {
+		t.Fatalf("MOVE tree depth = %d, want infinity", got)
+	}
+	if got := providerOperationTreeDepth(ProviderOperationCopy, 0); got != 0 {
+		t.Fatalf("Depth:0 COPY tree depth = %d, want 0", got)
+	}
+	if got := providerOperationTreeDepth(ProviderOperationCopy, -1); got != -1 {
+		t.Fatalf("recursive COPY tree depth = %d, want infinity", got)
+	}
+}
+
+func TestProviderOperationTreeEvidenceRecoversStartedDirectoryCopy(t *testing.T) {
+	op := &model.WebDAVProviderOperation{
+		Method:           ProviderOperationCopy,
+		State:            ProviderOperationStarted,
+		SourceIsDir:      true,
+		SourceTreeSHA256: strings.Repeat("a", 64),
+	}
+	if got := providerOperationRecoveryDecisionWithEvidence(
+		op,
+		providerOperationRemoteMatch,
+		providerOperationRemoteInconclusive,
+	); got != ProviderOperationRecovered {
+		t.Fatalf("tree-verified STARTED directory COPY = %v, want recovered", got)
+	}
+	op.SourceTreeSHA256 = ""
+	if got := providerOperationRecoveryDecisionWithEvidence(
+		op,
+		providerOperationRemoteMatch,
+		providerOperationRemoteInconclusive,
+	); got != ProviderOperationInconclusive {
+		t.Fatalf("legacy directory COPY without tree evidence = %v, want inconclusive", got)
+	}
+}
+
+func TestProviderOperationMaintenanceCadence(t *testing.T) {
+	if providerOperationMaintenanceEvery != 5*time.Second {
+		t.Fatalf("provider operation maintenance cadence = %v, want 5s", providerOperationMaintenanceEvery)
+	}
+}
+
+func TestProviderOperationRecoveryIndex(t *testing.T) {
+	typ := reflect.TypeOf(model.WebDAVProviderOperation{})
+	state, _ := typ.FieldByName("State")
+	lastChecked, _ := typ.FieldByName("LastCheckedAt")
+	if !strings.Contains(state.Tag.Get("gorm"), "idx_webdav_provider_recovery") {
+		t.Fatal("provider operation State must lead recovery index")
+	}
+	if !strings.Contains(lastChecked.Tag.Get("gorm"), "idx_webdav_provider_recovery") {
+		t.Fatal("LastCheckedAt must participate in recovery index")
+	}
+}
+
+func TestStartedDirectoryCopyWithoutFingerprintRemainsConservative(t *testing.T) {
+	if got := providerOperationRecoveryDecision(
+		ProviderOperationCopy,
+		ProviderOperationStarted,
+		providerOperationRemoteMatch,
+		providerOperationRemoteInconclusive,
+		true,
+	); got != ProviderOperationInconclusive {
+		t.Fatalf("legacy STARTED directory COPY = %v, want inconclusive without tree fingerprint", got)
+	}
+}
+
 func TestProviderOperationKeyIsStableAndScoped(t *testing.T) {
 	copyKey := providerOperationKey(ProviderOperationCopy, "/src/file.bin", "/dst/file.bin", -1)
 	if copyKey != providerOperationKey("copy", "/src/file.bin", "/dst/file.bin", -1) {

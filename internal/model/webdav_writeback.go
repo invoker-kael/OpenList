@@ -55,16 +55,18 @@ type WebDAVProviderOperation struct {
 	SourceIsDir        bool       `json:"source_is_dir"`
 	SourceSize         int64      `json:"source_size"`
 	SourceSHA1         string     `json:"source_sha1" gorm:"size:40"`
+	SourceTreeSHA256   string     `json:"source_tree_sha256" gorm:"size:64"`
+	SourceTreeEntries  int        `json:"source_tree_entries"`
 	SourceModTime      time.Time  `json:"source_mod_time"`
 	SourceCreateTime   time.Time  `json:"source_create_time"`
 	Overwrite          bool       `json:"overwrite"`
 	Depth              int        `json:"depth"`
 	DestinationExisted bool       `json:"destination_existed"`
-	State              string     `json:"state" gorm:"size:16;index"`
+	State              string     `json:"state" gorm:"size:16;index;index:idx_webdav_provider_recovery,priority:1"`
 	RecoveryCount      int        `json:"recovery_count"`
 	LastRecovery       string     `json:"last_recovery" gorm:"size:24"`
 	LastError          string     `json:"last_error" gorm:"type:text"`
-	LastCheckedAt      *time.Time `json:"last_checked_at"`
+	LastCheckedAt      *time.Time `json:"last_checked_at" gorm:"index:idx_webdav_provider_recovery,priority:2"`
 	AppliedAt          *time.Time `json:"applied_at"`
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`

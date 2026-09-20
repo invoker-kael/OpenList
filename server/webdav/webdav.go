@@ -830,8 +830,8 @@ func recoverProviderCopyMove(ctx context.Context, method, src, dst string, depth
 	return providerOperationResponseStatus(op), true, nil
 }
 
-func prepareProviderOperation(method, src, dst string, depth int, source model.Obj, overwrite, destinationExisted bool) (*model.WebDAVProviderOperation, error) {
-	op, err := writeback.PrepareProviderOperation(method, src, dst, depth, source, overwrite, destinationExisted)
+func prepareProviderOperation(ctx context.Context, method, src, dst string, depth int, source model.Obj, overwrite, destinationExisted bool) (*model.WebDAVProviderOperation, error) {
+	op, err := writeback.PrepareProviderOperation(ctx, method, src, dst, depth, source, overwrite, destinationExisted)
 	if err != nil {
 		return nil, err
 	}
@@ -961,7 +961,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 
 		var providerOp *model.WebDAVProviderOperation
 		if writeback.Enabled() {
-			providerOp, err = prepareProviderOperation(writeback.ProviderOperationCopy, src, dst, depth, sourceRoot, overwrite, dstExisted)
+			providerOp, err = prepareProviderOperation(ctx, writeback.ProviderOperationCopy, src, dst, depth, sourceRoot, overwrite, dstExisted)
 			if err != nil {
 				w.Header().Set("Retry-After", "2")
 				return http.StatusServiceUnavailable, err
@@ -1070,7 +1070,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 			}
 			return http.StatusInternalServerError, err
 		}
-		providerOp, err = prepareProviderOperation(writeback.ProviderOperationMove, src, dst, -1, sourceRoot, overwrite, dstExisted)
+		providerOp, err = prepareProviderOperation(ctx, writeback.ProviderOperationMove, src, dst, -1, sourceRoot, overwrite, dstExisted)
 		if err != nil {
 			w.Header().Set("Retry-After", "2")
 			return http.StatusServiceUnavailable, err

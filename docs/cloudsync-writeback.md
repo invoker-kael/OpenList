@@ -200,6 +200,10 @@ A `STARTED` operation is never declared "not applied" from one provider observat
 
 Source identity now includes provider object ID plus canonical generation/ETag when available. If the original source generation has been superseded before metadata recovery, file operations may rebuild only the destination root from the durable snapshot; directory operations stay blocked because replaying a stale tree could touch newer descendants.
 
+Directory provider operations now persist a deterministic SHA-256 tree fingerprint before the cloud mutation. Entries are sorted by relative path and include type, encrypted size and provider SHA-1; 115 Open requires SHA-1 evidence for every file. The fingerprint respects WebDAV COPY depth, so a lost `applied` marker on a STARTED directory COPY can be recovered only when the destination tree exactly matches the captured source tree. For 115 directory MOVE, a visible destination object ID is additionally checked against the captured source object ID before the tree is accepted as the moved source.
+
+Provider-intent maintenance also runs on an independent five-second cadence instead of waiting for the ten-minute completed-spool cleanup. APPLIED and abandoned PREPARED rows are prioritized, while STARTED rows rotate by `last_checked_at`; a few permanently ambiguous operations therefore cannot starve newer recoverable intents.
+
 ## Direct read reconciliation
 
 After the completed local cache expires, direct `GET`, `HEAD` and single-resource `PROPFIND` perform conservative remote-loss reconciliation.

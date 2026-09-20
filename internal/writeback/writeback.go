@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -312,6 +313,87 @@ func ProviderOperationPathConflict(p string) (*model.WebDAVProviderOperation, er
 	return nil, nil
 }
 
+func providerOperationTreeDepth(method string, depth int) int {
+	if strings.EqualFold(method, ProviderOperationMove) {
+		return -1
+	}
+	return depth
+}
+
+func providerDirectoryTreeFingerprint(ctx context.Context, root string, depth int) (string, int, error) {
+	root = utils.FixAndCleanPath(root)
+	requireHash := providerRequiresPayloadHash(root)
+	hasher := sha256.New()
+	entries := 0
+
+	var walk func(string, string, int) error
+	walk = func(current, relative string, remaining int) error {
+		if remaining == 0 {
+			return nil
+		}
+		objs, err := fs.List(ctx, current, &fs.ListArgs{Refresh: true, NoLog: true})
+		if err != nil {
+			return err
+		}
+		sort.Slice(objs, func(i, j int) bool {
+			return objs[i].GetName() < objs[j].GetName()
+		})
+		for _, obj := range objs {
+			if obj == nil {
+				continue
+			}
+			rel := path.Join(relative, obj.GetName())
+			if obj.IsDir() {
+				_, _ = fmt.Fprintf(hasher, "D\x00%s\n", rel)
+				entries++
+				next := remaining
+				if remaining > 0 {
+					next--
+				}
+				if err := walk(path.Join(current, obj.GetName()), rel, next); err != nil {
+					return err
+				}
+				continue
+			}
+			sha1sum := strings.ToLower(obj.GetHash().GetHash(utils.SHA1))
+			if requireHash && sha1sum == "" {
+				return fmt.Errorf("provider directory fingerprint missing SHA1 for %s", path.Join(current, obj.GetName()))
+			}
+			_, _ = fmt.Fprintf(hasher, "F\x00%s\x00%d\x00%s\n", rel, obj.GetSize(), sha1sum)
+			entries++
+		}
+		return nil
+	}
+
+	if err := walk(root, "", depth); err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), entries, nil
+}
+
+func providerDirectoryDestinationMatches(ctx context.Context, op *model.WebDAVProviderOperation, remote model.Obj) (providerOperationRemoteState, error) {
+	if op == nil || !op.SourceIsDir || remote == nil || !remote.IsDir() {
+		return providerOperationRemoteMismatch, nil
+	}
+	if strings.EqualFold(op.Method, ProviderOperationMove) &&
+		providerRequiresPayloadHash(op.DestinationPath) &&
+		op.SourceObjectID != "" && remote.GetID() != "" &&
+		op.SourceObjectID != remote.GetID() {
+		return providerOperationRemoteMismatch, nil
+	}
+	if op.SourceTreeSHA256 == "" {
+		return providerOperationRemoteMatch, nil
+	}
+	fingerprint, entries, err := providerDirectoryTreeFingerprint(ctx, op.DestinationPath, providerOperationTreeDepth(op.Method, op.Depth))
+	if err != nil {
+		return providerOperationRemoteInconclusive, err
+	}
+	if entries != op.SourceTreeEntries || !strings.EqualFold(fingerprint, op.SourceTreeSHA256) {
+		return providerOperationRemoteMismatch, nil
+	}
+	return providerOperationRemoteMatch, nil
+}
+
 func GetProviderOperation(method, src, dst string, depth int) (*model.WebDAVProviderOperation, error) {
 	if !Enabled() {
 		return nil, nil
@@ -327,7 +409,7 @@ func GetProviderOperation(method, src, dst string, depth int) (*model.WebDAVProv
 	return &op, nil
 }
 
-func PrepareProviderOperation(method, src, dst string, depth int, source model.Obj, overwrite, destinationExisted bool) (*model.WebDAVProviderOperation, error) {
+func PrepareProviderOperation(ctx context.Context, method, src, dst string, depth int, source model.Obj, overwrite, destinationExisted bool) (*model.WebDAVProviderOperation, error) {
 	if !Enabled() || source == nil {
 		return nil, nil
 	}
@@ -367,6 +449,15 @@ func PrepareProviderOperation(method, src, dst string, depth int, source model.O
 		if op.SourceSHA1 == "" {
 			op.SourceSHA1 = strings.ToLower(canonicalContentSHA1(canonical))
 		}
+	}
+
+	if op.SourceIsDir {
+		fingerprint, entries, err := providerDirectoryTreeFingerprint(ctx, src, providerOperationTreeDepth(method, depth))
+		if err != nil {
+			return nil, err
+		}
+		op.SourceTreeSHA256 = fingerprint
+		op.SourceTreeEntries = entries
 	}
 
 	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
@@ -468,13 +559,21 @@ func providerOperationPathState(ctx context.Context, p string, op *model.WebDAVP
 	hashEvidenceMissing := requireHash && op != nil && !op.SourceIsDir && op.SourceSHA1 == ""
 	remote, getErr := fs.Get(ctx, p, &fs.GetArgs{NoLog: true})
 	if getErr == nil && remote != nil && !hashEvidenceMissing {
-		switch compareRemoteContent(expected, remote, requireHash) {
-		case remoteContentMatch:
-			return providerOperationRemoteMatch, remote, nil
-		case remoteContentInconclusive:
-			// Confirm through the refreshed parent listing below.
-		case remoteContentMismatch:
-			// Confirm through the refreshed parent listing below.
+		if op != nil && op.SourceIsDir {
+			state, err := providerDirectoryDestinationMatches(ctx, op, remote)
+			if state == providerOperationRemoteMatch || err != nil {
+				return state, remote, err
+			}
+			// Confirm mismatch/incomplete evidence through the refreshed parent view.
+		} else {
+			switch compareRemoteContent(expected, remote, requireHash) {
+			case remoteContentMatch:
+				return providerOperationRemoteMatch, remote, nil
+			case remoteContentInconclusive:
+				// Confirm through the refreshed parent listing below.
+			case remoteContentMismatch:
+				// Confirm through the refreshed parent listing below.
+			}
 		}
 	} else if getErr != nil && !errs.IsObjectNotFound(getErr) {
 		return providerOperationRemoteInconclusive, nil, getErr
@@ -490,6 +589,10 @@ func providerOperationPathState(ctx context.Context, p string, op *model.WebDAVP
 	remote = exactRemoteByName(objs, path.Base(p))
 	if remote == nil {
 		return providerOperationRemoteAbsent, nil, nil
+	}
+	if op != nil && op.SourceIsDir {
+		state, err := providerDirectoryDestinationMatches(ctx, op, remote)
+		return state, remote, err
 	}
 	if hashEvidenceMissing {
 		return providerOperationRemoteInconclusive, remote, nil
@@ -612,6 +715,20 @@ func providerOperationRecoveryDecision(method, state string, dstState, srcState 
 	}
 }
 
+func providerOperationRecoveryDecisionWithEvidence(op *model.WebDAVProviderOperation, dstState, srcState providerOperationRemoteState) ProviderOperationRecovery {
+	if op == nil {
+		return ProviderOperationNotApplied
+	}
+	if strings.EqualFold(op.Method, ProviderOperationCopy) &&
+		op.State == ProviderOperationStarted &&
+		op.SourceIsDir &&
+		op.SourceTreeSHA256 != "" &&
+		dstState == providerOperationRemoteMatch {
+		return ProviderOperationRecovered
+	}
+	return providerOperationRecoveryDecision(op.Method, op.State, dstState, srcState, op.SourceIsDir)
+}
+
 func RecoverProviderOperation(ctx context.Context, op *model.WebDAVProviderOperation) (ProviderOperationRecovery, model.Obj, error) {
 	if op == nil {
 		return ProviderOperationNotApplied, nil, nil
@@ -627,7 +744,7 @@ func RecoverProviderOperation(ctx context.Context, op *model.WebDAVProviderOpera
 			return ProviderOperationInconclusive, dstObj, err
 		}
 	}
-	return providerOperationRecoveryDecision(op.Method, op.State, dstState, srcState, op.SourceIsDir), dstObj, nil
+	return providerOperationRecoveryDecisionWithEvidence(op, dstState, srcState), dstObj, nil
 }
 
 func providerOperationRecoveryLabel(recovery ProviderOperationRecovery) string {
@@ -2652,7 +2769,10 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 	return nil
 }
 
-const providerOperationPreparedAbandonAfter = 30 * time.Second
+const (
+	providerOperationPreparedAbandonAfter = 30 * time.Second
+	providerOperationMaintenanceEvery     = 5 * time.Second
+)
 
 func providerOperationPreparedExpired(op *model.WebDAVProviderOperation, now time.Time) bool {
 	if op == nil || op.State != ProviderOperationPrepared {
@@ -2678,7 +2798,11 @@ func recordProviderOperationError(id uint, err error) {
 
 func (m *workerManager) maintainProviderOperations() {
 	var ops []model.WebDAVProviderOperation
-	if err := db.GetDb().Order("updated_at asc").Limit(64).Find(&ops).Error; err != nil {
+	if err := db.GetDb().
+		Order("CASE state WHEN 'applied' THEN 0 WHEN 'prepared' THEN 1 ELSE 2 END").
+		Order("COALESCE(last_checked_at, created_at) asc").
+		Limit(64).
+		Find(&ops).Error; err != nil {
 		log.Errorf("write-back provider operation scan failed: %v", err)
 		return
 	}
@@ -2889,8 +3013,10 @@ func (m *workerManager) recoverInterrupted() error {
 
 func (m *workerManager) scheduler() {
 	ticker := time.NewTicker(2 * time.Second)
+	providerTicker := time.NewTicker(providerOperationMaintenanceEvery)
 	cleanupTicker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
+	defer providerTicker.Stop()
 	defer cleanupTicker.Stop()
 	for {
 		m.dispatch()
@@ -2899,8 +3025,9 @@ func (m *workerManager) scheduler() {
 			return
 		case <-m.wake:
 		case <-ticker.C:
-		case <-cleanupTicker.C:
+		case <-providerTicker.C:
 			m.maintainProviderOperations()
+		case <-cleanupTicker.C:
 			m.cleanupCompleted()
 		}
 	}
