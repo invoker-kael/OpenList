@@ -14,6 +14,7 @@ type WebDAVWritebackObject struct {
 	Path        string     `json:"path" gorm:"type:text"`
 	Parent      string     `json:"parent" gorm:"type:text"`
 	Name        string     `json:"name" gorm:"size:1024"`
+	IsDir       bool       `json:"is_dir" gorm:"index"`
 	Size        int64      `json:"size"`
 	ModTime     time.Time  `json:"mod_time"`
 	CreateTime  time.Time  `json:"create_time"`
