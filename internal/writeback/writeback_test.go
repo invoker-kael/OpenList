@@ -88,13 +88,13 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 		State:     StateCompleted,
 		SpoolPath: "",
 	}
-	if !shouldDropCanonicalAfterRemoteList(completedNoSpool, true, nil, time.Now()) {
+	if !shouldDropCanonicalAfterRemoteList(completedNoSpool, true, nil, time.Now(), false) {
 		t.Fatal("missing remote object should be surfaced after a reliable listing")
 	}
-	if shouldDropCanonicalAfterRemoteList(completedNoSpool, false, nil, time.Now()) {
+	if shouldDropCanonicalAfterRemoteList(completedNoSpool, false, nil, time.Now(), false) {
 		t.Fatal("provider/listing failure must not drop canonical metadata")
 	}
-	if shouldDropCanonicalAfterRemoteList(completedNoSpool, true, &model.Object{Size: completedNoSpool.Size}, time.Now()) {
+	if shouldDropCanonicalAfterRemoteList(completedNoSpool, true, &model.Object{Size: completedNoSpool.Size}, time.Now(), false) {
 		t.Fatal("present remote object must keep canonical metadata")
 	}
 
@@ -102,7 +102,7 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 		State:     StateCompleted,
 		SpoolPath: "/spool/object.data",
 	}
-	if shouldDropCanonicalAfterRemoteList(completedCached, true, nil, time.Now()) {
+	if shouldDropCanonicalAfterRemoteList(completedCached, true, nil, time.Now(), false) {
 		t.Fatal("locally cached completed object must remain authoritative")
 	}
 
@@ -110,7 +110,7 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 		State:     StateQueued,
 		SpoolPath: "/spool/object.data",
 	}
-	if shouldDropCanonicalAfterRemoteList(queued, true, nil, time.Now()) {
+	if shouldDropCanonicalAfterRemoteList(queued, true, nil, time.Now(), false) {
 		t.Fatal("pending upload must remain visible even before provider listing catches up")
 	}
 }
@@ -370,7 +370,7 @@ func TestCanonicalShadowGraceProtectsFreshCompletedFile(t *testing.T) {
 	if !canonicalShadowInGrace(row, now) {
 		t.Fatal("fresh completed file metadata should stay canonical during provider consistency grace")
 	}
-	if shouldDropCanonicalAfterRemoteList(row, true, nil, now) {
+	if shouldDropCanonicalAfterRemoteList(row, true, nil, now, false) {
 		t.Fatal("fresh completed file must not be dropped on a transient provider miss")
 	}
 
@@ -379,7 +379,7 @@ func TestCanonicalShadowGraceProtectsFreshCompletedFile(t *testing.T) {
 	if canonicalShadowInGrace(row, now) {
 		t.Fatal("completed file metadata should leave grace after the configured window")
 	}
-	if !shouldDropCanonicalAfterRemoteList(row, true, nil, now) {
+	if !shouldDropCanonicalAfterRemoteList(row, true, nil, now, false) {
 		t.Fatal("expired completed file should expose a confirmed provider loss")
 	}
 }

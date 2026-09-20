@@ -330,7 +330,7 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	}
 }
 
-func shouldDropCanonicalAfterRemoteList(row *model.WebDAVWritebackObject, remoteReliable bool, remote model.Obj, now time.Time) bool {
+func shouldDropCanonicalAfterRemoteList(row *model.WebDAVWritebackObject, remoteReliable bool, remote model.Obj, now time.Time, requireHash bool) bool {
 	if !remoteReliable ||
 		row.IsDir ||
 		row.State != StateCompleted ||
@@ -341,7 +341,7 @@ func shouldDropCanonicalAfterRemoteList(row *model.WebDAVWritebackObject, remote
 	if remote == nil {
 		return true
 	}
-	return compareRemoteContent(row, remote, providerRequiresPayloadHash(row.Path)) == remoteContentMismatch
+	return compareRemoteContent(row, remote, requireHash) == remoteContentMismatch
 }
 
 func canonicalShadowInGrace(row *model.WebDAVWritebackObject, now time.Time) bool {
@@ -412,7 +412,7 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 				continue
 			}
 		}
-		if shouldDropCanonicalAfterRemoteList(row, remoteReliable, remoteObj, now) {
+		if shouldDropCanonicalAfterRemoteList(row, remoteReliable, remoteObj, now, providerRequiresPayloadHash(row.Path)) {
 			res := db.GetDb().
 				Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
 				Delete(&model.WebDAVWritebackObject{})
