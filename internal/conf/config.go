@@ -117,6 +117,7 @@ type WebDAVWritebackConfig struct {
 	ReserveFreeSpaceMB        uint64 `json:"reserve_free_space_mb" env:"RESERVE_FREE_SPACE_MB"`
 	Workers                  int    `json:"workers" env:"WORKERS"`
 	CloudSyncSettleMillis     int    `json:"cloudsync_settle_millis" env:"CLOUDSYNC_SETTLE_MILLIS"`
+	DirectoryGraceSeconds    int    `json:"directory_grace_seconds" env:"DIRECTORY_GRACE_SECONDS"`
 	RetryInitialSeconds      int    `json:"retry_initial_seconds" env:"RETRY_INITIAL_SECONDS"`
 	RetryMaxSeconds          int    `json:"retry_max_seconds" env:"RETRY_MAX_SECONDS"`
 	VerifyIntervalSeconds    int    `json:"verify_interval_seconds" env:"VERIFY_INTERVAL_SECONDS"`
@@ -274,6 +275,7 @@ func DefaultConfig(dataDir string) *Config {
 			ReserveFreeSpaceMB:        20 * 1024,
 			Workers:                  4,
 			CloudSyncSettleMillis:     2000,
+			DirectoryGraceSeconds:    60,
 			RetryInitialSeconds:      30,
 			RetryMaxSeconds:          30 * 60,
 			VerifyIntervalSeconds:    5,
