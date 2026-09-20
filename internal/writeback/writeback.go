@@ -4378,6 +4378,40 @@ func advanceRemoteVerification(state remoteVerificationState, current, attempts 
 	return next, next >= max(1, attempts)
 }
 
+const open115MultipartChunkSize int64 = 20 * utils.MB
+
+func verificationAttemptsFor(row *model.WebDAVWritebackObject, requireHash bool) int {
+	attempts := max(1, conf.Conf.WebDAVWriteback.VerifyAttempts)
+	if row == nil || !requireHash || row.Size <= open115MultipartChunkSize {
+		return attempts
+	}
+	intervalSeconds := max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)
+	minWindowSeconds := max(intervalSeconds, conf.Conf.WebDAVWriteback.RetryMaxSeconds)
+	minAttempts := (minWindowSeconds + intervalSeconds - 1) / intervalSeconds
+	return max(attempts, minAttempts)
+}
+
+func suppressRepeatedLargeProviderRepair(row *model.WebDAVWritebackObject, requireHash bool) bool {
+	return row != nil &&
+		requireHash &&
+		row.Size > open115MultipartChunkSize &&
+		row.RetryCount >= 1
+}
+
+func repeatedLargeProviderVerifyDelay(row *model.WebDAVWritebackObject) time.Duration {
+	delay := retryDelay(1)
+	if row != nil {
+		delay = retryDelay(row.RetryCount + 1)
+	}
+	if conf.Conf != nil {
+		floor := time.Duration(max(1, conf.Conf.WebDAVWriteback.RetryMaxSeconds)) * time.Second
+		if delay < floor {
+			delay = floor
+		}
+	}
+	return delay
+}
+
 func remoteVerificationInconclusiveDelay() time.Duration {
 	verifySeconds := 1
 	retrySeconds := 1
@@ -4504,9 +4538,21 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		return
 	}
 
-	attempts := max(1, conf.Conf.WebDAVWriteback.VerifyAttempts)
+	attempts := verificationAttemptsFor(row, requireHash)
 	nextCount, retryUpload := advanceRemoteVerification(verification, row.VerifyCount, attempts)
 	if retryUpload {
+		if suppressRepeatedLargeProviderRepair(row, requireHash) {
+			next := time.Now().Add(repeatedLargeProviderVerifyDelay(row))
+			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
+				Updates(map[string]any{
+					"state":        StateVerifying,
+					"retry_at":     &next,
+					"verify_count": max(0, attempts-1),
+					"last_error":   "115 multipart upload remains divergent after one repair upload; preserving durable spool and continuing low-frequency verification without another automatic reupload",
+				}).Error
+			return
+		}
 		next := time.Now().Add(retryDelay(row.RetryCount + 1))
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
