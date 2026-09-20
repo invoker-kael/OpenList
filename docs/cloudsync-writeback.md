@@ -145,7 +145,7 @@ PUT honors `If-Match` and `If-None-Match` and returns HTTP 412 when the entity-t
 
 ### 115 verification fallback
 
-The background upload verifier does not trust a single 115 object lookup by itself. If the object lookup is missing or returns incomplete metadata, the worker force-refreshes the parent directory. For 115 Open, verification now requires the exact encrypted payload size **and** the persisted payload SHA-1 returned by `Obj.GetHash()`; a same-size stale generation is therefore not accepted as the newly uploaded object. Providers that do not expose a content hash retain the size-based fallback. This prevents 115's post-upload metadata consistency window from turning either a successful upload into an unnecessary retry or an older same-size object into a false completion.
+The background upload verifier does not trust a single 115 object lookup by itself. If the object lookup is missing or returns incomplete metadata, the worker force-refreshes the parent directory. For 115 Open, verification now requires the exact encrypted payload size **and** the persisted payload SHA-1 returned by `Obj.GetHash()`; a same-size stale generation is therefore not accepted as the newly uploaded object, and a temporary 115 response with an empty SHA-1 is treated as incomplete metadata rather than a successful verification. Providers whose storage driver genuinely does not expose a content hash retain the size-based fallback. This prevents 115's post-upload metadata consistency window from turning either a successful upload into an unnecessary retry or an older same-size object into a false completion.
 
 
 ## Cloud Sync rename, copy and delete compatibility

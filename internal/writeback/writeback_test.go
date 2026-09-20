@@ -473,7 +473,7 @@ func TestRemoteMatchesCanonical(t *testing.T) {
 		Size:     4096,
 		HashInfo: utils.NewHashInfo(utils.SHA1, strings.ToUpper(wantSHA1)),
 	}
-	if !remoteMatchesCanonical(row, match) {
+	if !remoteMatchesCanonical(row, match, true) {
 		t.Fatal("same-size same-SHA1 remote object should verify")
 	}
 
@@ -481,20 +481,23 @@ func TestRemoteMatchesCanonical(t *testing.T) {
 		Size:     4096,
 		HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40)),
 	}
-	if remoteMatchesCanonical(row, wrongHash) {
+	if remoteMatchesCanonical(row, wrongHash, true) {
 		t.Fatal("same-size old generation with a different SHA1 must not verify")
 	}
 
 	noHash := &model.Object{Size: 4096}
-	if !remoteMatchesCanonical(row, noHash) {
+	if !remoteMatchesCanonical(row, noHash, false) {
 		t.Fatal("provider without hash support should retain size-based fallback")
+	}
+	if remoteMatchesCanonical(row, noHash, true) {
+		t.Fatal("115 verification must wait for SHA1 instead of accepting size-only metadata")
 	}
 
 	wrongSize := &model.Object{
 		Size:     4095,
 		HashInfo: utils.NewHashInfo(utils.SHA1, wantSHA1),
 	}
-	if remoteMatchesCanonical(row, wrongSize) {
+	if remoteMatchesCanonical(row, wrongSize, true) {
 		t.Fatal("matching hash cannot compensate for a size mismatch")
 	}
 }

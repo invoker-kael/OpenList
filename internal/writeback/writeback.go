@@ -2097,7 +2097,12 @@ func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
 	}
 }
 
-func remoteMatchesCanonical(row *model.WebDAVWritebackObject, remote model.Obj) bool {
+func providerRequiresPayloadHash(p string) bool {
+	storage, err := fs.GetStorage(p, &fs.GetStoragesArgs{})
+	return err == nil && storage != nil && storage.Config().Name == "115 Open"
+}
+
+func remoteMatchesCanonical(row *model.WebDAVWritebackObject, remote model.Obj, requireHash bool) bool {
 	if row == nil || remote == nil || remote.IsDir() || remote.GetSize() != row.Size {
 		return false
 	}
@@ -2106,17 +2111,15 @@ func remoteMatchesCanonical(row *model.WebDAVWritebackObject, remote model.Obj) 
 	}
 	remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
 	if remoteSHA1 == "" {
-		// Keep write-back usable with providers that do not expose content
-		// hashes. 115 Open does expose SHA-1, so its verification path remains
-		// generation-content exact instead of size-only.
-		return true
+		return !requireHash
 	}
 	return strings.EqualFold(remoteSHA1, row.PayloadSHA1)
 }
 
 func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model.Obj, error) {
+	requireHash := providerRequiresPayloadHash(row.Path)
 	remote, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true})
-	if getErr == nil && remoteMatchesCanonical(row, remote) {
+	if getErr == nil && remoteMatchesCanonical(row, remote, requireHash) {
 		return remote, nil
 	}
 
@@ -2127,7 +2130,7 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model
 	objs, listErr := fs.List(m.ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
 	if listErr == nil {
 		for _, obj := range objs {
-			if obj.GetName() == row.Name && remoteMatchesCanonical(row, obj) {
+			if obj.GetName() == row.Name && remoteMatchesCanonical(row, obj, requireHash) {
 				return obj, nil
 			}
 		}
@@ -2143,8 +2146,9 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model
 }
 
 func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
+	requireHash := providerRequiresPayloadHash(row.Path)
 	remote, err := m.remoteForVerify(row)
-	if err == nil && remoteMatchesCanonical(row, remote) {
+	if err == nil && remoteMatchesCanonical(row, remote, requireHash) {
 		now := time.Now()
 		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
