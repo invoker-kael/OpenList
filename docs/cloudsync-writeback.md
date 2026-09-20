@@ -49,6 +49,7 @@ Default configuration in this fork:
   "reserve_free_space_mb": 20480,
   "workers": 4,
   "cloudsync_settle_millis": 2000,
+  "cloudsync_placeholder_millis": 10000,
   "directory_grace_seconds": 60,
   "retry_initial_seconds": 30,
   "retry_max_seconds": 1800,
@@ -116,7 +117,7 @@ PROPFIND file / parent immediately
 
 The WebDAV-visible result is committed locally before any slow 115/OpenList provider upload is required to finish. Cloud Sync therefore sees the newest canonical type, encrypted payload size, modification time and generation ETag throughout the provider consistency window.
 
-The default `cloudsync_settle_millis=2000` delays provider dispatch briefly after each PUT. A later PUT to the same path supersedes the previous generation, which avoids uploading a zero-byte placeholder and then immediately uploading the real encrypted payload.
+The default `cloudsync_settle_millis=2000` delays normal provider dispatch briefly after each PUT. A zero-byte PUT uses the longer `cloudsync_placeholder_millis=10000` window because Synology Cloud Sync can create a zero-length placeholder and send the real encrypted payload in a subsequent request. A later PUT to the same path supersedes the previous generation, avoiding an unnecessary empty-object upload before the real payload.
 
 ### Directory consistency
 
@@ -129,3 +130,8 @@ Directories are dispatched before files. If a child upload reaches the provider 
 The encrypted payload is opaque to OpenList. The canonical size is the exact number of bytes accepted by the WebDAV PUT, not the NAS source-file size and not a temporarily stale provider size. Provider hash and provider mtime are never promoted into the Cloud Sync-facing canonical view.
 
 This is specifically intended for one-way NAS -> WebDAV/OpenList -> cloud jobs. Provider-side changes are not treated as authoritative source edits.
+
+
+### Conditional retries
+
+PUT honors `If-Match` and `If-None-Match` and returns HTTP 412 when the entity-tag condition fails. To keep the normal Cloud Sync upload path fast, OpenList only performs a backing-provider lookup for this check when one of those headers is actually present. Canonical write-back metadata is used first whenever available.
