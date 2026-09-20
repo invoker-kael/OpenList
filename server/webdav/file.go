@@ -311,6 +311,13 @@ func copyFiles(ctx context.Context, src, dst string, overwrite bool, depth int) 
 		if err := fs.Remove(ctx, dst); err != nil {
 			return http.StatusInternalServerError, err
 		}
+		absent, verifyErr := providerResourceAbsent(ctx, dst)
+		if verifyErr != nil {
+			return http.StatusInternalServerError, verifyErr
+		}
+		if !absent {
+			return http.StatusServiceUnavailable, nil
+		}
 	}
 
 	// Native provider COPY is safe and efficient only when the final name is
