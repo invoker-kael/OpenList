@@ -1553,6 +1553,47 @@ func clearCompletedFileDivergence(row *model.WebDAVWritebackObject) error {
 // size=0, missing hashes, stale type metadata, or NotFound after upload. Any
 // apparent mismatch is confirmed through one force-refreshed exact-name parent
 // listing before canonical metadata is dropped.
+func completedRemoteVerificationInterval() time.Duration {
+	seconds := 1
+	if conf.Conf != nil {
+		seconds = max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func completedRemoteVerificationFresh(row *model.WebDAVWritebackObject, now time.Time) bool {
+	if row == nil ||
+		row.IsDir ||
+		row.State != StateCompleted ||
+		row.SpoolPath != "" ||
+		row.RemoteVerifiedAt == nil ||
+		row.RemoteGeneration != row.Generation ||
+		row.VerifyCount != 0 ||
+		row.RetryAt != nil ||
+		row.LastError != "" {
+		return false
+	}
+	return now.Before(row.RemoteVerifiedAt.Add(completedRemoteVerificationInterval()))
+}
+
+func refreshCompletedRemoteVerification(row *model.WebDAVWritebackObject, remote model.Obj, now time.Time) error {
+	if row == nil || remote == nil || row.IsDir || row.State != StateCompleted || row.SpoolPath != "" {
+		return nil
+	}
+	evidence := captureRemoteVerification(row, remote, now)
+	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
+		Updates(map[string]any{
+			"verify_count":        0,
+			"retry_at":           nil,
+			"last_error":         "",
+			"remote_object_id":   evidence.objectID,
+			"remote_sha1":        evidence.sha1,
+			"remote_generation":  evidence.generation,
+			"remote_verified_at": &evidence.verifiedAt,
+		}).Error
+}
+
 func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	if !Enabled() {
 		return false, nil
@@ -1563,6 +1604,9 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	}
 	now := time.Now()
 	if canonicalShadowInGrace(row, now) {
+		return false, nil
+	}
+	if completedRemoteVerificationFresh(row, now) {
 		return false, nil
 	}
 
@@ -1576,8 +1620,8 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 			return false, delErr
 		}
 		if !row.IsDir && compareRemoteContent(row, remote, requireHash) == remoteContentMatch {
-			if clearErr := clearCompletedFileDivergence(row); clearErr != nil {
-				return false, clearErr
+			if refreshErr := refreshCompletedRemoteVerification(row, remote, now); refreshErr != nil {
+				return false, refreshErr
 			}
 			return false, nil
 		}
@@ -1624,8 +1668,8 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 
 	switch compareRemoteContent(row, remote, requireHash) {
 	case remoteContentMatch:
-		if clearErr := clearCompletedFileDivergence(row); clearErr != nil {
-			return false, clearErr
+		if refreshErr := refreshCompletedRemoteVerification(row, remote, now); refreshErr != nil {
+			return false, refreshErr
 		}
 		return false, nil
 	case remoteContentInconclusive:

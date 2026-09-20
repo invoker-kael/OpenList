@@ -1260,6 +1260,51 @@ func TestCloudSyncRemoteVerificationEvidencePolicy(t *testing.T) {
 	}
 }
 
+func TestCompletedRemoteVerificationFresh(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{
+		WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyIntervalSeconds: 10},
+	}
+	defer func() { conf.Conf = oldConf }()
+
+	now := time.Now()
+	verified := now.Add(-5 * time.Second)
+	row := &model.WebDAVWritebackObject{
+		State:            StateCompleted,
+		Generation:       7,
+		RemoteGeneration: 7,
+		RemoteVerifiedAt: &verified,
+	}
+	if !completedRemoteVerificationFresh(row, now) {
+		t.Fatal("recent generation-scoped provider verification should suppress an immediate direct provider lookup")
+	}
+
+	stale := now.Add(-11 * time.Second)
+	row.RemoteVerifiedAt = &stale
+	if completedRemoteVerificationFresh(row, now) {
+		t.Fatal("verification older than the configured interval must be rechecked")
+	}
+
+	row.RemoteVerifiedAt = &verified
+	row.RemoteGeneration = 6
+	if completedRemoteVerificationFresh(row, now) {
+		t.Fatal("verification evidence from an older generation must not suppress reconciliation")
+	}
+
+	row.RemoteGeneration = 7
+	retryAt := now.Add(time.Second)
+	row.RetryAt = &retryAt
+	if completedRemoteVerificationFresh(row, now) {
+		t.Fatal("pending divergence retry must bypass the verification cooldown")
+	}
+
+	row.RetryAt = nil
+	row.SpoolPath = "/spool/current.data"
+	if completedRemoteVerificationFresh(row, now) {
+		t.Fatal("locally cached completed payloads do not use direct provider reconciliation cooldown")
+	}
+}
+
 func TestCloudSyncInconclusiveVerificationNeverConsumesReuploadBudget(t *testing.T) {
 	count := 0
 	for i := 0; i < 100; i++ {
