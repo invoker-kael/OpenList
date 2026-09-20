@@ -42,35 +42,44 @@ type WebDAVWritebackObject struct {
 // COPY/MOVE mutations. It closes the gap between a successful remote mutation
 // and the MySQL transaction that reconciles canonical WebDAV metadata.
 type WebDAVProviderOperation struct {
-	ID                         uint       `json:"id" gorm:"primaryKey"`
-	OperationKey               string     `json:"operation_key" gorm:"size:64;uniqueIndex"`
-	Method                     string     `json:"method" gorm:"size:8;index"`
-	SourceKey                  string     `json:"source_key" gorm:"size:64;index"`
-	DestinationKey             string     `json:"destination_key" gorm:"size:64;index"`
-	SourcePath                 string     `json:"source_path" gorm:"type:text"`
-	DestinationPath            string     `json:"destination_path" gorm:"type:text"`
-	SourceObjectID             string     `json:"source_object_id" gorm:"size:255"`
-	SourceGeneration           uint64     `json:"source_generation"`
-	SourceETag                 string     `json:"source_etag" gorm:"size:160"`
-	SourceIsDir                bool       `json:"source_is_dir"`
-	SourceSize                 int64      `json:"source_size"`
-	SourceSHA1                 string     `json:"source_sha1" gorm:"size:40"`
-	SourceTreeSHA256           string     `json:"source_tree_sha256" gorm:"size:64"`
-	SourceTreeEntries          int        `json:"source_tree_entries"`
-	SourceTreeOverlay          bool       `json:"source_tree_overlay"`
-	FailureDestinationObserved bool       `json:"failure_destination_observed"`
-	FailureDestinationObjectID string     `json:"failure_destination_object_id" gorm:"size:255"`
-	SourceModTime              time.Time  `json:"source_mod_time"`
-	SourceCreateTime           time.Time  `json:"source_create_time"`
-	Overwrite                  bool       `json:"overwrite"`
-	Depth                      int        `json:"depth"`
-	DestinationExisted         bool       `json:"destination_existed"`
-	State                      string     `json:"state" gorm:"size:16;index;index:idx_webdav_provider_recovery,priority:1"`
-	RecoveryCount              int        `json:"recovery_count"`
-	LastRecovery               string     `json:"last_recovery" gorm:"size:24"`
-	LastError                  string     `json:"last_error" gorm:"type:text"`
-	LastCheckedAt              *time.Time `json:"last_checked_at" gorm:"index:idx_webdav_provider_recovery,priority:2"`
-	AppliedAt                  *time.Time `json:"applied_at"`
-	CreatedAt                  time.Time  `json:"created_at"`
-	UpdatedAt                  time.Time  `json:"updated_at"`
+	ID                            uint       `json:"id" gorm:"primaryKey"`
+	OperationKey                  string     `json:"operation_key" gorm:"size:64;uniqueIndex"`
+	Method                        string     `json:"method" gorm:"size:8;index"`
+	SourceKey                     string     `json:"source_key" gorm:"size:64;index"`
+	DestinationKey                string     `json:"destination_key" gorm:"size:64;index"`
+	SourcePath                    string     `json:"source_path" gorm:"type:text"`
+	DestinationPath               string     `json:"destination_path" gorm:"type:text"`
+	DestinationObjectID           string     `json:"destination_object_id" gorm:"size:255"`
+	DestinationGeneration         uint64     `json:"destination_generation"`
+	DestinationETag               string     `json:"destination_etag" gorm:"size:160"`
+	SourceObjectID                string     `json:"source_object_id" gorm:"size:255"`
+	SourceGeneration              uint64     `json:"source_generation"`
+	SourceETag                    string     `json:"source_etag" gorm:"size:160"`
+	SourceIsDir                   bool       `json:"source_is_dir"`
+	SourceSize                    int64      `json:"source_size"`
+	SourceSHA1                    string     `json:"source_sha1" gorm:"size:40"`
+	SourceTreeSHA256              string     `json:"source_tree_sha256" gorm:"size:64"`
+	SourceTreeEntries             int        `json:"source_tree_entries"`
+	SourceTreeOverlay             bool       `json:"source_tree_overlay"`
+	FailureDestinationObserved    bool       `json:"failure_destination_observed"`
+	FailureDestinationObjectID    string     `json:"failure_destination_object_id" gorm:"size:255"`
+	FailureDestinationReady       bool       `json:"failure_destination_ready"`
+	FailureDestinationIsDir       bool       `json:"failure_destination_is_dir"`
+	FailureDestinationSize        int64      `json:"failure_destination_size"`
+	FailureDestinationSHA1        string     `json:"failure_destination_sha1" gorm:"size:40"`
+	FailureDestinationTreeSHA256  string     `json:"failure_destination_tree_sha256" gorm:"size:64"`
+	FailureDestinationTreeEntries int        `json:"failure_destination_tree_entries"`
+	SourceModTime                 time.Time  `json:"source_mod_time"`
+	SourceCreateTime              time.Time  `json:"source_create_time"`
+	Overwrite                     bool       `json:"overwrite"`
+	Depth                         int        `json:"depth"`
+	DestinationExisted            bool       `json:"destination_existed"`
+	State                         string     `json:"state" gorm:"size:16;index;index:idx_webdav_provider_recovery,priority:1"`
+	RecoveryCount                 int        `json:"recovery_count"`
+	LastRecovery                  string     `json:"last_recovery" gorm:"size:24"`
+	LastError                     string     `json:"last_error" gorm:"type:text"`
+	LastCheckedAt                 *time.Time `json:"last_checked_at" gorm:"index:idx_webdav_provider_recovery,priority:2"`
+	AppliedAt                     *time.Time `json:"applied_at"`
+	CreatedAt                     time.Time  `json:"created_at"`
+	UpdatedAt                     time.Time  `json:"updated_at"`
 }

@@ -29,17 +29,96 @@ func TestProviderOperationCopyUsesNative(t *testing.T) {
 	}
 }
 
+func TestProviderOperationDestinationGenerationFence(t *testing.T) {
+	op := &model.WebDAVProviderOperation{DestinationGeneration: 7}
+	if providerOperationDestinationGenerationAdvanced(op, &model.WebDAVWritebackObject{Generation: 7}) {
+		t.Fatal("unchanged destination generation must not count as reconciled")
+	}
+	if !providerOperationDestinationGenerationAdvanced(op, &model.WebDAVWritebackObject{Generation: 8}) {
+		t.Fatal("advanced destination generation should prove metadata mutation")
+	}
+	if !providerOperationDestinationGenerationAdvanced(&model.WebDAVProviderOperation{}, &model.WebDAVWritebackObject{Generation: 1}) {
+		t.Fatal("new destination without prior canonical generation should be accepted")
+	}
+}
+
+func TestProviderOperationProtectsCanonicalPath(t *testing.T) {
+	now := time.Now()
+	ops := []model.WebDAVProviderOperation{
+		{
+			SourcePath:      "/src/album",
+			DestinationPath: "/dst/album",
+			State:           ProviderOperationStarted,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		},
+	}
+	for _, p := range []string{"/src/album", "/src/album/a.jpg", "/dst/album", "/dst/album/sub/b.jpg"} {
+		if !providerOperationProtectsCanonicalPath(ops, p, now) {
+			t.Fatalf("path %q should be protected by active provider intent", p)
+		}
+	}
+	if providerOperationProtectsCanonicalPath(ops, "/other/file.jpg", now) {
+		t.Fatal("unrelated canonical path must not be protected")
+	}
+}
+
+func TestProviderOperationRecoveryDue(t *testing.T) {
+	now := time.Now()
+	if !providerOperationRecoveryDue(&model.WebDAVProviderOperation{}, now) {
+		t.Fatal("never-checked operation should be due immediately")
+	}
+	checked := now.Add(-providerOperationConfirmationDelay() / 2)
+	op := &model.WebDAVProviderOperation{LastCheckedAt: &checked}
+	if providerOperationRecoveryDue(op, now) {
+		t.Fatal("recently checked operation should be throttled")
+	}
+	checked = now.Add(-providerOperationConfirmationDelay())
+	if !providerOperationRecoveryDue(op, now) {
+		t.Fatal("operation should be due after confirmation delay")
+	}
+}
+
+func TestNotAppliedConfirmationStates(t *testing.T) {
+	for _, state := range []string{ProviderOperationStarted, ProviderOperationFailed} {
+		if !providerOperationNeedsNotAppliedConfirmation(state) {
+			t.Fatalf("state %q must require separated not-applied confirmation", state)
+		}
+	}
+	for _, state := range []string{ProviderOperationPrepared, ProviderOperationApplied, ""} {
+		if providerOperationNeedsNotAppliedConfirmation(state) {
+			t.Fatalf("state %q must not require not-applied confirmation", state)
+		}
+	}
+}
+
 func TestFailedProviderCopyCleanupIdentity(t *testing.T) {
+	sha := strings.Repeat("a", 40)
 	op := &model.WebDAVProviderOperation{
 		FailureDestinationObserved: true,
 		FailureDestinationObjectID: "copy-partial-123",
+		FailureDestinationReady:    true,
+		FailureDestinationIsDir:    false,
+		FailureDestinationSize:     4096,
+		FailureDestinationSHA1:     sha,
 	}
-	same := &model.Object{ID: "copy-partial-123"}
-	replaced := &model.Object{ID: "external-replacement-999"}
-	noID := &model.Object{}
+	same := &model.Object{
+		ID:       "copy-partial-123",
+		Size:     4096,
+		HashInfo: utils.NewHashInfo(utils.SHA1, sha),
+	}
+	replaced := &model.Object{
+		ID:       "external-replacement-999",
+		Size:     4096,
+		HashInfo: utils.NewHashInfo(utils.SHA1, sha),
+	}
+	noID := &model.Object{
+		Size:     4096,
+		HashInfo: utils.NewHashInfo(utils.SHA1, sha),
+	}
 
 	if !failedProviderCopyCleanupAllowed(op, same, true) {
-		t.Fatal("115 cleanup should allow the exact failed COPY object")
+		t.Fatal("115 cleanup should allow the exact failure-time object snapshot")
 	}
 	if failedProviderCopyCleanupAllowed(op, replaced, true) {
 		t.Fatal("115 cleanup must not delete a replacement object with a different ID")
@@ -51,8 +130,18 @@ func TestFailedProviderCopyCleanupIdentity(t *testing.T) {
 		t.Fatal("non-strict providers may fall back when object IDs are unavailable")
 	}
 
+	changedContent := &model.Object{
+		ID:       "copy-partial-123",
+		Size:     8192,
+		HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40)),
+	}
+	if failedProviderCopyCleanupAllowed(op, changedContent, true) {
+		t.Fatal("same object ID with changed content must not be auto-deleted")
+	}
+
 	op.FailureDestinationObserved = false
 	op.FailureDestinationObjectID = ""
+	op.FailureDestinationReady = false
 	if failedProviderCopyCleanupAllowed(op, same, true) {
 		t.Fatal("115 cleanup must not claim an object that was not observed at failure time")
 	}

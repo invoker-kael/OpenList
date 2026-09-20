@@ -210,6 +210,12 @@ If a failed COPY destination nevertheless matches the captured file/tree identit
 
 Provider-intent maintenance also runs on an independent five-second cadence instead of waiting for the ten-minute completed-spool cleanup. APPLIED and abandoned PREPARED rows are prioritized, while STARTED rows rotate by `last_checked_at`; a few permanently ambiguous operations therefore cannot starve newer recoverable intents.
 
+The recovery fence now also captures the destination's pre-operation provider object ID and canonical generation. A pre-existing canonical directory is never treated as proof that metadata reconciliation completed: the destination generation must advance after the provider mutation. While an intent is unresolved, canonical rows under both source and destination are protected from normal completed-shadow expiry, so the metadata evidence needed for reconciliation cannot disappear underneath the recovery worker.
+
+FAILED COPY cleanup stores a failure-time destination snapshot rather than only an object ID. For files this includes type, encrypted size and SHA-1; for directories it includes the full provider-tree fingerprint. On 115 Open, cleanup requires both the same provider object ID and the same failure snapshot before deletion. Even an in-place content change that keeps the same provider ID therefore stops automatic cleanup. FAILED `not_applied` observations use the same two-observation consistency fence as STARTED operations, and maintenance will not recheck an intent more frequently than the confirmation interval.
+
+Transitioning an intent back to STARTED or forward to APPLIED clears stale recovery/failure evidence, preventing a prior failed attempt from influencing a later generation of the same deterministic operation key.
+
 ## Direct read reconciliation
 
 After the completed local cache expires, direct `GET`, `HEAD` and single-resource `PROPFIND` perform conservative remote-loss reconciliation.

@@ -273,6 +273,26 @@ func providerOperationTouchesPath(op *model.WebDAVProviderOperation, p string) b
 	return pathsOverlap(op.SourcePath, p) || pathsOverlap(op.DestinationPath, p)
 }
 
+func providerOperationProtectsCanonicalPath(ops []model.WebDAVProviderOperation, p string, now time.Time) bool {
+	for i := range ops {
+		if providerOperationPreparedExpired(&ops[i], now) {
+			continue
+		}
+		if providerOperationTouchesPath(&ops[i], p) {
+			return true
+		}
+	}
+	return false
+}
+
+func activeProviderOperations() ([]model.WebDAVProviderOperation, error) {
+	var ops []model.WebDAVProviderOperation
+	if err := db.GetDb().Order("updated_at asc").Find(&ops).Error; err != nil {
+		return nil, err
+	}
+	return ops, nil
+}
+
 func ProviderOperationConflict(method, src, dst string, depth int) (*model.WebDAVProviderOperation, error) {
 	if !Enabled() {
 		return nil, nil
@@ -484,6 +504,20 @@ func PrepareProviderOperation(ctx context.Context, method, src, dst string, dept
 		}
 	}
 
+	if destinationExisted {
+		if remote, present, observeErr := providerOperationDestinationObject(ctx, dst); observeErr != nil {
+			return nil, observeErr
+		} else if present {
+			op.DestinationObjectID = remote.GetID()
+		}
+	}
+	if canonical, err := getByPath(dst); err != nil {
+		return nil, err
+	} else if canonical != nil {
+		op.DestinationGeneration = canonical.Generation
+		op.DestinationETag = canonical.ETag
+	}
+
 	if op.SourceIsDir {
 		op.SourceTreeOverlay = strings.EqualFold(method, ProviderOperationCopy) &&
 			!ProviderOperationCopyUsesNative(src, dst, depth)
@@ -540,7 +574,22 @@ func MarkProviderOperationStarted(id uint) error {
 	}
 	res := db.GetDb().Model(&model.WebDAVProviderOperation{}).
 		Where("id = ? AND state = ?", id, ProviderOperationPrepared).
-		Updates(map[string]any{"state": ProviderOperationStarted, "applied_at": nil})
+		Updates(map[string]any{
+			"state":                            ProviderOperationStarted,
+			"applied_at":                       nil,
+			"recovery_count":                   0,
+			"last_recovery":                    "",
+			"last_error":                       "",
+			"last_checked_at":                  nil,
+			"failure_destination_observed":     false,
+			"failure_destination_object_id":    "",
+			"failure_destination_ready":        false,
+			"failure_destination_is_dir":       false,
+			"failure_destination_size":         0,
+			"failure_destination_sha1":         "",
+			"failure_destination_tree_sha256":  "",
+			"failure_destination_tree_entries": 0,
+		})
 	if res.Error != nil {
 		return res.Error
 	}
@@ -557,7 +606,22 @@ func MarkProviderOperationApplied(id uint) error {
 	now := time.Now()
 	res := db.GetDb().Model(&model.WebDAVProviderOperation{}).
 		Where("id = ? AND state IN ?", id, []string{ProviderOperationStarted, ProviderOperationApplied}).
-		Updates(map[string]any{"state": ProviderOperationApplied, "applied_at": &now})
+		Updates(map[string]any{
+			"state":                            ProviderOperationApplied,
+			"applied_at":                       &now,
+			"recovery_count":                   0,
+			"last_recovery":                    "",
+			"last_error":                       "",
+			"last_checked_at":                  nil,
+			"failure_destination_observed":     false,
+			"failure_destination_object_id":    "",
+			"failure_destination_ready":        false,
+			"failure_destination_is_dir":       false,
+			"failure_destination_size":         0,
+			"failure_destination_sha1":         "",
+			"failure_destination_tree_sha256":  "",
+			"failure_destination_tree_entries": 0,
+		})
 	if res.Error != nil {
 		return res.Error
 	}
@@ -594,22 +658,55 @@ func MarkProviderOperationFailed(ctx context.Context, op *model.WebDAVProviderOp
 
 	failureObserved := false
 	failureObjectID := ""
+	failureReady := false
+	failureIsDir := false
+	var failureSize int64
+	failureSHA1 := ""
+	failureTreeSHA256 := ""
+	failureTreeEntries := 0
+
 	if remote, present, observeErr := providerOperationDestinationObject(ctx, op.DestinationPath); observeErr != nil {
 		lastError += "; destination evidence unavailable: " + observeErr.Error()
 	} else if present {
 		failureObserved = true
 		failureObjectID = remote.GetID()
+		failureIsDir = remote.IsDir()
+		failureSize = remote.GetSize()
+		if remote.IsDir() {
+			fingerprint, entries, fingerprintErr := providerDirectoryTreeFingerprint(
+				ctx,
+				op.DestinationPath,
+				providerOperationTreeDepth(op.Method, op.Depth),
+				false,
+			)
+			if fingerprintErr != nil {
+				lastError += "; destination tree evidence unavailable: " + fingerprintErr.Error()
+			} else {
+				failureReady = true
+				failureTreeSHA256 = fingerprint
+				failureTreeEntries = entries
+			}
+		} else {
+			failureSHA1 = strings.ToLower(remote.GetHash().GetHash(utils.SHA1))
+			failureReady = !providerRequiresPayloadHash(op.DestinationPath) || failureSHA1 != ""
+		}
 	}
 
 	res := db.GetDb().Model(&model.WebDAVProviderOperation{}).
 		Where("id = ? AND state IN ?", op.ID, []string{ProviderOperationStarted, ProviderOperationFailed}).
 		Updates(map[string]any{
-			"state":                         ProviderOperationFailed,
-			"last_error":                    lastError,
-			"last_checked_at":               &now,
-			"applied_at":                    nil,
-			"failure_destination_observed":  failureObserved,
-			"failure_destination_object_id": failureObjectID,
+			"state":                            ProviderOperationFailed,
+			"last_error":                       lastError,
+			"last_checked_at":                  &now,
+			"applied_at":                       nil,
+			"failure_destination_observed":     failureObserved,
+			"failure_destination_object_id":    failureObjectID,
+			"failure_destination_ready":        failureReady,
+			"failure_destination_is_dir":       failureIsDir,
+			"failure_destination_size":         failureSize,
+			"failure_destination_sha1":         failureSHA1,
+			"failure_destination_tree_sha256":  failureTreeSHA256,
+			"failure_destination_tree_entries": failureTreeEntries,
 		})
 	if res.Error != nil {
 		return res.Error
@@ -623,6 +720,12 @@ func MarkProviderOperationFailed(ctx context.Context, op *model.WebDAVProviderOp
 	op.AppliedAt = nil
 	op.FailureDestinationObserved = failureObserved
 	op.FailureDestinationObjectID = failureObjectID
+	op.FailureDestinationReady = failureReady
+	op.FailureDestinationIsDir = failureIsDir
+	op.FailureDestinationSize = failureSize
+	op.FailureDestinationSHA1 = failureSHA1
+	op.FailureDestinationTreeSHA256 = failureTreeSHA256
+	op.FailureDestinationTreeEntries = failureTreeEntries
 	return nil
 }
 
@@ -878,9 +981,20 @@ func providerOperationConfirmationDelay() time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// ObserveProviderOperationRecovery persists recovery evidence. A STARTED
-// operation needs two separated "not applied" observations before WebDAV may
-// execute the provider mutation again; one stale 115 view is never sufficient.
+func providerOperationRecoveryDue(op *model.WebDAVProviderOperation, now time.Time) bool {
+	if op == nil || op.LastCheckedAt == nil {
+		return true
+	}
+	return !now.Before(op.LastCheckedAt.Add(providerOperationConfirmationDelay()))
+}
+
+func providerOperationNeedsNotAppliedConfirmation(state string) bool {
+	return state == ProviderOperationStarted || state == ProviderOperationFailed
+}
+
+// ObserveProviderOperationRecovery persists recovery evidence. STARTED and
+// FAILED operations need two separated "not applied" observations before
+// WebDAV may retry or clean provider state; one stale 115 view is insufficient.
 func ObserveProviderOperationRecovery(op *model.WebDAVProviderOperation, recovery ProviderOperationRecovery, checkErr error) (bool, error) {
 	if op == nil || op.ID == 0 {
 		return recovery != ProviderOperationInconclusive && checkErr == nil, nil
@@ -906,7 +1020,8 @@ func ObserveProviderOperationRecovery(op *model.WebDAVProviderOperation, recover
 		if sameObservation {
 			count = locked.RecoveryCount + 1
 		}
-		if recovery == ProviderOperationNotApplied && locked.State == ProviderOperationStarted {
+		if recovery == ProviderOperationNotApplied &&
+			providerOperationNeedsNotAppliedConfirmation(locked.State) {
 			confirmed = sameObservation &&
 				locked.RecoveryCount >= 1 &&
 				locked.LastCheckedAt != nil &&
@@ -1003,6 +1118,13 @@ func ReconcileProviderOperationMetadata(op *model.WebDAVProviderOperation) error
 	return CopyTreeMetadata(op.SourcePath, op.DestinationPath, sourceRoot)
 }
 
+func providerOperationDestinationGenerationAdvanced(op *model.WebDAVProviderOperation, dst *model.WebDAVWritebackObject) bool {
+	if op == nil || dst == nil || op.DestinationGeneration == 0 {
+		return true
+	}
+	return dst.Generation > op.DestinationGeneration
+}
+
 func ProviderOperationMetadataApplied(op *model.WebDAVProviderOperation) (bool, error) {
 	if op == nil {
 		return false, nil
@@ -1010,6 +1132,12 @@ func ProviderOperationMetadataApplied(op *model.WebDAVProviderOperation) (bool, 
 	dst, err := getByPath(op.DestinationPath)
 	if err != nil || dst == nil || dst.State == StateDeleted || dst.IsDir != op.SourceIsDir {
 		return false, err
+	}
+	if !providerOperationDestinationGenerationAdvanced(op, dst) {
+		// A pre-existing canonical destination root is not proof that the
+		// provider operation's metadata transaction completed. Reconciliation
+		// always advances its generation.
+		return false, nil
 	}
 	if !op.SourceIsDir {
 		if dst.Size != op.SourceSize {
@@ -1150,6 +1278,14 @@ func exactRemoteByName(objs []model.Obj, name string) model.Obj {
 }
 
 func deleteCompletedCanonical(row *model.WebDAVWritebackObject) (bool, error) {
+	if row == nil {
+		return false, nil
+	}
+	if ops, err := activeProviderOperations(); err != nil {
+		return false, err
+	} else if providerOperationProtectsCanonicalPath(ops, row.Path, time.Now()) {
+		return false, nil
+	}
 	res := db.GetDb().
 		Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
 		Delete(&model.WebDAVWritebackObject{})
@@ -1277,6 +1413,10 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 	if len(rows) == 0 {
 		return remote, false, nil
 	}
+	activeOps, err := activeProviderOperations()
+	if err != nil {
+		return nil, false, err
+	}
 
 	byName := make(map[string]model.Obj, len(remote)+len(rows))
 	order := make([]string, 0, len(remote)+len(rows))
@@ -1290,13 +1430,14 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 	now := time.Now()
 	for i := range rows {
 		row := &rows[i]
+		protectedByProviderOperation := providerOperationProtectsCanonicalPath(activeOps, row.Path, now)
 		if row.State == StateDeleted {
 			delete(byName, row.Name)
 			continue
 		}
 		remoteObj, remotePresent := byName[row.Name]
 		if row.IsDir {
-			if remoteReliable && directoryShadowExpired(row, now) {
+			if !protectedByProviderOperation && remoteReliable && directoryShadowExpired(row, now) {
 				res := db.GetDb().
 					Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateCompleted).
 					Delete(&model.WebDAVWritebackObject{})
@@ -1312,7 +1453,8 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 				continue
 			}
 		}
-		if shouldDropCanonicalAfterRemoteList(row, remoteReliable, remoteObj, now, providerRequiresPayloadHash(row.Path)) {
+		if !protectedByProviderOperation &&
+			shouldDropCanonicalAfterRemoteList(row, remoteReliable, remoteObj, now, providerRequiresPayloadHash(row.Path)) {
 			res := db.GetDb().
 				Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
 				Delete(&model.WebDAVWritebackObject{})
@@ -2904,13 +3046,33 @@ func failedProviderCopyCleanupAllowed(op *model.WebDAVProviderOperation, current
 		return true
 	}
 	currentID := current.GetID()
-	if op.FailureDestinationObjectID != "" && currentID != "" {
-		return op.FailureDestinationObjectID == currentID
+	if op.FailureDestinationObjectID != "" && currentID != "" &&
+		op.FailureDestinationObjectID != currentID {
+		return false
 	}
 	if strictIdentity {
-		// 115 cleanup must never delete an object that was not positively
-		// identified at the time this COPY failed.
-		return op.FailureDestinationObserved && op.FailureDestinationObjectID != "" && currentID != ""
+		if !op.FailureDestinationObserved ||
+			!op.FailureDestinationReady ||
+			op.FailureDestinationObjectID == "" ||
+			currentID == "" ||
+			op.FailureDestinationObjectID != currentID {
+			return false
+		}
+	}
+	if op.FailureDestinationObserved && current.IsDir() != op.FailureDestinationIsDir {
+		return false
+	}
+	if !current.IsDir() && op.FailureDestinationReady {
+		if current.GetSize() != op.FailureDestinationSize {
+			return false
+		}
+		currentSHA1 := strings.ToLower(current.GetHash().GetHash(utils.SHA1))
+		if op.FailureDestinationSHA1 != "" {
+			return currentSHA1 != "" && strings.EqualFold(currentSHA1, op.FailureDestinationSHA1)
+		}
+		if strictIdentity {
+			return false
+		}
 	}
 	return true
 }
@@ -2943,6 +3105,21 @@ func CleanupFailedProviderCopy(ctx context.Context, op *model.WebDAVProviderOper
 	strictIdentity := providerRequiresPayloadHash(op.DestinationPath)
 	if !failedProviderCopyCleanupAllowed(op, current, strictIdentity) {
 		return false, ErrProviderOperationStale
+	}
+	if current.IsDir() && op.FailureDestinationReady {
+		fingerprint, entries, fingerprintErr := providerDirectoryTreeFingerprint(
+			ctx,
+			op.DestinationPath,
+			providerOperationTreeDepth(op.Method, op.Depth),
+			false,
+		)
+		if fingerprintErr != nil {
+			return false, fingerprintErr
+		}
+		if entries != op.FailureDestinationTreeEntries ||
+			!strings.EqualFold(fingerprint, op.FailureDestinationTreeSHA256) {
+			return false, ErrProviderOperationStale
+		}
 	}
 	if err := fs.Remove(ctx, op.DestinationPath); err != nil && !errs.IsObjectNotFound(err) {
 		return false, err
@@ -3028,6 +3205,9 @@ func (m *workerManager) maintainProviderOperations() {
 			} else {
 				retired++
 			}
+			continue
+		}
+		if !providerOperationRecoveryDue(op, now) {
 			continue
 		}
 
