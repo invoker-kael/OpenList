@@ -89,13 +89,13 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 		State:     StateCompleted,
 		SpoolPath: "",
 	}
-	if !shouldDropCanonicalAfterRemoteList(completedNoSpool, true, false, time.Now()) {
+	if !shouldDropCanonicalAfterRemoteList(completedNoSpool, true, nil, time.Now()) {
 		t.Fatal("missing remote object should be surfaced after a reliable listing")
 	}
-	if shouldDropCanonicalAfterRemoteList(completedNoSpool, false, false, time.Now()) {
+	if shouldDropCanonicalAfterRemoteList(completedNoSpool, false, nil, time.Now()) {
 		t.Fatal("provider/listing failure must not drop canonical metadata")
 	}
-	if shouldDropCanonicalAfterRemoteList(completedNoSpool, true, true, time.Now()) {
+	if shouldDropCanonicalAfterRemoteList(completedNoSpool, true, &model.Object{Size: completedNoSpool.Size}, time.Now()) {
 		t.Fatal("present remote object must keep canonical metadata")
 	}
 
@@ -103,7 +103,7 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 		State:     StateCompleted,
 		SpoolPath: "/spool/object.data",
 	}
-	if shouldDropCanonicalAfterRemoteList(completedCached, true, false, time.Now()) {
+	if shouldDropCanonicalAfterRemoteList(completedCached, true, nil, time.Now()) {
 		t.Fatal("locally cached completed object must remain authoritative")
 	}
 
@@ -111,7 +111,7 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 		State:     StateQueued,
 		SpoolPath: "/spool/object.data",
 	}
-	if shouldDropCanonicalAfterRemoteList(queued, true, false, time.Now()) {
+	if shouldDropCanonicalAfterRemoteList(queued, true, nil, time.Now()) {
 		t.Fatal("pending upload must remain visible even before provider listing catches up")
 	}
 }
@@ -372,7 +372,7 @@ func TestCanonicalShadowGraceProtectsFreshCompletedFile(t *testing.T) {
 	if !canonicalShadowInGrace(row, now) {
 		t.Fatal("fresh completed file metadata should stay canonical during provider consistency grace")
 	}
-	if shouldDropCanonicalAfterRemoteList(row, true, false, now) {
+	if shouldDropCanonicalAfterRemoteList(row, true, nil, now) {
 		t.Fatal("fresh completed file must not be dropped on a transient provider miss")
 	}
 
@@ -595,6 +595,64 @@ func TestDeleteParentMissing(t *testing.T) {
 	}
 	if deleteParentMissing(errors.New("network failure")) {
 		t.Fatal("unrelated provider failure must not be treated as descendant absence")
+	}
+}
+
+func TestRemoteContentMatchesCanonical(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	row := &model.WebDAVWritebackObject{
+		Size:        8192,
+		PayloadSHA1: sha,
+	}
+	same := &model.Object{
+		Size:     8192,
+		HashInfo: utils.NewHashInfo(utils.SHA1, strings.ToUpper(sha)),
+	}
+	if !remoteContentMatchesCanonical(row, same) {
+		t.Fatal("same size and SHA1 should retain canonical metadata")
+	}
+	if remoteContentMatchesCanonical(row, &model.Object{Size: 4096, HashInfo: same.HashInfo}) {
+		t.Fatal("provider size change must invalidate canonical metadata")
+	}
+	if remoteContentMatchesCanonical(row, &model.Object{Size: 8192, HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40))}) {
+		t.Fatal("provider SHA1 change must invalidate canonical metadata")
+	}
+	if !remoteContentMatchesCanonical(row, &model.Object{Size: 8192}) {
+		t.Fatal("missing provider hash should not create a false content mismatch")
+	}
+
+	dir := &model.WebDAVWritebackObject{IsDir: true}
+	if !remoteContentMatchesCanonical(dir, &model.Object{IsFolder: true}) {
+		t.Fatal("same-type directory should reconcile by provider visibility")
+	}
+	if remoteContentMatchesCanonical(dir, &model.Object{}) {
+		t.Fatal("resource type mismatch must invalidate canonical metadata")
+	}
+}
+
+func TestRefreshUnknownProviderOverwrite(t *testing.T) {
+	now := time.Now()
+	row := &model.WebDAVWritebackObject{
+		Path:        "/dst/old.bin",
+		PathKey:     pathKey("/dst/old.bin"),
+		Generation:  4,
+		Size:        512,
+		State:       StateCompleted,
+		SpoolPath:   "/spool/old.data",
+		PayloadSHA1: strings.Repeat("a", 40),
+	}
+	refreshUnknownProviderOverwrite(row, now)
+	if row.Generation != 5 || row.State != StateCompleted {
+		t.Fatalf("unknown overwrite row generation/state = %d/%s", row.Generation, row.State)
+	}
+	if row.SpoolPath != "" {
+		t.Fatal("old destination spool must stop being authoritative after provider overwrite")
+	}
+	if row.PayloadSHA1 == "" {
+		t.Fatal("old SHA1 should remain temporarily as reconciliation evidence")
+	}
+	if row.CompletedAt == nil || !row.CompletedAt.Equal(now) {
+		t.Fatal("unknown provider overwrite must receive a fresh consistency grace")
 	}
 }
 

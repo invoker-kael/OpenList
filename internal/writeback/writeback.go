@@ -131,10 +131,38 @@ func Canonical(p string) (obj model.Obj, found bool, deleted bool, err error) {
 	return toObject(row), true, false, nil
 }
 
-// ReconcileDirect confirms that a completed canonical object whose local
-// cache is gone has not disappeared from the provider. 115 single-object Get
-// can transiently lie, so a miss/type mismatch is only trusted after a
-// force-refreshed exact-name parent listing agrees.
+func remoteContentMatchesCanonical(row *model.WebDAVWritebackObject, remote model.Obj) bool {
+	if row == nil || remote == nil || remote.IsDir() != row.IsDir {
+		return false
+	}
+	if row.IsDir {
+		return true
+	}
+	if remote.GetSize() != row.Size {
+		return false
+	}
+	if row.PayloadSHA1 != "" {
+		remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
+		if remoteSHA1 != "" && !strings.EqualFold(remoteSHA1, row.PayloadSHA1) {
+			return false
+		}
+	}
+	return true
+}
+
+func deleteCompletedCanonical(row *model.WebDAVWritebackObject) (bool, error) {
+	res := db.GetDb().
+		Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
+		Delete(&model.WebDAVWritebackObject{})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
+}
+
+// ReconcileDirect validates a completed canonical object after its local spool
+// cache is gone. Provider mtime is deliberately ignored; content identity is
+// based on resource type, size and SHA-1 when the provider exposes it.
 func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	if !Enabled() {
 		return false, nil
@@ -149,7 +177,14 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 
 	remote, getErr := fs.Get(ctx, row.Path, &fs.GetArgs{NoLog: true})
 	if getErr == nil && remote != nil && remote.IsDir() == row.IsDir {
-		return false, nil
+		if !row.IsDir && remoteContentMatchesCanonical(row, remote) {
+			return false, nil
+		}
+		// Expired directory shadows hand control back to the provider. For files,
+		// a known size/SHA1 mismatch exposes the real remote object so one-way
+		// Cloud Sync can repair it.
+		_, delErr := deleteCompletedCanonical(row)
+		return false, delErr
 	}
 	if getErr != nil && !errs.IsObjectNotFound(getErr) {
 		return false, nil
@@ -164,32 +199,36 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 			continue
 		}
 		if obj.IsDir() == row.IsDir {
-			return false, nil
+			if !row.IsDir && remoteContentMatchesCanonical(row, obj) {
+				return false, nil
+			}
+			_, delErr := deleteCompletedCanonical(row)
+			return false, delErr
 		}
-		// The name exists with the wrong resource type. Stop shadowing it so
-		// Cloud Sync can observe the real provider conflict.
-		res := db.GetDb().
-			Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
-			Delete(&model.WebDAVWritebackObject{})
-		return false, res.Error
+		// The name exists with the wrong resource type.
+		_, delErr := deleteCompletedCanonical(row)
+		return false, delErr
 	}
 
-	res := db.GetDb().
-		Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
-		Delete(&model.WebDAVWritebackObject{})
-	if res.Error != nil {
-		return false, res.Error
+	dropped, delErr := deleteCompletedCanonical(row)
+	if delErr != nil {
+		return false, delErr
 	}
-	return res.RowsAffected > 0, nil
+	return dropped, nil
 }
 
-func shouldDropCanonicalAfterRemoteList(row *model.WebDAVWritebackObject, remoteReliable, remotePresent bool, now time.Time) bool {
-	return remoteReliable &&
-		!row.IsDir &&
-		!remotePresent &&
-		row.State == StateCompleted &&
-		row.SpoolPath == "" &&
-		!canonicalShadowInGrace(row, now)
+func shouldDropCanonicalAfterRemoteList(row *model.WebDAVWritebackObject, remoteReliable bool, remote model.Obj, now time.Time) bool {
+	if !remoteReliable ||
+		row.IsDir ||
+		row.State != StateCompleted ||
+		row.SpoolPath != "" ||
+		canonicalShadowInGrace(row, now) {
+		return false
+	}
+	if remote == nil {
+		return true
+	}
+	return !remoteContentMatchesCanonical(row, remote)
 }
 
 func canonicalShadowInGrace(row *model.WebDAVWritebackObject, now time.Time) bool {
@@ -242,7 +281,7 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 			delete(byName, row.Name)
 			continue
 		}
-		_, remotePresent := byName[row.Name]
+		remoteObj, remotePresent := byName[row.Name]
 		if row.IsDir {
 			if remoteReliable && directoryShadowExpired(row, now) {
 				res := db.GetDb().
@@ -260,7 +299,7 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 				continue
 			}
 		}
-		if shouldDropCanonicalAfterRemoteList(row, remoteReliable, remotePresent, now) {
+		if shouldDropCanonicalAfterRemoteList(row, remoteReliable, remoteObj, now) {
 			res := db.GetDb().
 				Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
 				Delete(&model.WebDAVWritebackObject{})
@@ -1257,6 +1296,19 @@ func providerOverwriteQuiescent(rows []model.WebDAVWritebackObject) bool {
 	return true
 }
 
+func refreshUnknownProviderOverwrite(row *model.WebDAVWritebackObject, now time.Time) {
+	row.Generation++
+	row.ETag = canonicalETag(pathKey(row.Path), row.Generation, row.Size)
+	row.State = StateCompleted
+	row.SpoolPath = ""
+	row.CleanupPath = ""
+	row.LastError = ""
+	row.RetryCount = 0
+	row.VerifyCount = 0
+	row.RetryAt = nil
+	row.CompletedAt = &now
+}
+
 func setProviderCompletedRoot(row *model.WebDAVWritebackObject, dst string, source model.Obj, now time.Time) {
 	dst = utils.FixAndCleanPath(dst)
 	if row.Generation == 0 {
@@ -1389,7 +1441,8 @@ func CopyTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 				if row.SpoolPath != "" {
 					staleSpools = append(staleSpools, row.SpoolPath)
 				}
-				if err := tx.Delete(&model.WebDAVWritebackObject{}, row.ID).Error; err != nil {
+				refreshUnknownProviderOverwrite(row, now)
+				if err := tx.Save(row).Error; err != nil {
 					return err
 				}
 			}
@@ -1499,10 +1552,7 @@ func CopyTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 			if destinationRow.SpoolPath != "" {
 				staleSpools = append(staleSpools, destinationRow.SpoolPath)
 			}
-			if destinationRow.State == StateDeleted {
-				continue
-			}
-			tombstoneMovedSource(destinationRow, now)
+			refreshUnknownProviderOverwrite(destinationRow, now)
 			if err := tx.Save(destinationRow).Error; err != nil {
 				return err
 			}
@@ -1587,7 +1637,8 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 				if row.SpoolPath != "" {
 					staleSpools = append(staleSpools, row.SpoolPath)
 				}
-				if err := tx.Delete(&model.WebDAVWritebackObject{}, row.ID).Error; err != nil {
+				refreshUnknownProviderOverwrite(row, now)
+				if err := tx.Save(row).Error; err != nil {
 					return err
 				}
 			}
@@ -1718,10 +1769,7 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 			if destinationRow.SpoolPath != "" {
 				staleSpools = append(staleSpools, destinationRow.SpoolPath)
 			}
-			if destinationRow.State == StateDeleted {
-				continue
-			}
-			tombstoneMovedSource(destinationRow, now)
+			refreshUnknownProviderOverwrite(destinationRow, now)
 			if err := tx.Save(destinationRow).Error; err != nil {
 				return err
 			}
