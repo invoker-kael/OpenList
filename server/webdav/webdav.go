@@ -732,7 +732,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 				return http.StatusInternalServerError, err
 			}
 			if !dstExisted || dstTracked {
-				handled, overwritten, wbErr := writeback.CopyPending(src, dst, overwrite)
+				handled, overwritten, wbErr := writeback.CopyPending(src, dst, overwrite, depth != 0)
 				if errors.Is(wbErr, writeback.ErrDestinationExists) {
 					return http.StatusPreconditionFailed, wbErr
 				}
@@ -746,15 +746,13 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 					return http.StatusCreated, nil
 				}
 			}
-			if dstTracked {
-				_, busy, prepErr := writeback.ProviderOverwriteReady(dst)
-				if prepErr != nil {
-					return http.StatusInternalServerError, prepErr
-				}
-				if busy {
-					w.Header().Set("Retry-After", "2")
-					return http.StatusServiceUnavailable, nil
-				}
+			_, busy, prepErr := writeback.ProviderOverwriteReady(dst)
+			if prepErr != nil {
+				return http.StatusInternalServerError, prepErr
+			}
+			if busy {
+				w.Header().Set("Retry-After", "2")
+				return http.StatusServiceUnavailable, nil
 			}
 		}
 
@@ -810,15 +808,13 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 				return http.StatusCreated, nil
 			}
 		}
-		if dstTracked {
-			_, busy, prepErr := writeback.ProviderOverwriteReady(dst)
-			if prepErr != nil {
-				return http.StatusInternalServerError, prepErr
-			}
-			if busy {
-				w.Header().Set("Retry-After", "2")
-				return http.StatusServiceUnavailable, nil
-			}
+		_, busy, prepErr := writeback.ProviderOverwriteReady(dst)
+		if prepErr != nil {
+			return http.StatusInternalServerError, prepErr
+		}
+		if busy {
+			w.Header().Set("Retry-After", "2")
+			return http.StatusServiceUnavailable, nil
 		}
 	}
 

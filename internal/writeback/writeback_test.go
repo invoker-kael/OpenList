@@ -399,3 +399,43 @@ func TestProviderOverwriteQuiescent(t *testing.T) {
 	}
 }
 
+func TestPendingDirectoryCopyLocalAuthority(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{
+		WebDAVWriteback: conf.WebDAVWritebackConfig{DirectoryGraceSeconds: 60},
+	}
+	defer func() { conf.Conf = oldConf }()
+
+	now := time.Now()
+	completed := now.Add(-2 * time.Minute)
+	root := model.WebDAVWritebackObject{
+		Path:        "/encrypted/album",
+		IsDir:       true,
+		State:       StateCompleted,
+		CompletedAt: &completed,
+	}
+	rows := []model.WebDAVWritebackObject{
+		root,
+		{
+			Path:      "/encrypted/album/file.bin",
+			State:     StateCompleted,
+			SpoolPath: "",
+		},
+	}
+
+	if !pendingDirectoryCopyLocallyAuthoritative(&rows[0], rows, now, false) {
+		t.Fatal("Depth: 0 directory COPY only needs the canonical collection itself")
+	}
+	if pendingDirectoryCopyLocallyAuthoritative(&rows[0], rows, now, true) {
+		t.Fatal("recursive directory COPY must fall back when a live file has no local spool")
+	}
+
+	rows[0].State = StateQueued
+	rows[0].CompletedAt = nil
+	rows[1].State = StateQueued
+	rows[1].SpoolPath = "/spool/file.data"
+	if !pendingDirectoryCopyLocallyAuthoritative(&rows[0], rows, now, true) {
+		t.Fatal("recursive pending directory with all live payloads spooled should use the local fast path")
+	}
+}
+

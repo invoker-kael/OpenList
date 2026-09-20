@@ -878,6 +878,118 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 	return handled, overwritten, nil
 }
 
+func pendingDirectoryCopyLocallyAuthoritative(root *model.WebDAVWritebackObject, rows []model.WebDAVWritebackObject, now time.Time, recursive bool) bool {
+	if root == nil || !root.IsDir || root.State == StateDeleted {
+		return false
+	}
+	if !recursive {
+		return true
+	}
+	return pendingDirectoryMoveLocallyAuthoritative(root, rows, now)
+}
+
+var errPendingDirectoryCopyFallback = errors.New("pending directory copy requires provider fallback")
+
+func copyPendingDirectory(src, dst string, recursive bool) (handled bool, overwritten bool, err error) {
+	if isPathOrDescendant(dst, src) {
+		return false, false, nil
+	}
+
+	now := time.Now()
+	err = db.GetDb().Transaction(func(tx *gorm.DB) error {
+		var candidates []model.WebDAVWritebackObject
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("path = ? OR path LIKE ? OR path = ? OR path LIKE ?", src, src+"%", dst, dst+"%").
+			Order("id asc").
+			Find(&candidates).Error; err != nil {
+			return err
+		}
+
+		sourceRows := make([]model.WebDAVWritebackObject, 0, len(candidates))
+		destinationRows := make([]model.WebDAVWritebackObject, 0, len(candidates))
+		rootIndex := -1
+		for i := range candidates {
+			row := candidates[i]
+			if isPathOrDescendant(row.Path, src) {
+				if row.Path == src {
+					rootIndex = len(sourceRows)
+				}
+				sourceRows = append(sourceRows, row)
+			}
+			if isPathOrDescendant(row.Path, dst) {
+				destinationRows = append(destinationRows, row)
+			}
+		}
+		if rootIndex < 0 || !pendingDirectoryCopyLocallyAuthoritative(&sourceRows[rootIndex], sourceRows, now, recursive) {
+			return errPendingDirectoryCopyFallback
+		}
+
+		// The asynchronous local-tree fast path is intentionally create-only.
+		// Replacing an existing remote directory may leave provider-only children
+		// that are unknown to canonical state; delegate that case to provider
+		// overwrite semantics instead of accidentally merging two trees.
+		if len(destinationRows) != 0 {
+			return errPendingDirectoryCopyFallback
+		}
+
+		for i := range sourceRows {
+			sourceRow := &sourceRows[i]
+			if sourceRow.State == StateDeleted {
+				continue
+			}
+			if !recursive && sourceRow.Path != src {
+				continue
+			}
+
+			suffix := strings.TrimPrefix(sourceRow.Path, src)
+			newPath := utils.FixAndCleanPath(dst + suffix)
+			newParent := path.Dir(newPath)
+			retryAt := now
+			spoolPath := ""
+			payloadSHA1 := ""
+			if !sourceRow.IsDir {
+				spoolPath = sourceRow.SpoolPath
+				payloadSHA1 = sourceRow.PayloadSHA1
+				retryAt = now.Add(cloudSyncSettleDelay(sourceRow.Size))
+			}
+
+			row := model.WebDAVWritebackObject{
+				PathKey:      pathKey(newPath),
+				ParentKey:    pathKey(newParent),
+				Path:         newPath,
+				Parent:       newParent,
+				Name:         path.Base(newPath),
+				IsDir:        sourceRow.IsDir,
+				Size:         sourceRow.Size,
+				ModTime:      sourceRow.ModTime,
+				CreateTime:   sourceRow.CreateTime,
+				ETag:         canonicalETag(pathKey(newPath), 1, sourceRow.Size),
+				Generation:   1,
+				State:        StateQueued,
+				SpoolPath:    spoolPath,
+				PayloadSHA1:  payloadSHA1,
+				MimeType:     sourceRow.MimeType,
+				RetryAt:      &retryAt,
+			}
+			if err := tx.Create(&row).Error; err != nil {
+				return err
+			}
+		}
+		handled = true
+		return nil
+	})
+	if errors.Is(err, errPendingDirectoryCopyFallback) {
+		return false, false, nil
+	}
+	if err != nil {
+		return true, false, err
+	}
+	if handled {
+		wake()
+	}
+	return handled, false, nil
+}
+
 // MovePending handles an exact pending file move without waiting for provider
 // visibility. The source always becomes an immediate tombstone, even when the
 // destination did not previously exist. This prevents a provider-visible old
@@ -996,7 +1108,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 // This lets Cloud Sync COPY a file immediately after PUT, before 115 exposes
 // the source object. The source and destination safely reference the same
 // immutable generation spool payload until their independent uploads finish.
-func CopyPending(src, dst string, overwrite bool) (handled bool, overwritten bool, err error) {
+func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool, overwritten bool, err error) {
 	src = utils.FixAndCleanPath(src)
 	dst = utils.FixAndCleanPath(dst)
 	if src == dst {
@@ -1009,7 +1121,13 @@ func CopyPending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		}
 		return false, false, err
 	}
-	if srcRow.IsDir || srcRow.State == StateDeleted || srcRow.SpoolPath == "" {
+	if srcRow.State == StateDeleted {
+		return false, false, nil
+	}
+	if srcRow.IsDir {
+		return copyPendingDirectory(src, dst, recursive)
+	}
+	if srcRow.SpoolPath == "" {
 		return false, false, nil
 	}
 
