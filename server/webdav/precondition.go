@@ -6,14 +6,19 @@ import (
 	"time"
 )
 
-// putPreconditionFailed implements the entity-tag conditions relevant to PUT.
-// If-Match uses strong comparison; If-None-Match uses weak comparison.
-func putPreconditionFailed(ifMatch, ifNoneMatch string, exists bool, currentETag string) bool {
+// putPreconditionFailed implements RFC 7232 write preconditions relevant to
+// PUT. Evaluation order matters: If-Match takes precedence over
+// If-Unmodified-Since, then If-None-Match is evaluated.
+func putPreconditionFailed(ifMatch, ifNoneMatch, ifUnmodifiedSince string, exists bool, currentETag string, modTime time.Time) bool {
 	if ifMatch != "" {
 		if !exists {
 			return true
 		}
 		if strings.TrimSpace(ifMatch) != "*" && !etagListMatches(ifMatch, currentETag, false) {
+			return true
+		}
+	} else if ifUnmodifiedSince != "" && exists && !modTime.IsZero() {
+		if t, err := http.ParseTime(ifUnmodifiedSince); err == nil && modTime.UTC().Truncate(time.Second).After(t.UTC()) {
 			return true
 		}
 	}

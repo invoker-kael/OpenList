@@ -8,12 +8,14 @@ import (
 
 func TestPutPreconditions(t *testing.T) {
 	tests := []struct {
-		name        string
-		ifMatch     string
-		ifNoneMatch string
-		exists      bool
-		etag        string
-		failed      bool
+		name              string
+		ifMatch           string
+		ifNoneMatch       string
+		ifUnmodifiedSince string
+		exists            bool
+		etag              string
+		modTime           time.Time
+		failed            bool
 	}{
 		{name: "no conditions", exists: false, failed: false},
 		{name: "if match star existing", ifMatch: "*", exists: true, etag: "\"v1\"", failed: false},
@@ -27,10 +29,40 @@ func TestPutPreconditions(t *testing.T) {
 		{name: "if none match weak", ifNoneMatch: "W/\"v1\"", exists: true, etag: "\"v1\"", failed: true},
 		{name: "if none match other", ifNoneMatch: "\"v0\"", exists: true, etag: "\"v1\"", failed: false},
 		{name: "etag list", ifMatch: "\"v0\", \"v1\"", exists: true, etag: "\"v1\"", failed: false},
+		{
+			name:              "if unmodified since stale",
+			ifUnmodifiedSince: time.Date(2026, time.September, 20, 4, 59, 0, 0, time.UTC).Format(http.TimeFormat),
+			exists:            true,
+			modTime:           time.Date(2026, time.September, 20, 5, 0, 0, 0, time.UTC),
+			failed:            true,
+		},
+		{
+			name:              "if unmodified since current",
+			ifUnmodifiedSince: time.Date(2026, time.September, 20, 5, 0, 0, 0, time.UTC).Format(http.TimeFormat),
+			exists:            true,
+			modTime:           time.Date(2026, time.September, 20, 5, 0, 0, 0, time.UTC),
+			failed:            false,
+		},
+		{
+			name:              "if match takes precedence over stale date",
+			ifMatch:           "\"v1\"",
+			ifUnmodifiedSince: time.Date(2026, time.September, 20, 4, 59, 0, 0, time.UTC).Format(http.TimeFormat),
+			exists:            true,
+			etag:              "\"v1\"",
+			modTime:           time.Date(2026, time.September, 20, 5, 0, 0, 0, time.UTC),
+			failed:            false,
+		},
+		{
+			name:              "malformed date ignored",
+			ifUnmodifiedSince: "not-a-date",
+			exists:            true,
+			modTime:           time.Date(2026, time.September, 20, 5, 0, 0, 0, time.UTC),
+			failed:            false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := putPreconditionFailed(tt.ifMatch, tt.ifNoneMatch, tt.exists, tt.etag); got != tt.failed {
+			if got := putPreconditionFailed(tt.ifMatch, tt.ifNoneMatch, tt.ifUnmodifiedSince, tt.exists, tt.etag, tt.modTime); got != tt.failed {
 				t.Fatalf("putPreconditionFailed() = %v, want %v", got, tt.failed)
 			}
 		})

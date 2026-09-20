@@ -422,8 +422,8 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 		return status, err
 	}
 	defer release()
-	// TODO(rost): Support the If-Match, If-None-Match headers? See bradfitz'
-	// comments in http.checkEtag.
+	// Canonical write-back metadata owns conditional PUT evaluation so provider
+	// ETags/mtimes cannot make a Cloud Sync retry target the wrong generation.
 	ctx := r.Context()
 	user := ctx.Value(conf.UserKey).(*model.User)
 	reqPath, err = user.JoinPath(reqPath)
@@ -478,7 +478,8 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	// provider lookups.
 	ifMatch := r.Header.Get("If-Match")
 	ifNoneMatch := r.Header.Get("If-None-Match")
-	if ifMatch != "" || ifNoneMatch != "" {
+	ifUnmodifiedSince := r.Header.Get("If-Unmodified-Since")
+	if ifMatch != "" || ifNoneMatch != "" || ifUnmodifiedSince != "" {
 		var current model.Obj
 		exists := false
 		current, found, deleted, wbErr := writeback.Canonical(reqPath)
@@ -499,13 +500,17 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 			}
 		}
 		etag := ""
+		modTime := time.Time{}
 		if exists {
-			etag, err = findETag(ctx, h.LockSystem, reqPath, current)
-			if err != nil {
-				return http.StatusInternalServerError, err
+			modTime = current.ModTime()
+			if ifMatch != "" || ifNoneMatch != "" {
+				etag, err = findETag(ctx, h.LockSystem, reqPath, current)
+				if err != nil {
+					return http.StatusInternalServerError, err
+				}
 			}
 		}
-		if putPreconditionFailed(ifMatch, ifNoneMatch, exists, etag) {
+		if putPreconditionFailed(ifMatch, ifNoneMatch, ifUnmodifiedSince, exists, etag, modTime) {
 			return http.StatusPreconditionFailed, nil
 		}
 	}

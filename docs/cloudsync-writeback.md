@@ -194,7 +194,7 @@ A 115 single-object NotFound or type mismatch is never trusted alone. OpenList f
 
 Canonical `HEAD` responses also pin `Content-Length` to the MySQL generation size. If a completed object has to fall back to transparent provider proxying after its local spool expires, OpenList restores the canonical `ETag`, `Last-Modified`, `Content-Type` and `Content-Length` after copying provider headers. This keeps `PROPFIND` and `HEAD` from presenting two different identities for the same encrypted payload during provider metadata drift.
 
-Canonical `GET`/`HEAD` conditional requests are evaluated before any 115 request. `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since` therefore use the MySQL generation ETag/mtime rather than provider validators. After evaluation those headers are removed before proxying so 115 cannot re-decide the request with a different ETag. `If-Range` is evaluated against the canonical generation as well: a match preserves the byte range, while a mismatch intentionally downgrades to a full-body response. Non-range canonical GET/HEAD responses pin `Content-Length` to the canonical encrypted size.
+Canonical `GET`/`HEAD` conditional requests are evaluated before any 115 request. `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since` therefore use the MySQL generation ETag/mtime rather than provider validators. After evaluation those headers are removed before proxying so 115 cannot re-decide the request with a different ETag. `If-Range` is evaluated against the canonical generation as well: a match preserves the byte range, while a mismatch intentionally downgrades to a full-body response. Non-range canonical GET/HEAD responses pin `Content-Length` to the canonical encrypted size. Conditional `PUT` now uses the same canonical identity: `If-Match`, `If-Unmodified-Since` and `If-None-Match` are evaluated in RFC order against the current MySQL generation before Cloud Sync upload data is committed, preventing a provider ETag/mtime drift from turning a retry into an overwrite of the wrong generation.
 
 ### Change identity for one-way encrypted upload
 
@@ -212,3 +212,8 @@ This fork also hardens the 115 Open driver under the write-back workload:
 
 - `Get()` falls back to the parent listing when a non-directory object has suspicious `size <= 0` or an invalid modification time, covering the post-upload incomplete-metadata window seen by Cloud Sync.
 - failed or canceled OSS multipart uploads explicitly call `AbortMultipartUpload` before retry, avoiding accumulation of unfinished multipart sessions.
+
+
+### Branch validation policy
+
+The focused WebDAV write-back workflow is intentionally not triggered by ordinary pushes to `feature/cloudsync-writeback`. During compatibility work, related changes can accumulate without repeatedly canceling/rerunning the same CI. Validation remains available through `workflow_dispatch`, and pull requests targeting `main` still run the focused write-back suite automatically.

@@ -2012,21 +2012,32 @@ func Stop() {
 }
 
 func (m *workerManager) recoverInterrupted() error {
-	// An UPLOADING row is ambiguous after a process crash: the provider may
-	// already contain the exact encrypted payload even though MySQL never
-	// durably recorded VERIFYING. Resume it in VERIFYING so the normal
-	// multi-attempt size/SHA-1 window runs before any retransmission. If the
-	// object never becomes visible, processVerify re-queues the durable spool
-	// for upload after the verification window expires.
+	// An UPLOADING file is ambiguous after a process crash: 115 may already
+	// contain the exact encrypted payload even though MySQL never recorded
+	// VERIFYING. Resume files in VERIFYING so the normal size/SHA-1 window runs
+	// before retransmission. Directories have no payload/hash verification, so
+	// re-queue interrupted MKCOL operations instead.
 	now := time.Now()
-	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("state = ?", StateUploading).
-		Updates(map[string]any{
-			"state":        StateVerifying,
-			"retry_at":     &now,
-			"verify_count": 0,
-			"last_error":   "resuming remote verification after interrupted upload",
-		}).Error
+	return db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.WebDAVWritebackObject{}).
+			Where("state = ? AND is_dir = ?", StateUploading, true).
+			Updates(map[string]any{
+				"state":        StateQueued,
+				"retry_at":     &now,
+				"verify_count": 0,
+				"last_error":   "re-queued interrupted directory creation",
+			}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.WebDAVWritebackObject{}).
+			Where("state = ? AND is_dir = ?", StateUploading, false).
+			Updates(map[string]any{
+				"state":        StateVerifying,
+				"retry_at":     &now,
+				"verify_count": 0,
+				"last_error":   "resuming remote verification after interrupted upload",
+			}).Error
+	})
 }
 
 func (m *workerManager) scheduler() {
@@ -2413,6 +2424,19 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 }
 
 func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
+	if row.IsDir {
+		now := time.Now()
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
+			Updates(map[string]any{
+				"state":        StateQueued,
+				"retry_at":     &now,
+				"verify_count": 0,
+				"last_error":   "directory verification state repaired to queued",
+			}).Error
+		return
+	}
+
 	requireHash := providerRequiresPayloadHash(row.Path)
 	remote, err := m.remoteForVerify(row)
 	if err == nil && remoteMatchesCanonical(row, remote, requireHash) {
