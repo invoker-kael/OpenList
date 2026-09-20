@@ -802,10 +802,10 @@ func DeleteTree(p string) (bool, error) {
 			if err := tx.Model(&model.WebDAVWritebackObject{}).
 				Where("id = ?", row.ID).
 				Updates(map[string]any{
-					"generation":   gorm.Expr("generation + 1"),
-					"state":        StateDeleted,
-					"retry_at":     &now,
-					"last_error":   "",
+					"generation":         gorm.Expr("generation + 1"),
+					"state":              StateDeleted,
+					"retry_at":           &now,
+					"last_error":         "",
 					"retry_count":        0,
 					"verify_count":       0,
 					"completed_at":       nil,

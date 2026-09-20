@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -146,6 +147,58 @@ func providerResourceAbsent(ctx context.Context, name string) (bool, error) {
 	return true, nil
 }
 
+func providerConsistencyConfirmationDelay(storageName string, verifyIntervalSeconds int) time.Duration {
+	if storageName != "115 Open" {
+		return 0
+	}
+	if verifyIntervalSeconds <= 0 {
+		verifyIntervalSeconds = 1
+	}
+	if verifyIntervalSeconds > 2 {
+		verifyIntervalSeconds = 2
+	}
+	return time.Duration(verifyIntervalSeconds) * time.Second
+}
+
+func providerOverwriteConfirmationDelay(name string) time.Duration {
+	storage, err := fs.GetStorage(name, &fs.GetStoragesArgs{})
+	if err != nil || storage == nil {
+		return 0
+	}
+	verifyInterval := 1
+	if conf.Conf != nil {
+		verifyInterval = conf.Conf.WebDAVWriteback.VerifyIntervalSeconds
+	}
+	return providerConsistencyConfirmationDelay(storage.Config().Name, verifyInterval)
+}
+
+func providerResourceAbsentStable(ctx context.Context, name string) (bool, error) {
+	absent, err := providerResourceAbsent(ctx, name)
+	if err != nil || !absent {
+		return absent, err
+	}
+
+	delay := providerOverwriteConfirmationDelay(name)
+	if delay <= 0 {
+		return true, nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-timer.C:
+	}
+	return providerResourceAbsent(ctx, name)
+}
+
+func removeProviderOverwriteDestination(ctx context.Context, name string) (bool, error) {
+	if err := fs.Remove(ctx, name); err != nil && !errs.IsObjectNotFound(err) {
+		return false, err
+	}
+	return providerResourceAbsentStable(ctx, name)
+}
+
 func moveNeedsStaging(src, dst string) bool {
 	return path.Dir(src) != path.Dir(dst) && path.Base(src) != path.Base(dst)
 }
@@ -220,18 +273,14 @@ func moveFiles(ctx context.Context, src, dst string, overwrite bool) (status int
 		return http.StatusPreconditionFailed, nil
 	}
 	if dstExists {
-		if err := fs.Remove(ctx, dst); err != nil {
-			return http.StatusInternalServerError, err
-		}
-		absent, verifyErr := providerResourceAbsent(ctx, dst)
+		absent, verifyErr := removeProviderOverwriteDestination(ctx, dst)
 		if verifyErr != nil {
 			return http.StatusInternalServerError, verifyErr
 		}
 		if !absent {
 			// Do not move the source until the provider has stopped exposing
-			// the overwritten destination. On 115 this prevents a rename from
-			// silently producing duplicate same-name objects in the consistency
-			// window.
+			// the overwritten destination. 115 requires two absence observations
+			// across a short consistency fence before the final name is reused.
 			return http.StatusServiceUnavailable, nil
 		}
 	}
@@ -308,10 +357,7 @@ func copyFiles(ctx context.Context, src, dst string, overwrite bool, depth int) 
 		return http.StatusPreconditionFailed, nil
 	}
 	if dstExists {
-		if err := fs.Remove(ctx, dst); err != nil {
-			return http.StatusInternalServerError, err
-		}
-		absent, verifyErr := providerResourceAbsent(ctx, dst)
+		absent, verifyErr := removeProviderOverwriteDestination(ctx, dst)
 		if verifyErr != nil {
 			return http.StatusInternalServerError, verifyErr
 		}

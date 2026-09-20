@@ -208,3 +208,25 @@ func TestCanonicalReadRequestDropsRangeOnIfRangeMismatch(t *testing.T) {
 		t.Fatalf("If-Range must not be re-evaluated by provider, got %q", got.Header.Get("If-Range"))
 	}
 }
+
+
+func TestProviderConsistencyConfirmationDelay(t *testing.T) {
+	tests := []struct {
+		name     string
+		storage  string
+		interval int
+		want     time.Duration
+	}{
+		{name: "other provider does not wait", storage: "S3", interval: 5, want: 0},
+		{name: "115 clamps long verify interval", storage: "115 Open", interval: 5, want: 2 * time.Second},
+		{name: "115 keeps short verify interval", storage: "115 Open", interval: 1, want: time.Second},
+		{name: "115 repairs invalid interval", storage: "115 Open", interval: 0, want: time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := providerConsistencyConfirmationDelay(tt.storage, tt.interval); got != tt.want {
+				t.Fatalf("providerConsistencyConfirmationDelay(%q, %d) = %v, want %v", tt.storage, tt.interval, got, tt.want)
+			}
+		})
+	}
+}

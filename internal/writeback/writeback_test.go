@@ -761,7 +761,6 @@ func TestCaptureRemoteVerificationWithoutProviderHash(t *testing.T) {
 	}
 }
 
-
 func TestClearRemoteVerification(t *testing.T) {
 	now := time.Now()
 	row := &model.WebDAVWritebackObject{
@@ -901,7 +900,6 @@ func TestProviderMoveSourceTombstone(t *testing.T) {
 		t.Fatal("provider MOVE source tombstone should retain captured provider timestamps")
 	}
 }
-
 
 func TestCanReverifyCompletedDuplicatePut(t *testing.T) {
 	sha := strings.Repeat("e", 40)
