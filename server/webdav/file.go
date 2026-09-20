@@ -131,7 +131,7 @@ func walkFS(ctx context.Context, depth int, name string, info model.Obj, walkFn 
 	// Read directory names.
 	objs, err := fs.List(context.WithValue(ctx, conf.MetaKey, meta), name, &fs.ListArgs{})
 	if writeback.Enabled() {
-		overlaid, hasWriteback, overlayErr := writeback.OverlayList(name, objs)
+		overlaid, hasWriteback, overlayErr := writeback.OverlayList(name, objs, err == nil)
 		if overlayErr != nil {
 			return walkFn(name, info, overlayErr)
 		}
