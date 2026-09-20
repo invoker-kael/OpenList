@@ -54,6 +54,21 @@ func TestProviderOperationConflictRules(t *testing.T) {
 	}
 }
 
+func TestProviderOperationTouchesPath(t *testing.T) {
+	op := &model.WebDAVProviderOperation{
+		SourcePath:      "/source/album",
+		DestinationPath: "/archive/album",
+	}
+	for _, p := range []string{"/source/album", "/source/album/photo.jpg", "/archive", "/archive/album/photo.jpg"} {
+		if !providerOperationTouchesPath(op, p) {
+			t.Fatalf("expected unresolved intent to fence %q", p)
+		}
+	}
+	if providerOperationTouchesPath(op, "/unrelated/photo.jpg") {
+		t.Fatal("unrelated path must not be fenced")
+	}
+}
+
 func TestProviderOperationSourceMatchesCanonicalGeneration(t *testing.T) {
 	op := &model.WebDAVProviderOperation{
 		SourceIsDir:      false,

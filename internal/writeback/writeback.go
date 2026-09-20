@@ -264,6 +264,13 @@ func providerOperationsConflict(existing *model.WebDAVProviderOperation, method,
 	return false
 }
 
+func providerOperationTouchesPath(op *model.WebDAVProviderOperation, p string) bool {
+	if op == nil {
+		return false
+	}
+	return pathsOverlap(op.SourcePath, p) || pathsOverlap(op.DestinationPath, p)
+}
+
 func ProviderOperationConflict(method, src, dst string, depth int) (*model.WebDAVProviderOperation, error) {
 	if !Enabled() {
 		return nil, nil
@@ -272,8 +279,33 @@ func ProviderOperationConflict(method, src, dst string, depth int) (*model.WebDA
 	if err := db.GetDb().Order("updated_at asc").Find(&ops).Error; err != nil {
 		return nil, err
 	}
+	now := time.Now()
 	for i := range ops {
+		if providerOperationPreparedExpired(&ops[i], now) {
+			continue
+		}
 		if providerOperationsConflict(&ops[i], method, src, dst, depth) {
+			return &ops[i], nil
+		}
+	}
+	return nil, nil
+}
+
+func ProviderOperationPathConflict(p string) (*model.WebDAVProviderOperation, error) {
+	if !Enabled() {
+		return nil, nil
+	}
+	p = utils.FixAndCleanPath(p)
+	var ops []model.WebDAVProviderOperation
+	if err := db.GetDb().Order("updated_at asc").Find(&ops).Error; err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	for i := range ops {
+		if providerOperationPreparedExpired(&ops[i], now) {
+			continue
+		}
+		if providerOperationTouchesPath(&ops[i], p) {
 			return &ops[i], nil
 		}
 	}
@@ -344,6 +376,12 @@ func PrepareProviderOperation(method, src, dst string, depth int, source model.O
 		}
 		var same *model.WebDAVProviderOperation
 		for i := range existing {
+			if providerOperationPreparedExpired(&existing[i], now) {
+				if err := tx.Delete(&model.WebDAVProviderOperation{}, existing[i].ID).Error; err != nil {
+					return err
+				}
+				continue
+			}
 			if existing[i].OperationKey == op.OperationKey {
 				same = &existing[i]
 				continue

@@ -194,6 +194,12 @@ On a Cloud Sync retry, OpenList checks the existing intent before destructive ov
 
 This specifically prevents the failure sequence where a successful 115 MOVE is followed by a MySQL error, then the retry sees the destination and deletes it before discovering that the provider source has already moved.
 
+The intent also acts as a path fence while unresolved. PUT, DELETE, MKCOL and PROPPATCH under the source/destination tree return HTTP 503 with `Retry-After: 2` instead of creating a newer canonical generation that an older metadata reconcile could overwrite. Other COPY/MOVE requests are fenced when their source/destination trees overlap; independent COPY operations may still share the same stable source.
+
+A `STARTED` operation is never declared "not applied" from one provider observation. OpenList requires two consistent observations separated by the configured verification interval (capped at two seconds) before allowing the cloud mutation to be retried. On process startup and during periodic maintenance, durable intents are scanned automatically: abandoned `PREPARED` rows are retired, already-converged metadata rows are cleaned up, and provider-confirmed operations are reconciled without waiting for Synology to repeat the request. Ambiguous directory-tree recovery remains fenced rather than being guessed.
+
+Source identity now includes provider object ID plus canonical generation/ETag when available. If the original source generation has been superseded before metadata recovery, file operations may rebuild only the destination root from the durable snapshot; directory operations stay blocked because replaying a stale tree could touch newer descendants.
+
 ## Direct read reconciliation
 
 After the completed local cache expires, direct `GET`, `HEAD` and single-resource `PROPFIND` perform conservative remote-loss reconciliation.

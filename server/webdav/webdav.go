@@ -369,6 +369,13 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 	if err != nil {
 		return http.StatusForbidden, err
 	}
+	if writeback.Enabled() {
+		if blocked, blockErr := providerOperationPathBlocked(w, reqPath); blockErr != nil {
+			return http.StatusInternalServerError, blockErr
+		} else if blocked {
+			return http.StatusServiceUnavailable, nil
+		}
+	}
 	// TODO: return MultiStatus where appropriate.
 	if writeback.Enabled() {
 		handled, wbErr := writeback.DeleteTree(reqPath)
@@ -430,6 +437,13 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	reqPath, err = user.JoinPath(reqPath)
 	if err != nil {
 		return http.StatusForbidden, err
+	}
+	if writeback.Enabled() {
+		if blocked, blockErr := providerOperationPathBlocked(w, reqPath); blockErr != nil {
+			return http.StatusInternalServerError, blockErr
+		} else if blocked {
+			return http.StatusServiceUnavailable, nil
+		}
 	}
 	size := r.ContentLength
 	if size < 0 {
@@ -595,6 +609,13 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 	if err != nil {
 		return http.StatusForbidden, err
 	}
+	if writeback.Enabled() {
+		if blocked, blockErr := providerOperationPathBlocked(w, reqPath); blockErr != nil {
+			return http.StatusInternalServerError, blockErr
+		} else if blocked {
+			return http.StatusServiceUnavailable, nil
+		}
+	}
 
 	if r.ContentLength > 0 {
 		return http.StatusUnsupportedMediaType, nil
@@ -686,6 +707,30 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 		return http.StatusMethodNotAllowed, err
 	}
 	return http.StatusCreated, nil
+}
+
+func providerOperationPathBlocked(w http.ResponseWriter, p string) (bool, error) {
+	conflict, err := writeback.ProviderOperationPathConflict(p)
+	if err != nil {
+		return false, err
+	}
+	if conflict == nil {
+		return false, nil
+	}
+	w.Header().Set("Retry-After", "2")
+	return true, nil
+}
+
+func providerOperationCopyMoveBlocked(w http.ResponseWriter, method, src, dst string, depth int) (bool, error) {
+	conflict, err := writeback.ProviderOperationConflict(method, src, dst, depth)
+	if err != nil {
+		return false, err
+	}
+	if conflict == nil {
+		return false, nil
+	}
+	w.Header().Set("Retry-After", "2")
+	return true, nil
 }
 
 func copyMoveProviderSucceeded(status int) bool {
@@ -872,6 +917,11 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 				}
 				return recoveredStatus, recoveryErr
 			}
+			if blocked, blockErr := providerOperationCopyMoveBlocked(w, writeback.ProviderOperationCopy, src, dst, depth); blockErr != nil {
+				return http.StatusInternalServerError, blockErr
+			} else if blocked {
+				return http.StatusServiceUnavailable, nil
+			}
 			dstExisted, err = resourceExists(ctx, dst)
 			if err != nil {
 				return http.StatusInternalServerError, err
@@ -967,6 +1017,11 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 				w.Header().Set("Retry-After", "2")
 			}
 			return recoveredStatus, recoveryErr
+		}
+		if blocked, blockErr := providerOperationCopyMoveBlocked(w, writeback.ProviderOperationMove, src, dst, -1); blockErr != nil {
+			return http.StatusInternalServerError, blockErr
+		} else if blocked {
+			return http.StatusServiceUnavailable, nil
 		}
 		dstExisted, err = resourceExists(ctx, dst)
 		if err != nil {
@@ -1316,6 +1371,13 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request) (statu
 	reqPath, err = user.JoinPath(reqPath)
 	if err != nil {
 		return http.StatusForbidden, err
+	}
+	if writeback.Enabled() {
+		if blocked, blockErr := providerOperationPathBlocked(w, reqPath); blockErr != nil {
+			return http.StatusInternalServerError, blockErr
+		} else if blocked {
+			return http.StatusServiceUnavailable, nil
+		}
 	}
 	meta, err := op.GetNearestMeta(reqPath)
 	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
