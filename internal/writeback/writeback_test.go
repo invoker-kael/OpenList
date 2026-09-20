@@ -1087,6 +1087,28 @@ func TestCopyToSpoolRejectsDeclaredSizeOverrunBeforeWrite(t *testing.T) {
 	}
 }
 
+func TestDurableCommitContextSurvivesClientCancellation(t *testing.T) {
+	type contextKey string
+	const key contextKey = "request-value"
+
+	parent, cancel := context.WithCancel(context.WithValue(context.Background(), key, "preserved"))
+	cancel()
+	if parent.Err() == nil {
+		t.Fatal("test parent context should be canceled")
+	}
+
+	commitCtx := durableCommitContext(parent)
+	if err := commitCtx.Err(); err != nil {
+		t.Fatalf("durable commit context inherited request cancellation: %v", err)
+	}
+	if got := commitCtx.Value(key); got != "preserved" {
+		t.Fatalf("request-scoped value was not preserved: %v", got)
+	}
+	if _, ok := commitCtx.Deadline(); ok {
+		t.Fatal("durable commit context must not inherit the HTTP request deadline")
+	}
+}
+
 func TestCopyToSpoolComputesPayloadSHA1(t *testing.T) {
 	payload := "cloud-sync-encrypted-payload"
 	f, err := os.CreateTemp(t.TempDir(), "spool-*.data")

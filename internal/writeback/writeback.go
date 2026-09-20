@@ -2144,6 +2144,14 @@ func syncDir(dir string) {
 	}
 }
 
+func durableCommitContext(ctx context.Context) context.Context {
+	// Once the complete request body has been fsynced and atomically moved into
+	// the spool, a client disconnect must not discard that durable payload.
+	// Preserve request-scoped values for database hooks while detaching
+	// cancellation/deadlines from the HTTP request.
+	return context.WithoutCancel(ctx)
+}
+
 // Commit receives the complete opaque WebDAV object into the local spool and
 // only then commits a new canonical generation into MySQL.
 func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTime, createTime time.Time, mime string) (*model.WebDAVWritebackObject, bool, error) {
@@ -2229,7 +2237,8 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		return current, false, nil
 	}
 
-	err = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	commitCtx := durableCommitContext(ctx)
+	err = db.GetDb().WithContext(commitCtx).Transaction(func(tx *gorm.DB) error {
 		var row model.WebDAVWritebackObject
 		findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", key).First(&row).Error
 		if findErr != nil && !errors.Is(findErr, gorm.ErrRecordNotFound) {
