@@ -13,6 +13,18 @@ on:
       - "internal/db/db.go"
       - "internal/conf/**"
       - ".github/workflows/writeback.yml"
+  push:
+    branches: ["feature/cloudsync-writeback"]
+    paths:
+      - "internal/writeback/**"
+      - "server/webdav/**"
+      - "server/common/proxy.go"
+      - "server/common/proxy_test.go"
+      - "drivers/115_open/**"
+      - "internal/model/webdav_writeback.go"
+      - "internal/db/db.go"
+      - "internal/conf/**"
+      - ".github/workflows/writeback.yml"
   workflow_dispatch:
 
 permissions:
