@@ -40,6 +40,8 @@ The write-back queue and canonical metadata use the normal OpenList GORM databas
 
 Paths are stored as text, while SHA-256 path keys are indexed. This avoids MySQL `utf8mb4` index-length problems for long WebDAV paths.
 
+Same-path PUT publication is also fenced in MySQL. Each WebDAV path has one small receive-fence row with a monotonically increasing start sequence and the last sequence that successfully published canonical state. A PUT receives its sequence before the body is accepted; after the complete payload is durable, canonical publication locks that fence and cannot move behind a newer committed PUT. This replaces process-local ordering as the correctness authority, so overlapping large-file retries converge the same way after restart or across multiple OpenList instances.
+
 The queue table also has composite indexes on `(state, retry_at)` for the two-second worker dispatch scan and `(state, completed_at)` for completed-spool cleanup. They are declared in the GORM model, so the normal OpenList MySQL `AutoMigrate` path creates them automatically on upgrade; no separate SQLite database or manual migration is required. The hot dispatch scan selects only `id`, completed-cache cleanup selects only the four fields it actually consumes, and provider-intent protection scans select only routing/fence columns instead of large recovery snapshots and TEXT errors. This avoids repeated transfer/allocation of cold columns on large MySQL tables. Subtree mutation queries also use an escaped `root/%` LIKE pattern (`~` escape) instead of `root%`, so encrypted names containing `_`/`%` cannot expand into SQL wildcards and sibling prefixes such as `/a` versus `/ab` are excluded before row locking.
 
 ## Configuration

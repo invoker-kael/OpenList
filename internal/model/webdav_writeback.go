@@ -38,6 +38,21 @@ type WebDAVWritebackObject struct {
 	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
+// WebDAVWritebackReceiveFence serializes same-path PUT publication through
+// MySQL. NextSequence is allocated when a PUT starts; LastCommittedSequence is
+// advanced only when that receive publishes canonical state. Keeping the fence
+// independent from the canonical object preserves ordering across restart,
+// multiple OpenList instances, and later canonical-row reconciliation.
+type WebDAVWritebackReceiveFence struct {
+	ID                    uint      `json:"id" gorm:"primaryKey"`
+	PathKey               string    `json:"path_key" gorm:"size:64;uniqueIndex"`
+	Path                  string    `json:"path" gorm:"type:text"`
+	NextSequence          uint64    `json:"next_sequence"`
+	LastCommittedSequence uint64    `json:"last_committed_sequence"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
 // WebDAVProviderOperation is a durable intent around synchronous provider
 // COPY/MOVE mutations. It closes the gap between a successful remote mutation
 // and the MySQL transaction that reconciles canonical WebDAV metadata.

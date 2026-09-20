@@ -1896,23 +1896,19 @@ func spoolAdmissionRequired(floor, reserved, additional uint64) (uint64, bool) {
 }
 
 type receivingPathState struct {
-	active          int
-	latestCommitted uint64
-	commitMu        sync.Mutex
+	active int
 }
 
 type receivingSession struct {
-	key      string
-	sequence uint64
-	state    *receivingPathState
+	key   string
+	state *receivingPathState
 }
 
 var (
-	spaceMu           sync.Mutex
-	reservedIncoming  uint64
-	receivingMu       sync.Mutex
-	receivingSequence uint64
-	receivingPaths    = make(map[string]*receivingPathState)
+	spaceMu          sync.Mutex
+	reservedIncoming uint64
+	receivingMu      sync.Mutex
+	receivingPaths   = make(map[string]*receivingPathState)
 )
 
 type incomingReservation struct {
@@ -2033,18 +2029,13 @@ func reserveIncomingBytes(expected int64) (*incomingReservation, error) {
 func beginReceiving(p string) (*receivingSession, func()) {
 	key := pathKey(p)
 	receivingMu.Lock()
-	receivingSequence++
 	state := receivingPaths[key]
 	if state == nil {
 		state = &receivingPathState{}
 		receivingPaths[key] = state
 	}
 	state.active++
-	session := &receivingSession{
-		key:      key,
-		sequence: receivingSequence,
-		state:    state,
-	}
+	session := &receivingSession{key: key, state: state}
 	receivingMu.Unlock()
 
 	return session, func() {
@@ -2059,16 +2050,67 @@ func beginReceiving(p string) (*receivingSession, func()) {
 	}
 }
 
-func (s *receivingSession) lockCommit() bool {
-	s.state.commitMu.Lock()
-	return s.state.latestCommitted > s.sequence
+func receiveSequenceSuperseded(lastCommitted, current uint64) bool {
+	return lastCommitted > current
 }
 
-func (s *receivingSession) unlockCommit(committed bool) {
-	if committed && s.sequence > s.state.latestCommitted {
-		s.state.latestCommitted = s.sequence
+func beginReceiveSequence(ctx context.Context, p string) (uint64, error) {
+	p = utils.FixAndCleanPath(p)
+	key := pathKey(p)
+	var sequence uint64
+	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		seed := model.WebDAVWritebackReceiveFence{PathKey: key, Path: p}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "path_key"}},
+			DoNothing: true,
+		}).Create(&seed).Error; err != nil {
+			return err
+		}
+
+		var fence model.WebDAVWritebackReceiveFence
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("path_key = ?", key).
+			First(&fence).Error; err != nil {
+			return err
+		}
+		fence.NextSequence++
+		fence.Path = p
+		sequence = fence.NextSequence
+		return tx.Model(&model.WebDAVWritebackReceiveFence{}).
+			Where("id = ?", fence.ID).
+			Updates(map[string]any{
+				"path":          p,
+				"next_sequence": sequence,
+			}).Error
+	})
+	return sequence, err
+}
+
+func lockReceiveFence(tx *gorm.DB, p string) (*model.WebDAVWritebackReceiveFence, error) {
+	key := pathKey(p)
+	var fence model.WebDAVWritebackReceiveFence
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("path_key = ?", key).
+		First(&fence).Error; err != nil {
+		return nil, err
 	}
-	s.state.commitMu.Unlock()
+	return &fence, nil
+}
+
+func advanceReceiveFence(tx *gorm.DB, fence *model.WebDAVWritebackReceiveFence, sequence uint64) error {
+	if fence == nil || sequence == 0 {
+		return errors.New("write-back receive fence is missing")
+	}
+	if receiveSequenceSuperseded(fence.LastCommittedSequence, sequence) {
+		return errors.New("cannot move receive fence backwards")
+	}
+	if fence.LastCommittedSequence == sequence {
+		return nil
+	}
+	fence.LastCommittedSequence = sequence
+	return tx.Model(&model.WebDAVWritebackReceiveFence{}).
+		Where("id = ? AND last_committed_sequence <= ?", fence.ID, sequence).
+		Update("last_committed_sequence", sequence).Error
 }
 
 func isReceiving(p string) bool {
@@ -2165,8 +2207,12 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	p = utils.FixAndCleanPath(p)
 	modTimeProvided := !modTime.IsZero()
 	createTimeProvided := !createTime.IsZero()
-	receiveSession, releaseReceiving := beginReceiving(p)
+	_, releaseReceiving := beginReceiving(p)
 	defer releaseReceiving()
+	receiveSequence, err := beginReceiveSequence(ctx, p)
+	if err != nil {
+		return nil, false, err
+	}
 	spoolDir := conf.Conf.WebDAVWriteback.SpoolDir
 	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
 		return nil, false, err
@@ -2223,30 +2269,27 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	wakeDuplicate := false
 	settleAt := time.Now().Add(cloudSyncSettleDelay(actualSize))
 
-	// Same-path Cloud Sync retries can overlap. Serialize only the final canonical
-	// commit and preserve request-start order: if a later-started PUT has already
-	// committed, this older receiver must not manufacture a newer generation just
-	// because its larger body finished later.
-	if receiveSession.lockCommit() {
-		current, lookupErr := getByPath(p)
-		receiveSession.unlockCommit(false)
-		_ = os.Remove(finalName)
-		syncDir(spoolDir)
-		if lookupErr != nil {
-			return nil, false, lookupErr
-		}
-		if current == nil {
-			return nil, false, errors.New("superseded WebDAV PUT has no canonical successor")
-		}
-		return current, false, nil
-	}
-
+	// MySQL is the authoritative ordering point for same-path Cloud Sync PUTs.
+	// The path fence survives process restarts and is shared by every instance.
 	commitCtx := durableCommitContext(ctx)
+	superseded := false
 	err = db.GetDb().WithContext(commitCtx).Transaction(func(tx *gorm.DB) error {
+		fence, err := lockReceiveFence(tx, p)
+		if err != nil {
+			return err
+		}
 		var row model.WebDAVWritebackObject
 		findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", key).First(&row).Error
 		if findErr != nil && !errors.Is(findErr, gorm.ErrRecordNotFound) {
 			return findErr
+		}
+		if receiveSequenceSuperseded(fence.LastCommittedSequence, receiveSequence) {
+			if findErr != nil {
+				return errors.New("superseded WebDAV PUT has no canonical successor")
+			}
+			superseded = true
+			saved = row
+			return nil
 		}
 		if findErr == nil {
 			if canCoalesceDuplicatePut(&row, actualSize, payloadSHA1) {
@@ -2272,7 +2315,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 						return err
 					}
 					saved = row
-					return nil
+					return advanceReceiveFence(tx, fence, receiveSequence)
 				}
 			}
 			if canReverifyCompletedDuplicatePut(&row, actualSize, payloadSHA1) {
@@ -2292,7 +2335,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 					return err
 				}
 				saved = row
-				return nil
+				return advanceReceiveFence(tx, fence, receiveSequence)
 			}
 			oldSpool = row.SpoolPath
 			if row.State == StateDeleted {
@@ -2334,12 +2377,16 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			return err
 		}
 		saved = row
-		return nil
+		return advanceReceiveFence(tx, fence, receiveSequence)
 	})
-	receiveSession.unlockCommit(err == nil)
 	if err != nil {
 		_ = os.Remove(finalName)
 		return nil, false, err
+	}
+	if superseded {
+		_ = os.Remove(finalName)
+		syncDir(spoolDir)
+		return &saved, false, nil
 	}
 	if duplicate {
 		_ = os.Remove(finalName)

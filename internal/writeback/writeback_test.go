@@ -670,44 +670,32 @@ func TestReceivingPathReferenceCount(t *testing.T) {
 	}
 }
 
-func TestReceivingCommitOrderKeepsNewerStartedPut(t *testing.T) {
-	p := "/encrypted/overlap.bin"
-	older, releaseOlder := beginReceiving(p)
-	newer, releaseNewer := beginReceiving(p)
-	defer releaseOlder()
-	defer releaseNewer()
-
-	if newer.lockCommit() {
-		newer.unlockCommit(false)
-		t.Fatal("newer PUT cannot be stale before any successful commit")
+func TestReceiveSequenceSuperseded(t *testing.T) {
+	if receiveSequenceSuperseded(0, 1) {
+		t.Fatal("first receive sequence cannot be superseded")
 	}
-	newer.unlockCommit(true)
-
-	if !older.lockCommit() {
-		older.unlockCommit(false)
-		t.Fatal("older PUT finishing after a committed newer PUT must be superseded")
+	if receiveSequenceSuperseded(7, 7) {
+		t.Fatal("the sequence that advanced the fence remains current")
 	}
-	older.unlockCommit(false)
+	if !receiveSequenceSuperseded(8, 7) {
+		t.Fatal("older PUT finishing after a newer committed sequence must be superseded")
+	}
 }
 
-func TestReceivingFailedNewerPutDoesNotSuppressOlderCommit(t *testing.T) {
-	p := "/encrypted/newer-fails.bin"
-	older, releaseOlder := beginReceiving(p)
-	newer, releaseNewer := beginReceiving(p)
-	defer releaseOlder()
-	defer releaseNewer()
-
-	if newer.lockCommit() {
-		newer.unlockCommit(false)
-		t.Fatal("newer PUT cannot begin stale")
+func TestReceiveFenceSchemaKeepsPathOrderingDurable(t *testing.T) {
+	typ := reflect.TypeOf(model.WebDAVWritebackReceiveFence{})
+	pathKeyField, ok := typ.FieldByName("PathKey")
+	if !ok || !strings.Contains(pathKeyField.Tag.Get("gorm"), "uniqueIndex") {
+		t.Fatal("receive fence PathKey must be unique so one MySQL row serializes each WebDAV path")
 	}
-	newer.unlockCommit(false)
-
-	if older.lockCommit() {
-		older.unlockCommit(false)
-		t.Fatal("failed newer PUT must not suppress an older durable receiver")
+	next, ok := typ.FieldByName("NextSequence")
+	if !ok || next.Type.Kind() != reflect.Uint64 {
+		t.Fatal("receive fence NextSequence must be uint64")
 	}
-	older.unlockCommit(true)
+	last, ok := typ.FieldByName("LastCommittedSequence")
+	if !ok || last.Type.Kind() != reflect.Uint64 {
+		t.Fatal("receive fence LastCommittedSequence must be uint64")
+	}
 }
 
 func TestCanonicalDirectoryObject(t *testing.T) {
