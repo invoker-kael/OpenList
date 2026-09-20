@@ -30,6 +30,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
+	log "github.com/sirupsen/logrus"
 )
 
 type Handler struct {
@@ -712,6 +713,97 @@ func retryMetadataReconciliation(ctx context.Context, fn func() error) error {
 	return lastErr
 }
 
+func providerOperationResponseStatus(op *model.WebDAVProviderOperation) int {
+	if op != nil && op.DestinationExisted {
+		return http.StatusNoContent
+	}
+	return http.StatusCreated
+}
+
+func recoverProviderCopyMove(ctx context.Context, method, src, dst string, depth int, currentSource model.Obj) (status int, handled bool, err error) {
+	op, err := writeback.GetProviderOperation(method, src, dst, depth)
+	if err != nil || op == nil {
+		return 0, false, err
+	}
+	if currentSource != nil && !writeback.ProviderOperationSourceMatches(op, currentSource) {
+		// The source changed after an older intent. That intent must not suppress
+		// a new client operation against the new source generation.
+		if finishErr := writeback.FinishProviderOperation(op.ID); finishErr != nil {
+			return http.StatusServiceUnavailable, true, finishErr
+		}
+		return 0, false, nil
+	}
+
+	if strings.EqualFold(method, writeback.ProviderOperationCopy) {
+		if applied, appliedErr := writeback.ProviderOperationMetadataApplied(op); appliedErr != nil {
+			return http.StatusServiceUnavailable, true, appliedErr
+		} else if applied {
+			_ = writeback.FinishProviderOperation(op.ID)
+			return providerOperationResponseStatus(op), true, nil
+		}
+	}
+
+	recovery, _, recoveryErr := writeback.RecoverProviderOperation(ctx, op)
+	if recoveryErr != nil {
+		return http.StatusServiceUnavailable, true, recoveryErr
+	}
+	switch recovery {
+	case writeback.ProviderOperationNotApplied:
+		if op.State == writeback.ProviderOperationApplied {
+			// An already-finished intent now points at a different/recreated
+			// source. Retire it before starting a fresh client operation.
+			if finishErr := writeback.FinishProviderOperation(op.ID); finishErr != nil {
+				return http.StatusServiceUnavailable, true, finishErr
+			}
+		}
+		return 0, false, nil
+	case writeback.ProviderOperationInconclusive:
+		return http.StatusServiceUnavailable, true, nil
+	}
+
+	if strings.EqualFold(method, writeback.ProviderOperationMove) {
+		if applied, appliedErr := writeback.ProviderOperationMetadataApplied(op); appliedErr != nil {
+			return http.StatusServiceUnavailable, true, appliedErr
+		} else if applied {
+			_ = writeback.FinishProviderOperation(op.ID)
+			return providerOperationResponseStatus(op), true, nil
+		}
+	}
+
+	sourceRoot := currentSource
+	if sourceRoot == nil {
+		sourceRoot = writeback.ProviderOperationSourceObject(op)
+	}
+	reconcile := func() error {
+		if strings.EqualFold(method, writeback.ProviderOperationMove) {
+			return writeback.MoveTreeMetadata(src, dst, sourceRoot)
+		}
+		return writeback.CopyTreeMetadata(src, dst, sourceRoot)
+	}
+	if reconcileErr := retryMetadataReconciliation(ctx, reconcile); reconcileErr != nil {
+		return http.StatusServiceUnavailable, true, reconcileErr
+	}
+	if finishErr := writeback.FinishProviderOperation(op.ID); finishErr != nil {
+		log.Warnf("provider %s metadata reconciled but intent cleanup failed for %s -> %s: %v", method, src, dst, finishErr)
+	}
+	return providerOperationResponseStatus(op), true, nil
+}
+
+func prepareProviderOperation(method, src, dst string, depth int, source model.Obj, overwrite, destinationExisted bool) (*model.WebDAVProviderOperation, error) {
+	op, err := writeback.PrepareProviderOperation(method, src, dst, depth, source, overwrite, destinationExisted)
+	if err != nil {
+		return nil, err
+	}
+	if op == nil {
+		return nil, nil
+	}
+	if err := writeback.MarkProviderOperationStarted(op.ID); err != nil {
+		return nil, err
+	}
+	op.State = writeback.ProviderOperationStarted
+	return op, nil
+}
+
 func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status int, err error) {
 	hdr := r.Header.Get("Destination")
 	if hdr == "" {
@@ -768,7 +860,22 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 		overwrite := r.Header.Get("Overwrite") != "F"
 		dstExisted := false
 		dstTracked := false
+		var sourceRoot model.Obj
 		if writeback.Enabled() {
+			sourceRoot, err = resourceObject(ctx, src)
+			if err != nil {
+				if errs.IsObjectNotFound(err) {
+					return http.StatusNotFound, err
+				}
+				return http.StatusInternalServerError, err
+			}
+			recoveredStatus, recovered, recoveryErr := recoverProviderCopyMove(ctx, writeback.ProviderOperationCopy, src, dst, depth, sourceRoot)
+			if recovered {
+				if recoveredStatus == http.StatusServiceUnavailable {
+					w.Header().Set("Retry-After", "2")
+				}
+				return recoveredStatus, recoveryErr
+			}
 			dstExisted, err = resourceExists(ctx, dst)
 			if err != nil {
 				return http.StatusInternalServerError, err
@@ -789,6 +896,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 					return http.StatusInternalServerError, wbErr
 				}
 				if handled {
+					_ = writeback.DiscardProviderOperation(writeback.ProviderOperationCopy, src, dst, depth)
 					if dstExisted || overwritten {
 						return http.StatusNoContent, nil
 					}
@@ -805,22 +913,33 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 			}
 		}
 
-		var sourceRoot model.Obj
+		var providerOp *model.WebDAVProviderOperation
 		if writeback.Enabled() {
-			sourceRoot, err = resourceObject(ctx, src)
+			providerOp, err = prepareProviderOperation(writeback.ProviderOperationCopy, src, dst, depth, sourceRoot, overwrite, dstExisted)
 			if err != nil {
-				if errs.IsObjectNotFound(err) {
-					return http.StatusNotFound, err
-				}
-				return http.StatusInternalServerError, err
+				w.Header().Set("Retry-After", "2")
+				return http.StatusServiceUnavailable, err
 			}
 		}
 		copyStatus, copyErr := copyFiles(ctx, src, dst, overwrite, depth)
 		if copyErr == nil && writeback.Enabled() && copyMoveProviderSucceeded(copyStatus) {
+			if providerOp != nil {
+				if markErr := writeback.MarkProviderOperationApplied(providerOp.ID); markErr != nil {
+					log.Warnf("provider COPY succeeded but intent apply marker failed for %s -> %s: %v", src, dst, markErr)
+				} else {
+					providerOp.State = writeback.ProviderOperationApplied
+				}
+			}
 			if wbErr := retryMetadataReconciliation(ctx, func() error {
 				return writeback.CopyTreeMetadata(src, dst, sourceRoot)
 			}); wbErr != nil {
-				return http.StatusInternalServerError, wbErr
+				w.Header().Set("Retry-After", "2")
+				return http.StatusServiceUnavailable, wbErr
+			}
+			if providerOp != nil {
+				if finishErr := writeback.FinishProviderOperation(providerOp.ID); finishErr != nil {
+					log.Warnf("provider COPY metadata reconciled but intent cleanup failed for %s -> %s: %v", src, dst, finishErr)
+				}
 			}
 		}
 		if copyStatus == http.StatusServiceUnavailable {
@@ -846,6 +965,13 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 	dstExisted := false
 	dstTracked := false
 	if writeback.Enabled() {
+		recoveredStatus, recovered, recoveryErr := recoverProviderCopyMove(ctx, writeback.ProviderOperationMove, src, dst, -1, nil)
+		if recovered {
+			if recoveredStatus == http.StatusServiceUnavailable {
+				w.Header().Set("Retry-After", "2")
+			}
+			return recoveredStatus, recoveryErr
+		}
 		dstExisted, err = resourceExists(ctx, dst)
 		if err != nil {
 			return http.StatusInternalServerError, err
@@ -866,6 +992,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 				return http.StatusInternalServerError, wbErr
 			}
 			if handled {
+				_ = writeback.DiscardProviderOperation(writeback.ProviderOperationMove, src, dst, -1)
 				if dstExisted || overwritten {
 					return http.StatusNoContent, nil
 				}
@@ -883,6 +1010,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 	}
 
 	var sourceRoot model.Obj
+	var providerOp *model.WebDAVProviderOperation
 	if writeback.Enabled() {
 		sourceRoot, err = resourceObject(ctx, src)
 		if err != nil {
@@ -891,13 +1019,31 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 			}
 			return http.StatusInternalServerError, err
 		}
+		providerOp, err = prepareProviderOperation(writeback.ProviderOperationMove, src, dst, -1, sourceRoot, overwrite, dstExisted)
+		if err != nil {
+			w.Header().Set("Retry-After", "2")
+			return http.StatusServiceUnavailable, err
+		}
 	}
 	moveStatus, moveErr := moveFiles(ctx, src, dst, overwrite)
 	if moveErr == nil && writeback.Enabled() && copyMoveProviderSucceeded(moveStatus) {
+		if providerOp != nil {
+			if markErr := writeback.MarkProviderOperationApplied(providerOp.ID); markErr != nil {
+				log.Warnf("provider MOVE succeeded but intent apply marker failed for %s -> %s: %v", src, dst, markErr)
+			} else {
+				providerOp.State = writeback.ProviderOperationApplied
+			}
+		}
 		if wbErr := retryMetadataReconciliation(ctx, func() error {
 			return writeback.MoveTreeMetadata(src, dst, sourceRoot)
 		}); wbErr != nil {
-			return http.StatusInternalServerError, wbErr
+			w.Header().Set("Retry-After", "2")
+			return http.StatusServiceUnavailable, wbErr
+		}
+		if providerOp != nil {
+			if finishErr := writeback.FinishProviderOperation(providerOp.ID); finishErr != nil {
+				log.Warnf("provider MOVE metadata reconciled but intent cleanup failed for %s -> %s: %v", src, dst, finishErr)
+			}
 		}
 	}
 	if moveStatus == http.StatusServiceUnavailable {

@@ -14,6 +14,115 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
+func TestProviderOperationKeyIsStableAndScoped(t *testing.T) {
+	copyKey := providerOperationKey(ProviderOperationCopy, "/src/file.bin", "/dst/file.bin", -1)
+	if copyKey != providerOperationKey("copy", "/src/file.bin", "/dst/file.bin", -1) {
+		t.Fatal("provider operation key must normalize method casing")
+	}
+	if len(copyKey) != 64 {
+		t.Fatalf("provider operation key length = %d, want 64", len(copyKey))
+	}
+	if copyKey == providerOperationKey(ProviderOperationMove, "/src/file.bin", "/dst/file.bin", -1) {
+		t.Fatal("COPY and MOVE intents must not share a key")
+	}
+	if copyKey == providerOperationKey(ProviderOperationCopy, "/src/file.bin", "/dst/file.bin", 0) {
+		t.Fatal("COPY depth must scope the durable intent")
+	}
+}
+
+func TestProviderOperationSourceMatches(t *testing.T) {
+	modTime := time.Date(2026, time.September, 20, 8, 0, 0, 0, time.UTC)
+	sha := strings.Repeat("a", 40)
+	op := &model.WebDAVProviderOperation{
+		SourcePath:    "/src/file.bin",
+		SourceSize:    4096,
+		SourceSHA1:    sha,
+		SourceModTime: modTime,
+	}
+	source := &model.Object{
+		Name:     "file.bin",
+		Size:     4096,
+		Modified: modTime,
+		HashInfo: utils.NewHashInfo(utils.SHA1, strings.ToUpper(sha)),
+	}
+	if !ProviderOperationSourceMatches(op, source) {
+		t.Fatal("same provider source snapshot should match")
+	}
+	source.HashInfo = utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40))
+	if ProviderOperationSourceMatches(op, source) {
+		t.Fatal("changed source content must invalidate a stale provider intent")
+	}
+}
+
+func TestProviderOperationRecoveryDecision(t *testing.T) {
+	if got := providerOperationRecoveryDecision(
+		ProviderOperationMove,
+		ProviderOperationStarted,
+		providerOperationRemoteMatch,
+		providerOperationRemoteAbsent,
+		false,
+	); got != ProviderOperationRecovered {
+		t.Fatalf("completed MOVE recovery = %v, want recovered", got)
+	}
+	if got := providerOperationRecoveryDecision(
+		ProviderOperationMove,
+		ProviderOperationStarted,
+		providerOperationRemoteMatch,
+		providerOperationRemoteMatch,
+		false,
+	); got != ProviderOperationInconclusive {
+		t.Fatalf("MOVE with both names visible = %v, want inconclusive", got)
+	}
+	if got := providerOperationRecoveryDecision(
+		ProviderOperationMove,
+		ProviderOperationStarted,
+		providerOperationRemoteMismatch,
+		providerOperationRemoteMismatch,
+		false,
+	); got != ProviderOperationNotApplied {
+		t.Fatalf("MOVE with a different recreated source = %v, want not applied", got)
+	}
+	if got := providerOperationRecoveryDecision(
+		ProviderOperationCopy,
+		ProviderOperationStarted,
+		providerOperationRemoteMatch,
+		providerOperationRemoteInconclusive,
+		false,
+	); got != ProviderOperationRecovered {
+		t.Fatalf("file COPY with matching destination = %v, want recovered", got)
+	}
+	if got := providerOperationRecoveryDecision(
+		ProviderOperationCopy,
+		ProviderOperationStarted,
+		providerOperationRemoteMatch,
+		providerOperationRemoteInconclusive,
+		true,
+	); got != ProviderOperationInconclusive {
+		t.Fatalf("unmarked directory COPY = %v, want inconclusive", got)
+	}
+	if got := providerOperationRecoveryDecision(
+		ProviderOperationCopy,
+		ProviderOperationPrepared,
+		providerOperationRemoteMatch,
+		providerOperationRemoteInconclusive,
+		false,
+	); got != ProviderOperationNotApplied {
+		t.Fatalf("prepared intent = %v, want not applied", got)
+	}
+}
+
+func TestProviderOperationModelUsesSafeKey(t *testing.T) {
+	typ := reflect.TypeOf(model.WebDAVProviderOperation{})
+	field, ok := typ.FieldByName("OperationKey")
+	if !ok {
+		t.Fatal("provider operation model is missing OperationKey")
+	}
+	tag := field.Tag.Get("gorm")
+	if !strings.Contains(tag, "size:64") || !strings.Contains(tag, "uniqueIndex") {
+		t.Fatalf("operation key gorm tag = %q", tag)
+	}
+}
+
 func TestPathKeyIsStableAndMySQLIndexSafe(t *testing.T) {
 	key1 := pathKey("/encrypted/very/long/path/file.bin")
 	key2 := pathKey("/encrypted/very/long/path/file.bin")

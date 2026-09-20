@@ -186,6 +186,14 @@ Cloud Sync can issue WebDAV operations before an asynchronously uploaded 115 obj
 
 A Cloud Sync delete can be followed almost immediately by a PUT that recreates the same path. Provider deletion is generation-checked both before and after the remote remove. If an older delete overlaps a newer generation that has already completed, the newest payload is re-queued from its local spool so the stale delete cannot become the final remote state.
 
+### Durable provider COPY/MOVE intent
+
+Provider-side COPY/MOVE has a second ambiguity window: the cloud mutation can succeed while the following MySQL metadata transaction fails. The operation is now fenced by a durable MySQL intent with a deterministic SHA-256 operation key and a `prepared -> started -> applied` lifecycle. OpenList refuses to call the provider unless the `started` marker is durable first.
+
+On a Cloud Sync retry, OpenList checks the existing intent before destructive overwrite handling. File operations compare the destination against the captured source size/SHA-1, and MOVE additionally confirms whether the provider source disappeared. A recovered operation reconciles canonical metadata without issuing COPY/MOVE again. Ambiguous 115 views return HTTP 503 with `Retry-After: 2` rather than deleting an already-successful destination. Directory COPY is intentionally conservative: an unmarked, partially visible tree is treated as inconclusive instead of assuming the copy completed.
+
+This specifically prevents the failure sequence where a successful 115 MOVE is followed by a MySQL error, then the retry sees the destination and deletes it before discovering that the provider source has already moved.
+
 ## Direct read reconciliation
 
 After the completed local cache expires, direct `GET`, `HEAD` and single-resource `PROPFIND` perform conservative remote-loss reconciliation.

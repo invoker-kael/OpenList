@@ -10,6 +10,7 @@ on:
       - "server/common/proxy_test.go"
       - "drivers/115_open/**"
       - "internal/model/webdav_writeback.go"
+      - "internal/db/db.go"
       - "internal/conf/**"
       - ".github/workflows/writeback.yml"
   workflow_dispatch:
@@ -39,6 +40,7 @@ jobs:
         run: |
           files=(
             internal/model/webdav_writeback.go
+            internal/db/db.go
             internal/writeback/writeback.go
             internal/writeback/writeback_test.go
             server/webdav/file.go

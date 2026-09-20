@@ -145,6 +145,336 @@ func applyDuplicatePutMetadata(row *model.WebDAVWritebackObject, modTime, create
 
 var ErrDestinationExists = errors.New("write-back destination already exists")
 
+const (
+	ProviderOperationCopy = "COPY"
+	ProviderOperationMove = "MOVE"
+
+	ProviderOperationPrepared = "prepared"
+	ProviderOperationStarted  = "started"
+	ProviderOperationApplied  = "applied"
+)
+
+type ProviderOperationRecovery uint8
+
+const (
+	ProviderOperationNotApplied ProviderOperationRecovery = iota
+	ProviderOperationRecovered
+	ProviderOperationInconclusive
+)
+
+type providerOperationRemoteState uint8
+
+const (
+	providerOperationRemoteAbsent providerOperationRemoteState = iota
+	providerOperationRemoteMatch
+	providerOperationRemoteMismatch
+	providerOperationRemoteInconclusive
+)
+
+func providerOperationKey(method, src, dst string, depth int) string {
+	method = strings.ToUpper(method)
+	src = utils.FixAndCleanPath(src)
+	dst = utils.FixAndCleanPath(dst)
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%d", method, src, dst, depth)))
+	return hex.EncodeToString(sum[:])
+}
+
+func ProviderOperationSourceObject(op *model.WebDAVProviderOperation) model.Obj {
+	if op == nil {
+		return nil
+	}
+	obj := &model.Object{
+		Path:     op.SourcePath,
+		Name:     path.Base(op.SourcePath),
+		Size:     op.SourceSize,
+		Modified: op.SourceModTime,
+		Ctime:    op.SourceCreateTime,
+		IsFolder: op.SourceIsDir,
+	}
+	if op.SourceSHA1 != "" {
+		obj.HashInfo = utils.NewHashInfo(utils.SHA1, op.SourceSHA1)
+	}
+	return obj
+}
+
+func ProviderOperationSourceMatches(op *model.WebDAVProviderOperation, source model.Obj) bool {
+	if op == nil || source == nil || op.SourceIsDir != source.IsDir() {
+		return false
+	}
+	if op.SourceIsDir {
+		if op.SourceModTime.IsZero() || source.ModTime().IsZero() {
+			return false
+		}
+		return op.SourceModTime.Unix() == source.ModTime().Unix()
+	}
+	if op.SourceSize != source.GetSize() {
+		return false
+	}
+	sourceSHA1 := source.GetHash().GetHash(utils.SHA1)
+	if op.SourceSHA1 != "" || sourceSHA1 != "" {
+		return op.SourceSHA1 != "" && sourceSHA1 != "" && strings.EqualFold(op.SourceSHA1, sourceSHA1)
+	}
+	if op.SourceModTime.IsZero() || source.ModTime().IsZero() {
+		return false
+	}
+	return op.SourceModTime.Unix() == source.ModTime().Unix()
+}
+
+func GetProviderOperation(method, src, dst string, depth int) (*model.WebDAVProviderOperation, error) {
+	if !Enabled() {
+		return nil, nil
+	}
+	var op model.WebDAVProviderOperation
+	err := db.GetDb().Where("operation_key = ?", providerOperationKey(method, src, dst, depth)).First(&op).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &op, nil
+}
+
+func PrepareProviderOperation(method, src, dst string, depth int, source model.Obj, overwrite, destinationExisted bool) (*model.WebDAVProviderOperation, error) {
+	if !Enabled() || source == nil {
+		return nil, nil
+	}
+	method = strings.ToUpper(method)
+	src = utils.FixAndCleanPath(src)
+	dst = utils.FixAndCleanPath(dst)
+	now := time.Now()
+	op := model.WebDAVProviderOperation{
+		OperationKey:       providerOperationKey(method, src, dst, depth),
+		Method:             method,
+		SourcePath:         src,
+		DestinationPath:    dst,
+		SourceIsDir:        source.IsDir(),
+		SourceSize:         source.GetSize(),
+		SourceSHA1:         strings.ToLower(source.GetHash().GetHash(utils.SHA1)),
+		SourceModTime:      source.ModTime(),
+		SourceCreateTime:   source.CreateTime(),
+		Overwrite:          overwrite,
+		Depth:              depth,
+		DestinationExisted: destinationExisted,
+		State:              ProviderOperationPrepared,
+		AppliedAt:          nil,
+		UpdatedAt:          now,
+	}
+	err := db.GetDb().Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "operation_key"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"method", "source_path", "destination_path", "source_is_dir", "source_size",
+			"source_sha1", "source_mod_time", "source_create_time", "overwrite", "depth",
+			"destination_existed", "state", "applied_at", "updated_at",
+		}),
+	}).Create(&op).Error
+	if err != nil {
+		return nil, err
+	}
+	return GetProviderOperation(method, src, dst, depth)
+}
+
+func MarkProviderOperationStarted(id uint) error {
+	if id == 0 {
+		return errors.New("provider operation intent is missing")
+	}
+	res := db.GetDb().Model(&model.WebDAVProviderOperation{}).
+		Where("id = ? AND state = ?", id, ProviderOperationPrepared).
+		Updates(map[string]any{"state": ProviderOperationStarted, "applied_at": nil})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return errors.New("provider operation intent was not in prepared state")
+	}
+	return nil
+}
+
+func MarkProviderOperationApplied(id uint) error {
+	if id == 0 {
+		return errors.New("provider operation intent is missing")
+	}
+	now := time.Now()
+	res := db.GetDb().Model(&model.WebDAVProviderOperation{}).
+		Where("id = ? AND state IN ?", id, []string{ProviderOperationStarted, ProviderOperationApplied}).
+		Updates(map[string]any{"state": ProviderOperationApplied, "applied_at": &now})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return errors.New("provider operation intent was not started")
+	}
+	return nil
+}
+
+func FinishProviderOperation(id uint) error {
+	if id == 0 {
+		return nil
+	}
+	return db.GetDb().Delete(&model.WebDAVProviderOperation{}, id).Error
+}
+
+func DiscardProviderOperation(method, src, dst string, depth int) error {
+	if !Enabled() {
+		return nil
+	}
+	return db.GetDb().Where("operation_key = ?", providerOperationKey(method, src, dst, depth)).
+		Delete(&model.WebDAVProviderOperation{}).Error
+}
+
+func providerOperationExpectedRow(op *model.WebDAVProviderOperation) *model.WebDAVWritebackObject {
+	if op == nil {
+		return nil
+	}
+	return &model.WebDAVWritebackObject{
+		IsDir:       op.SourceIsDir,
+		Size:        op.SourceSize,
+		PayloadSHA1: op.SourceSHA1,
+	}
+}
+
+func providerOperationPathState(ctx context.Context, p string, op *model.WebDAVProviderOperation) (providerOperationRemoteState, model.Obj, error) {
+	expected := providerOperationExpectedRow(op)
+	requireHash := providerRequiresPayloadHash(p)
+	hashEvidenceMissing := requireHash && op != nil && !op.SourceIsDir && op.SourceSHA1 == ""
+	remote, getErr := fs.Get(ctx, p, &fs.GetArgs{NoLog: true})
+	if getErr == nil && remote != nil && !hashEvidenceMissing {
+		switch compareRemoteContent(expected, remote, requireHash) {
+		case remoteContentMatch:
+			return providerOperationRemoteMatch, remote, nil
+		case remoteContentInconclusive:
+			// Confirm through the refreshed parent listing below.
+		case remoteContentMismatch:
+			// Confirm through the refreshed parent listing below.
+		}
+	} else if getErr != nil && !errs.IsObjectNotFound(getErr) {
+		return providerOperationRemoteInconclusive, nil, getErr
+	}
+
+	objs, listErr := fs.List(ctx, path.Dir(p), &fs.ListArgs{Refresh: true, NoLog: true})
+	if listErr != nil {
+		if errs.IsObjectNotFound(listErr) {
+			return providerOperationRemoteAbsent, nil, nil
+		}
+		return providerOperationRemoteInconclusive, nil, listErr
+	}
+	remote = exactRemoteByName(objs, path.Base(p))
+	if remote == nil {
+		return providerOperationRemoteAbsent, nil, nil
+	}
+	if hashEvidenceMissing {
+		return providerOperationRemoteInconclusive, remote, nil
+	}
+	switch compareRemoteContent(expected, remote, requireHash) {
+	case remoteContentMatch:
+		return providerOperationRemoteMatch, remote, nil
+	case remoteContentMismatch:
+		return providerOperationRemoteMismatch, remote, nil
+	default:
+		return providerOperationRemoteInconclusive, remote, nil
+	}
+}
+
+func providerOperationRecoveryDecision(method, state string, dstState, srcState providerOperationRemoteState, sourceIsDir bool) ProviderOperationRecovery {
+	method = strings.ToUpper(method)
+	if state == ProviderOperationPrepared {
+		return ProviderOperationNotApplied
+	}
+	if method == ProviderOperationCopy {
+		if state == ProviderOperationApplied {
+			if dstState == providerOperationRemoteMatch {
+				return ProviderOperationRecovered
+			}
+			return ProviderOperationInconclusive
+		}
+		if sourceIsDir {
+			if dstState == providerOperationRemoteAbsent {
+				return ProviderOperationNotApplied
+			}
+			return ProviderOperationInconclusive
+		}
+		switch dstState {
+		case providerOperationRemoteMatch:
+			return ProviderOperationRecovered
+		case providerOperationRemoteAbsent, providerOperationRemoteMismatch:
+			return ProviderOperationNotApplied
+		default:
+			return ProviderOperationInconclusive
+		}
+	}
+
+	if method != ProviderOperationMove {
+		return ProviderOperationInconclusive
+	}
+	switch srcState {
+	case providerOperationRemoteMismatch:
+		// The source path now contains a different object, so this intent is
+		// stale and must not suppress a new MOVE.
+		return ProviderOperationNotApplied
+	case providerOperationRemoteMatch, providerOperationRemoteInconclusive:
+		if dstState == providerOperationRemoteAbsent || dstState == providerOperationRemoteMismatch {
+			return ProviderOperationNotApplied
+		}
+		return ProviderOperationInconclusive
+	case providerOperationRemoteAbsent:
+		if dstState == providerOperationRemoteMatch {
+			return ProviderOperationRecovered
+		}
+		return ProviderOperationInconclusive
+	default:
+		return ProviderOperationInconclusive
+	}
+}
+
+func RecoverProviderOperation(ctx context.Context, op *model.WebDAVProviderOperation) (ProviderOperationRecovery, model.Obj, error) {
+	if op == nil {
+		return ProviderOperationNotApplied, nil, nil
+	}
+	dstState, dstObj, err := providerOperationPathState(ctx, op.DestinationPath, op)
+	if err != nil {
+		return ProviderOperationInconclusive, nil, err
+	}
+	srcState := providerOperationRemoteInconclusive
+	if strings.EqualFold(op.Method, ProviderOperationMove) {
+		srcState, _, err = providerOperationPathState(ctx, op.SourcePath, op)
+		if err != nil {
+			return ProviderOperationInconclusive, dstObj, err
+		}
+	}
+	return providerOperationRecoveryDecision(op.Method, op.State, dstState, srcState, op.SourceIsDir), dstObj, nil
+}
+
+func ProviderOperationMetadataApplied(op *model.WebDAVProviderOperation) (bool, error) {
+	if op == nil {
+		return false, nil
+	}
+	dst, err := getByPath(op.DestinationPath)
+	if err != nil || dst == nil || dst.State == StateDeleted || dst.IsDir != op.SourceIsDir {
+		return false, err
+	}
+	if !op.SourceIsDir {
+		if dst.Size != op.SourceSize {
+			return false, nil
+		}
+		if op.SourceSHA1 != "" {
+			dstSHA1 := canonicalContentSHA1(dst)
+			if dstSHA1 == "" || !strings.EqualFold(dstSHA1, op.SourceSHA1) {
+				return false, nil
+			}
+		}
+	}
+	if strings.EqualFold(op.Method, ProviderOperationMove) {
+		src, err := getByPath(op.SourcePath)
+		if err != nil {
+			return false, err
+		}
+		if src == nil || src.State != StateDeleted {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func removeSpoolIfUnreferenced(spoolPath string) {
 	if spoolPath == "" {
 		return
@@ -168,6 +498,7 @@ func toObject(row *model.WebDAVWritebackObject) model.Obj {
 			Modified: row.ModTime,
 			Ctime:    row.CreateTime,
 			IsFolder: row.IsDir,
+			HashInfo: utils.NewHashInfo(utils.SHA1, row.PayloadSHA1),
 		},
 		etag: row.ETag,
 	}
