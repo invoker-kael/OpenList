@@ -30,7 +30,7 @@ PUT
 
 A successful PUT means the payload is durable in the local spool and its metadata is committed to the OpenList database. It does **not** mean the backing cloud has already finished uploading.
 
-After the complete PUT body is fsynced and atomically installed in the spool, the canonical MySQL commit is intentionally detached from HTTP request cancellation. A late Cloud Sync timeout/disconnect can therefore lose the response, but it cannot make OpenList discard an already complete large payload; the next retry observes/coalesces against the durable canonical generation. An incomplete body is never committed.
+After the complete PUT body is fsynced and atomically installed in the spool, the canonical MySQL commit is intentionally detached from HTTP request cancellation. A late Cloud Sync timeout/disconnect can therefore lose the response, but it cannot make OpenList discard an already complete large payload; the next retry observes/coalesces against the durable canonical generation. An incomplete body is never committed. When the request has a declared length and OpenList has received exactly that many bytes, a terminal connection-cancellation error after the final byte is treated as end-of-body rather than as truncation; cancellation before the declared length remains a hard failure.
 
 Failed remote uploads retry in the background. An interrupted `UPLOADING` row is deliberately re-queued from the durable spool after restart. This can duplicate a provider upload after a crash, but it avoids treating an older same-sized encrypted object as proof that the newest generation arrived. The remote write contract is therefore **at-least-once across crashes**, with the local canonical generation remaining authoritative to Cloud Sync.
 

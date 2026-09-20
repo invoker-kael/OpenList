@@ -1110,6 +1110,69 @@ func TestDurableCommitContextSurvivesClientCancellation(t *testing.T) {
 	}
 }
 
+type terminalErrorReader struct {
+	payload []byte
+	err     error
+	sent    bool
+}
+
+func (r *terminalErrorReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		n := copy(p, r.payload)
+		return n, nil
+	}
+	return 0, r.err
+}
+
+func TestCopyToSpoolAcceptsLateCancellationAfterDeclaredLength(t *testing.T) {
+	payload := []byte("complete-large-put")
+	f, err := os.CreateTemp(t.TempDir(), "spool-*.data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	reservation := &incomingReservation{remaining: uint64(len(payload))}
+	spaceMu.Lock()
+	reservedIncoming += uint64(len(payload))
+	spaceMu.Unlock()
+	defer reservation.release()
+
+	reader := &terminalErrorReader{payload: payload, err: context.Canceled}
+	size, sha1sum, err := copyToSpool(f, reader, int64(len(payload)), reservation)
+	if err != nil {
+		t.Fatalf("late cancellation after the declared length should not discard a complete PUT: %v", err)
+	}
+	if size != int64(len(payload)) {
+		t.Fatalf("spooled size = %d, want %d", size, len(payload))
+	}
+	if want := utils.HashData(utils.SHA1, payload); sha1sum != want {
+		t.Fatalf("payload sha1 = %q, want %q", sha1sum, want)
+	}
+}
+
+func TestCopyToSpoolRejectsCancellationBeforeDeclaredLength(t *testing.T) {
+	payload := []byte("short")
+	expected := int64(len(payload) + 1)
+	f, err := os.CreateTemp(t.TempDir(), "spool-*.data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	reservation := &incomingReservation{remaining: uint64(expected)}
+	spaceMu.Lock()
+	reservedIncoming += uint64(expected)
+	spaceMu.Unlock()
+	defer reservation.release()
+
+	reader := &terminalErrorReader{payload: payload, err: context.Canceled}
+	if _, _, err := copyToSpool(f, reader, expected, reservation); !errors.Is(err, context.Canceled) {
+		t.Fatalf("incomplete canceled PUT error = %v, want context.Canceled", err)
+	}
+}
+
 func TestCopyToSpoolComputesPayloadSHA1(t *testing.T) {
 	payload := "cloud-sync-encrypted-payload"
 	f, err := os.CreateTemp(t.TempDir(), "spool-*.data")

@@ -2124,7 +2124,11 @@ func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incom
 			}
 		}
 		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
+			if errors.Is(readErr, io.EOF) || (expected >= 0 && total == expected) {
+				// net/http can surface a late request cancellation instead of EOF
+				// after all declared bytes have already been delivered. The body is
+				// complete in that case; rejecting it would discard a fully received
+				// large Cloud Sync PUT and force a full retransmission.
 				break
 			}
 			return total, "", readErr
