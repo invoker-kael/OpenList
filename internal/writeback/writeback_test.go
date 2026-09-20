@@ -670,6 +670,14 @@ func TestReceivingPathReferenceCount(t *testing.T) {
 	}
 }
 
+func TestOrderedMutationFenceRootsIsDeterministic(t *testing.T) {
+	got := orderedMutationFenceRoots("/z", "/a", "/z", "/m/../b")
+	want := []string{"/a", "/b", "/z"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ordered mutation roots = %v, want %v", got, want)
+	}
+}
+
 func TestMutationFenceInvalidatesEarlierPutSequence(t *testing.T) {
 	fence := &model.WebDAVWritebackReceiveFence{
 		NextSequence:          7,

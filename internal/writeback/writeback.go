@@ -2146,6 +2146,30 @@ func advanceMutationFenceTree(tx *gorm.DB, root string) error {
 	return nil
 }
 
+func orderedMutationFenceRoots(roots ...string) []string {
+	seen := make(map[string]struct{}, len(roots))
+	ordered := make([]string, 0, len(roots))
+	for _, root := range roots {
+		root = utils.FixAndCleanPath(root)
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		ordered = append(ordered, root)
+	}
+	sort.Strings(ordered)
+	return ordered
+}
+
+func advanceMutationFenceTrees(tx *gorm.DB, roots ...string) error {
+	for _, root := range orderedMutationFenceRoots(roots...) {
+		if err := advanceMutationFenceTree(tx, root); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func advanceReceiveFence(tx *gorm.DB, fence *model.WebDAVWritebackReceiveFence, sequence uint64) error {
 	if fence == nil || sequence == 0 {
 		return errors.New("write-back receive fence is missing")
@@ -2759,6 +2783,9 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 	now := time.Now()
 	var oldDestinationSpools []string
 	err = db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := advanceMutationFenceTrees(tx, src, dst); err != nil {
+			return err
+		}
 		// Lock both subtrees in one deterministic ID order. This avoids the
 		// classic A->B / B->A pattern where two MOVE transactions lock their
 		// source first and deadlock while trying to lock the other's target.
@@ -2920,6 +2947,9 @@ func copyPendingDirectory(src, dst string, recursive bool) (handled bool, overwr
 
 	now := time.Now()
 	err = db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := advanceMutationFenceTree(tx, dst); err != nil {
+			return err
+		}
 		var candidates []model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("path = ? OR path LIKE ? ESCAPE '~' OR path = ? OR path LIKE ? ESCAPE '~'", src, descendantLikePattern(src), dst, descendantLikePattern(dst)).
@@ -3049,6 +3079,9 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 	now := time.Now()
 	settleAt := now.Add(cloudSyncSettleDelay(srcRow.Size))
 	err = db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := advanceMutationFenceTrees(tx, src, dst); err != nil {
+			return err
+		}
 		var lockedSrc model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).First(&lockedSrc).Error; err != nil {
 			return err
@@ -3158,6 +3191,9 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 	var oldDestinationSpool string
 	settleAt := time.Now().Add(cloudSyncSettleDelay(srcRow.Size))
 	err = db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := advanceMutationFence(tx, dst); err != nil {
+			return err
+		}
 		var lockedSrc model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).First(&lockedSrc).Error; err != nil {
 			return err
@@ -3421,6 +3457,9 @@ func CopyTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 	now := time.Now()
 	var staleSpools []string
 	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := advanceMutationFenceTree(tx, dst); err != nil {
+			return err
+		}
 		var candidates []model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("path = ? OR path LIKE ? ESCAPE '~' OR path = ? OR path LIKE ? ESCAPE '~'", src, descendantLikePattern(src), dst, descendantLikePattern(dst)).
@@ -3618,6 +3657,9 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 	now := time.Now()
 	var staleSpools []string
 	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := advanceMutationFenceTrees(tx, src, dst); err != nil {
+			return err
+		}
 		var candidates []model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("path = ? OR path LIKE ? ESCAPE '~' OR path = ? OR path LIKE ? ESCAPE '~'", src, descendantLikePattern(src), dst, descendantLikePattern(dst)).
