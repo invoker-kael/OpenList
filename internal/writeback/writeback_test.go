@@ -3,6 +3,8 @@ package writeback
 import (
 	"strings"
 	"testing"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
 func TestPathKeyIsStableAndMySQLIndexSafe(t *testing.T) {
@@ -25,5 +27,52 @@ func TestCanonicalETagChangesWithGeneration(t *testing.T) {
 	}
 	if !strings.HasPrefix(a, "\"olwb-") {
 		t.Fatalf("unexpected etag %q", a)
+	}
+}
+
+
+func TestShouldRemoveStaleRemote(t *testing.T) {
+	tests := []struct {
+		name     string
+		uploaded string
+		current  *model.WebDAVWritebackObject
+		want     bool
+	}{
+		{
+			name:     "newer generation same path is kept",
+			uploaded: "/encrypted/file.bin",
+			current: &model.WebDAVWritebackObject{
+				Path:       "/encrypted/file.bin",
+				Generation: 2,
+				State:      StateQueued,
+			},
+			want: false,
+		},
+		{
+			name:     "deleted path is removed",
+			uploaded: "/encrypted/file.bin",
+			current: &model.WebDAVWritebackObject{
+				Path:  "/encrypted/file.bin",
+				State: StateDeleted,
+			},
+			want: true,
+		},
+		{
+			name:     "moved path cleans old remote",
+			uploaded: "/encrypted/.tmp-file",
+			current: &model.WebDAVWritebackObject{
+				Path:  "/encrypted/file.bin",
+				State: StateQueued,
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRemoveStaleRemote(tt.uploaded, tt.current); got != tt.want {
+				t.Fatalf("shouldRemoveStaleRemote() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
