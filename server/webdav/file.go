@@ -29,6 +29,26 @@ func slashClean(name string) string {
 	return path.Clean(name)
 }
 
+func resourceExists(ctx context.Context, name string) (bool, error) {
+	if writeback.Enabled() {
+		obj, found, deleted, err := writeback.Canonical(name)
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return !deleted && obj != nil, nil
+		}
+	}
+	_, err := fs.Get(ctx, name, &fs.GetArgs{NoLog: true})
+	if err == nil {
+		return true, nil
+	}
+	if errs.IsObjectNotFound(err) {
+		return false, nil
+	}
+	return false, err
+}
+
 // moveFiles moves files and/or directories from src to dst.
 // Individual item permission checks are skipped for performance reasons.
 //
@@ -56,6 +76,13 @@ func moveFiles(ctx context.Context, src, dst string, overwrite bool) (status int
 	if !common.CanWrite(user, srcMeta, srcDir) || !common.CanWrite(user, dstMeta, dstDir) {
 		return http.StatusForbidden, nil
 	}
+	dstExists, err := resourceExists(ctx, dst)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	if dstExists && !overwrite {
+		return http.StatusPreconditionFailed, nil
+	}
 	if srcDir == dstDir {
 		err = fs.Rename(ctx, src, dstName)
 	} else {
@@ -70,7 +97,9 @@ func moveFiles(ctx context.Context, src, dst string, overwrite bool) (status int
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
-	// TODO if there are no files copy, should return 204
+	if dstExists {
+		return http.StatusNoContent, nil
+	}
 	return http.StatusCreated, nil
 }
 
@@ -99,11 +128,20 @@ func copyFiles(ctx context.Context, src, dst string, overwrite bool) (status int
 	if !common.CanWrite(user, dstMeta, dstDir) {
 		return http.StatusForbidden, nil
 	}
+	dstExists, err := resourceExists(ctx, dst)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	if dstExists && !overwrite {
+		return http.StatusPreconditionFailed, nil
+	}
 	_, err = fs.Copy(context.WithValue(ctx, conf.NoTaskKey, struct{}{}), src, dstDir)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
-	// TODO if there are no files copy, should return 204
+	if dstExists {
+		return http.StatusNoContent, nil
+	}
 	return http.StatusCreated, nil
 }
 
