@@ -55,6 +55,12 @@ func pathKey(p string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func isPathOrDescendant(candidate, root string) bool {
+	candidate = utils.FixAndCleanPath(candidate)
+	root = utils.FixAndCleanPath(root)
+	return candidate == root || strings.HasPrefix(candidate, root+"/")
+}
+
 func canonicalETag(key string, generation uint64, size int64) string {
 	return fmt.Sprintf("\"olwb-%s-%d-%x\"", key[:16], generation, uint64(size))
 }
@@ -544,34 +550,94 @@ func OpenLocal(p string) (*os.File, *model.WebDAVWritebackObject, error) {
 	return f, row, err
 }
 
-// Delete creates a durable tombstone and lets the background worker remove the
-// remote object. This makes the deletion immediately visible to Cloud Sync.
-func Delete(p string) (bool, error) {
-	row, err := getByPath(p)
-	if err != nil || row == nil {
-		return false, err
+// DeleteTree creates durable tombstones for a tracked path and every tracked
+// descendant. If only descendants are tracked, add a synthetic directory
+// tombstone so the backing provider tree is still removed asynchronously.
+func DeleteTree(p string) (bool, error) {
+	if !Enabled() {
+		return false, nil
 	}
+	p = utils.FixAndCleanPath(p)
 	now := time.Now()
-	err = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("id = ?", row.ID).
-		Updates(map[string]any{
-			"generation":   gorm.Expr("generation + 1"),
-			"state":        StateDeleted,
-			"retry_at":     &now,
-			"last_error":   "",
-			"verify_count": 0,
-		}).Error
-	if err == nil {
+	handled := false
+
+	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		var candidates []model.WebDAVWritebackObject
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("path = ? OR path LIKE ?", p, p+"%").
+			Find(&candidates).Error; err != nil {
+			return err
+		}
+
+		hasExact := false
+		matchedDescendant := false
+		for i := range candidates {
+			row := &candidates[i]
+			if !isPathOrDescendant(row.Path, p) {
+				continue
+			}
+			handled = true
+			if row.Path == p {
+				hasExact = true
+			} else {
+				matchedDescendant = true
+			}
+			if row.State == StateDeleted {
+				continue
+			}
+			if err := tx.Model(&model.WebDAVWritebackObject{}).
+				Where("id = ?", row.ID).
+				Updates(map[string]any{
+					"generation":   gorm.Expr("generation + 1"),
+					"state":        StateDeleted,
+					"retry_at":     &now,
+					"last_error":   "",
+					"retry_count":  0,
+					"verify_count": 0,
+					"completed_at": nil,
+				}).Error; err != nil {
+				return err
+			}
+		}
+
+		if !hasExact && matchedDescendant {
+			key := pathKey(p)
+			row := model.WebDAVWritebackObject{
+				PathKey:    key,
+				ParentKey:  pathKey(path.Dir(p)),
+				Path:       p,
+				Parent:     path.Dir(p),
+				Name:       path.Base(p),
+				IsDir:      true,
+				Size:       0,
+				ModTime:    now,
+				CreateTime: now,
+				ETag:       canonicalETag(key, 1, 0),
+				Generation: 1,
+				State:      StateDeleted,
+				RetryAt:    &now,
+			}
+			if err := tx.Create(&row).Error; err != nil {
+				return err
+			}
+			handled = true
+		}
+		return nil
+	})
+	if err != nil {
+		return handled, err
+	}
+	if handled {
 		wake()
 	}
-	return true, err
+	return handled, nil
 }
 
-// MovePending handles an exact file move when the source has not reached the
-// completed remote state yet. It also handles Cloud Sync's common
-// temp-file -> final-file overwrite pattern without violating the MySQL
-// path_key unique index.
-func MovePending(src, dst string, overwrite bool) (bool, error) {
+
+// MovePending handles an exact pending file move without waiting for provider
+// visibility. overwritten reports whether the canonical destination existed so
+// WebDAV can return 204 instead of 201.
+func MovePending(src, dst string, overwrite bool) (handled bool, overwritten bool, err error) {
 	src = utils.FixAndCleanPath(src)
 	dst = utils.FixAndCleanPath(dst)
 	srcKey := pathKey(src)
@@ -580,22 +646,22 @@ func MovePending(src, dst string, overwrite bool) (bool, error) {
 	var srcRow model.WebDAVWritebackObject
 	if err := db.GetDb().Where("path_key = ?", srcKey).First(&srcRow).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return false, nil
+			return false, false, nil
 		}
-		return false, err
+		return false, false, err
 	}
-	if srcRow.State == StateDeleted || srcRow.State == StateCompleted {
-		return false, nil
+	if srcRow.IsDir || srcRow.State == StateDeleted || srcRow.State == StateCompleted {
+		return false, false, nil
 	}
 
 	var oldDestinationSpool string
 	now := time.Now()
-	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+	err = db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var lockedSrc model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).First(&lockedSrc).Error; err != nil {
 			return err
 		}
-		if lockedSrc.State == StateDeleted || lockedSrc.State == StateCompleted {
+		if lockedSrc.IsDir || lockedSrc.State == StateDeleted || lockedSrc.State == StateCompleted {
 			return gorm.ErrRecordNotFound
 		}
 
@@ -605,16 +671,21 @@ func MovePending(src, dst string, overwrite bool) (bool, error) {
 			return dstErr
 		}
 		if dstErr == nil && dstRow.ID != lockedSrc.ID {
-			if !overwrite {
+			destinationExists := dstRow.State != StateDeleted
+			if destinationExists && !overwrite {
 				return ErrDestinationExists
 			}
+			if destinationExists && dstRow.IsDir {
+				return ErrDestinationExists
+			}
+			overwritten = destinationExists
 			oldDestinationSpool = dstRow.SpoolPath
 			dstRow.Generation++
 			dstRow.ParentKey = pathKey(path.Dir(dst))
 			dstRow.Path = dst
 			dstRow.Parent = path.Dir(dst)
 			dstRow.Name = path.Base(dst)
-			dstRow.IsDir = lockedSrc.IsDir
+			dstRow.IsDir = false
 			dstRow.Size = lockedSrc.Size
 			dstRow.ModTime = lockedSrc.ModTime
 			dstRow.CreateTime = lockedSrc.CreateTime
@@ -628,19 +699,19 @@ func MovePending(src, dst string, overwrite bool) (bool, error) {
 			dstRow.VerifyCount = 0
 			dstRow.RetryAt = &now
 			dstRow.CompletedAt = nil
-		if err := tx.Save(&dstRow).Error; err != nil {
-			return err
-		}
+			if err := tx.Save(&dstRow).Error; err != nil {
+				return err
+			}
 
-		lockedSrc.Generation++
-		lockedSrc.State = StateDeleted
-		lockedSrc.SpoolPath = ""
-		lockedSrc.LastError = ""
-		lockedSrc.RetryCount = 0
-		lockedSrc.VerifyCount = 0
-		lockedSrc.RetryAt = &now
-		lockedSrc.CompletedAt = nil
-		return tx.Save(&lockedSrc).Error
+			lockedSrc.Generation++
+			lockedSrc.State = StateDeleted
+			lockedSrc.SpoolPath = ""
+			lockedSrc.LastError = ""
+			lockedSrc.RetryCount = 0
+			lockedSrc.VerifyCount = 0
+			lockedSrc.RetryAt = &now
+			lockedSrc.CompletedAt = nil
+			return tx.Save(&lockedSrc).Error
 		}
 
 		lockedSrc.PathKey = dstKey
@@ -660,10 +731,10 @@ func MovePending(src, dst string, overwrite bool) (bool, error) {
 		return tx.Save(&lockedSrc).Error
 	})
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return false, nil
+		return false, false, nil
 	}
 	if err != nil {
-		return true, err
+		return true, overwritten, err
 	}
 	if oldDestinationSpool != "" {
 		if _, active := activeSpools.Load(oldDestinationSpool); !active {
@@ -671,8 +742,103 @@ func MovePending(src, dst string, overwrite bool) (bool, error) {
 		}
 	}
 	wake()
-	return true, nil
+	return true, overwritten, nil
 }
+
+// CopyPending copies a canonical file directly from the durable local spool.
+// This lets Cloud Sync COPY a file immediately after PUT, before 115 exposes
+// the source object. The source and destination safely reference the same
+// immutable generation spool payload until their independent uploads finish.
+func CopyPending(src, dst string, overwrite bool) (handled bool, overwritten bool, err error) {
+	src = utils.FixAndCleanPath(src)
+	dst = utils.FixAndCleanPath(dst)
+	if src == dst {
+		return false, false, nil
+	}
+	var srcRow model.WebDAVWritebackObject
+	if err := db.GetDb().Where("path_key = ?", pathKey(src)).First(&srcRow).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, false, nil
+		}
+		return false, false, err
+	}
+	if srcRow.IsDir || srcRow.State == StateDeleted || srcRow.SpoolPath == "" {
+		return false, false, nil
+	}
+
+	var oldDestinationSpool string
+	settleAt := time.Now().Add(cloudSyncSettleDelay(srcRow.Size))
+	err = db.GetDb().Transaction(func(tx *gorm.DB) error {
+		var lockedSrc model.WebDAVWritebackObject
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).First(&lockedSrc).Error; err != nil {
+			return err
+		}
+		if lockedSrc.IsDir || lockedSrc.State == StateDeleted || lockedSrc.SpoolPath == "" {
+			return gorm.ErrRecordNotFound
+		}
+
+		dstKey := pathKey(dst)
+		var dstRow model.WebDAVWritebackObject
+		dstErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", dstKey).First(&dstRow).Error
+		if dstErr != nil && !errors.Is(dstErr, gorm.ErrRecordNotFound) {
+			return dstErr
+		}
+
+		if dstErr == nil {
+			destinationExists := dstRow.State != StateDeleted
+			if destinationExists && !overwrite {
+				return ErrDestinationExists
+			}
+			if destinationExists && dstRow.IsDir {
+				return ErrDestinationExists
+			}
+			overwritten = destinationExists
+			oldDestinationSpool = dstRow.SpoolPath
+			dstRow.Generation++
+		} else {
+			dstRow.Generation = 1
+		}
+
+		dstRow.PathKey = dstKey
+		dstRow.ParentKey = pathKey(path.Dir(dst))
+		dstRow.Path = dst
+		dstRow.Parent = path.Dir(dst)
+		dstRow.Name = path.Base(dst)
+		dstRow.IsDir = false
+		dstRow.Size = lockedSrc.Size
+		dstRow.ModTime = lockedSrc.ModTime
+		dstRow.CreateTime = lockedSrc.CreateTime
+		dstRow.ETag = canonicalETag(dstKey, dstRow.Generation, lockedSrc.Size)
+		dstRow.State = StateQueued
+		dstRow.SpoolPath = lockedSrc.SpoolPath
+		dstRow.MimeType = lockedSrc.MimeType
+		dstRow.CleanupPath = ""
+		dstRow.LastError = ""
+		dstRow.RetryCount = 0
+		dstRow.VerifyCount = 0
+		dstRow.RetryAt = &settleAt
+		dstRow.CompletedAt = nil
+
+		if dstRow.ID == 0 {
+			return tx.Create(&dstRow).Error
+		}
+		return tx.Save(&dstRow).Error
+	})
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, false, nil
+	}
+	if err != nil {
+		return true, overwritten, err
+	}
+	if oldDestinationSpool != "" && oldDestinationSpool != srcRow.SpoolPath {
+		if _, active := activeSpools.Load(oldDestinationSpool); !active {
+			removeSpoolIfUnreferenced(oldDestinationSpool)
+		}
+	}
+	wake()
+	return true, overwritten, nil
+}
+
 
 // MoveTreeMetadata follows a successful remote MOVE and keeps canonical
 // metadata aligned with the new path. Pending descendants are re-queued.
@@ -691,7 +857,7 @@ func MoveTreeMetadata(src, dst string) error {
 	}
 	for i := range rows {
 		row := &rows[i]
-		if row.Path != src && !strings.HasPrefix(row.Path, src+"/") {
+		if !isPathOrDescendant(row.Path, src) {
 			continue
 		}
 		suffix := strings.TrimPrefix(row.Path, src)
