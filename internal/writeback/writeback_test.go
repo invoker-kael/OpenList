@@ -552,3 +552,35 @@ func TestRemoteListContainsName(t *testing.T) {
 	}
 }
 
+func TestMoveMetadataNeedsProviderRootShadow(t *testing.T) {
+	sourceRoot := &model.Object{
+		Name:     "src",
+		IsFolder: true,
+		Modified: time.Now().Add(-time.Hour),
+		Ctime:    time.Now().Add(-2 * time.Hour),
+	}
+	rows := []model.WebDAVWritebackObject{
+		{Path: "/src/child.bin", State: StateCompleted},
+	}
+	hasSourceRoot := false
+	for i := range rows {
+		if rows[i].Path == "/src" {
+			hasSourceRoot = true
+			break
+		}
+	}
+	if hasSourceRoot {
+		t.Fatal("test fixture unexpectedly contains a canonical source root")
+	}
+
+	now := time.Now()
+	var root model.WebDAVWritebackObject
+	setProviderCompletedRoot(&root, "/dst", sourceRoot, now)
+	if !root.IsDir || root.Path != "/dst" || root.State != StateCompleted {
+		t.Fatalf("provider directory root shadow = %+v", root)
+	}
+	if root.CompletedAt == nil || !root.CompletedAt.Equal(now) {
+		t.Fatal("provider directory root shadow must receive fresh consistency grace")
+	}
+}
+

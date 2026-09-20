@@ -1684,6 +1684,32 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 			}
 		}
 
+		hasSourceRoot := false
+		for i := range sourceRows {
+			if sourceRows[i].Path == src {
+				hasSourceRoot = true
+				break
+			}
+		}
+		if !hasSourceRoot && sourceRoot != nil {
+			var root model.WebDAVWritebackObject
+			if idx, ok := destinationByPath[dst]; ok {
+				root = destinationRows[idx]
+				collidedDestination[root.ID] = struct{}{}
+				if root.SpoolPath != "" {
+					staleSpools = append(staleSpools, root.SpoolPath)
+				}
+			}
+			setProviderCompletedRoot(&root, dst, sourceRoot, now)
+			if root.ID == 0 {
+				if err := tx.Create(&root).Error; err != nil {
+					return err
+				}
+			} else if err := tx.Save(&root).Error; err != nil {
+				return err
+			}
+		}
+
 		for i := range destinationRows {
 			destinationRow := &destinationRows[i]
 			if _, ok := collidedDestination[destinationRow.ID]; ok {
