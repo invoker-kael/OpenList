@@ -38,7 +38,6 @@ type WebDAVWritebackObject struct {
 	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
-
 // WebDAVProviderOperation is a durable intent around synchronous provider
 // COPY/MOVE mutations. It closes the gap between a successful remote mutation
 // and the MySQL transaction that reconciles canonical WebDAV metadata.
