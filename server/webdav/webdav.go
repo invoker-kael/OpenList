@@ -443,6 +443,54 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	if !common.CanWrite(user, parentMeta, parentPath) {
 		return http.StatusForbidden, errs.PermissionDenied
 	}
+
+	// Cloud Sync normally relies on the immediate PROPFIND result, but WebDAV
+	// clients may also use entity-tag preconditions while retrying an upload.
+	// Only resolve the current provider object when a condition header exists;
+	// ordinary Cloud Sync PUTs stay independent of slow/eventually-consistent
+	// provider lookups.
+	ifMatch := r.Header.Get("If-Match")
+	ifNoneMatch := r.Header.Get("If-None-Match")
+	if ifMatch != "" || ifNoneMatch != "" {
+		var current model.Obj
+		exists := false
+		current, found, deleted, wbErr := writeback.Canonical(reqPath)
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
+		if found {
+			exists = !deleted && current != nil
+		} else {
+			current, err = fs.Get(ctx, reqPath, &fs.GetArgs{})
+			if err == nil {
+				exists = true
+			} else if errs.IsObjectNotFound(err) {
+				err = nil
+				current = nil
+			} else {
+				return http.StatusInternalServerError, err
+			}
+		}
+		etag := ""
+		if exists {
+			etag, err = findETag(ctx, h.LockSystem, reqPath, current)
+			if err != nil {
+				return http.StatusInternalServerError, err
+			}
+		}
+		if putPreconditionFailed(ifMatch, ifNoneMatch, exists, etag) {
+			return http.StatusPreconditionFailed, nil
+		}
+	}
+
+	if writeback.Enabled() {
+		if current, found, deleted, wbErr := writeback.Canonical(reqPath); wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		} else if found && !deleted && current != nil && current.IsDir() {
+			return http.StatusMethodNotAllowed, nil
+		}
+	}
+
 	mimeType := r.Header.Get("Content-Type")
 	if mimeType == "" {
 		mimeType = utils.GetMimeType(reqPath)
