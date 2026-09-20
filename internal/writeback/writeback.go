@@ -183,7 +183,12 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 				if res.Error != nil {
 					return nil, false, res.Error
 				}
-				delete(byName, row.Name)
+				// If the provider exposes a same-name object with the wrong type,
+				// stop shadowing it after the grace window so Cloud Sync can observe
+				// the real conflict instead of seeing the name disappear entirely.
+				if !remotePresent {
+					delete(byName, row.Name)
+				}
 				continue
 			}
 		}
