@@ -1392,6 +1392,90 @@ func setProviderCompletedRoot(row *model.WebDAVWritebackObject, dst string, sour
 	row.CompletedAt = &now
 }
 
+
+func setMovedDestinationFromSource(row, source *model.WebDAVWritebackObject, dst string, now time.Time) {
+	if row == nil || source == nil {
+		return
+	}
+	dst = utils.FixAndCleanPath(dst)
+	if row.Generation == 0 {
+		row.Generation = 1
+	} else {
+		row.Generation++
+	}
+	row.PathKey = pathKey(dst)
+	row.ParentKey = pathKey(path.Dir(dst))
+	row.Path = dst
+	row.Parent = path.Dir(dst)
+	row.Name = path.Base(dst)
+	row.IsDir = source.IsDir
+	row.Size = source.Size
+	row.ModTime = source.ModTime
+	row.CreateTime = source.CreateTime
+	row.ETag = canonicalETag(row.PathKey, row.Generation, row.Size)
+	row.SpoolPath = source.SpoolPath
+	row.PayloadSHA1 = source.PayloadSHA1
+	row.MimeType = source.MimeType
+	row.CleanupPath = ""
+	row.LastError = ""
+	row.RetryCount = 0
+	row.VerifyCount = 0
+	clearRemoteVerification(row)
+
+	switch {
+	case source.State == StateDeleted:
+		row.State = StateDeleted
+		row.SpoolPath = ""
+		row.PayloadSHA1 = ""
+		row.RetryAt = &now
+		row.CompletedAt = nil
+	case source.State == StateCompleted && source.SpoolPath == "":
+		row.State = StateCompleted
+		row.RetryAt = nil
+		row.CompletedAt = &now
+	default:
+		row.State = StateQueued
+		row.RetryAt = &now
+		row.CompletedAt = nil
+	}
+}
+
+func providerMoveSourceTombstone(src string, source model.Obj, now time.Time) model.WebDAVWritebackObject {
+	src = utils.FixAndCleanPath(src)
+	size := int64(0)
+	isDir := false
+	modTime := now
+	createTime := now
+	if source != nil {
+		size = source.GetSize()
+		isDir = source.IsDir()
+		if !source.ModTime().IsZero() {
+			modTime = source.ModTime()
+		}
+		if !source.CreateTime().IsZero() {
+			createTime = source.CreateTime()
+		} else {
+			createTime = modTime
+		}
+	}
+	key := pathKey(src)
+	return model.WebDAVWritebackObject{
+		PathKey:    key,
+		ParentKey:  pathKey(path.Dir(src)),
+		Path:       src,
+		Parent:     path.Dir(src),
+		Name:       path.Base(src),
+		IsDir:      isDir,
+		Size:       size,
+		ModTime:    modTime,
+		CreateTime: createTime,
+		ETag:       canonicalETag(key, 1, size),
+		Generation: 1,
+		State:      StateDeleted,
+		RetryAt:    &now,
+	}
+}
+
 // ProviderOverwriteReady checks whether a provider COPY/MOVE may safely replace
 // a tracked destination. It intentionally does not mutate canonical state:
 // provider failure must leave the old stable WebDAV view intact.
@@ -1693,6 +1777,10 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 					return err
 				}
 			}
+			tombstone := providerMoveSourceTombstone(src, sourceRoot, now)
+			if err := tx.Create(&tombstone).Error; err != nil {
+				return err
+			}
 			return nil
 		}
 
@@ -1706,83 +1794,25 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 			sourceRow := &sourceRows[i]
 			suffix := strings.TrimPrefix(sourceRow.Path, src)
 			newPath := utils.FixAndCleanPath(dst + suffix)
-			newParent := path.Dir(newPath)
 
+			var destinationRow model.WebDAVWritebackObject
 			if idx, ok := destinationByPath[newPath]; ok {
-				destinationRow := &destinationRows[idx]
+				destinationRow = destinationRows[idx]
 				collidedDestination[destinationRow.ID] = struct{}{}
 				if destinationRow.SpoolPath != "" && destinationRow.SpoolPath != sourceRow.SpoolPath {
 					staleSpools = append(staleSpools, destinationRow.SpoolPath)
 				}
-
-				destinationRow.Generation++
-				destinationRow.ParentKey = pathKey(newParent)
-				destinationRow.Path = newPath
-				destinationRow.Parent = newParent
-				destinationRow.Name = path.Base(newPath)
-				destinationRow.IsDir = sourceRow.IsDir
-				destinationRow.Size = sourceRow.Size
-				destinationRow.ModTime = sourceRow.ModTime
-				destinationRow.CreateTime = sourceRow.CreateTime
-				destinationRow.ETag = canonicalETag(pathKey(newPath), destinationRow.Generation, sourceRow.Size)
-				destinationRow.SpoolPath = sourceRow.SpoolPath
-				destinationRow.PayloadSHA1 = sourceRow.PayloadSHA1
-				destinationRow.MimeType = sourceRow.MimeType
-				destinationRow.CleanupPath = ""
-				destinationRow.LastError = ""
-				destinationRow.RetryCount = 0
-				destinationRow.VerifyCount = 0
-				clearRemoteVerification(destinationRow)
-
-				switch {
-				case sourceRow.State == StateDeleted:
-					if sourceRow.SpoolPath != "" {
-						staleSpools = append(staleSpools, sourceRow.SpoolPath)
-					}
-					destinationRow.State = StateDeleted
-					destinationRow.SpoolPath = ""
-					destinationRow.PayloadSHA1 = ""
-					destinationRow.RetryAt = &now
-					destinationRow.CompletedAt = nil
-				case sourceRow.State == StateCompleted && sourceRow.SpoolPath == "":
-					destinationRow.State = StateCompleted
-					destinationRow.RetryAt = nil
-					destinationRow.CompletedAt = &now
-				default:
-					destinationRow.State = StateQueued
-					destinationRow.RetryAt = &now
-					destinationRow.CompletedAt = nil
-				}
-				if err := tx.Save(destinationRow).Error; err != nil {
+			}
+			setMovedDestinationFromSource(&destinationRow, sourceRow, newPath, now)
+			if destinationRow.ID == 0 {
+				if err := tx.Create(&destinationRow).Error; err != nil {
 					return err
 				}
-
-				tombstoneMovedSource(sourceRow, now)
-				if err := tx.Save(sourceRow).Error; err != nil {
-					return err
-				}
-				continue
+			} else if err := tx.Save(&destinationRow).Error; err != nil {
+				return err
 			}
 
-			sourceRow.PathKey = pathKey(newPath)
-			sourceRow.ParentKey = pathKey(newParent)
-			sourceRow.Path = newPath
-			sourceRow.Parent = newParent
-			sourceRow.Name = path.Base(newPath)
-			sourceRow.Generation++
-			sourceRow.ETag = canonicalETag(sourceRow.PathKey, sourceRow.Generation, sourceRow.Size)
-			clearRemoteVerification(sourceRow)
-			switch {
-			case sourceRow.State == StateCompleted:
-				sourceRow.CompletedAt = &now
-			case sourceRow.State == StateDeleted:
-				sourceRow.RetryAt = &now
-				sourceRow.CompletedAt = nil
-			default:
-				sourceRow.State = StateQueued
-				sourceRow.RetryAt = &now
-				sourceRow.CompletedAt = nil
-			}
+			tombstoneMovedSource(sourceRow, now)
 			if err := tx.Save(sourceRow).Error; err != nil {
 				return err
 			}
@@ -1810,6 +1840,10 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 					return err
 				}
 			} else if err := tx.Save(&root).Error; err != nil {
+				return err
+			}
+			tombstone := providerMoveSourceTombstone(src, sourceRoot, now)
+			if err := tx.Create(&tombstone).Error; err != nil {
 				return err
 			}
 		}

@@ -828,3 +828,77 @@ func TestRemoteMatchesCanonicalUsesGenerationScopedEvidence(t *testing.T) {
 		t.Fatal("stale remote verification evidence must not constrain a newer generation without payload SHA1")
 	}
 }
+
+
+func TestSetMovedDestinationFromSourceCreatesIndependentGeneration(t *testing.T) {
+	now := time.Now()
+	source := &model.WebDAVWritebackObject{
+		Path:         "/src/file.bin",
+		Parent:       "/src",
+		Name:         "file.bin",
+		Size:         8192,
+		ModTime:      now.Add(-time.Hour),
+		CreateTime:   now.Add(-2 * time.Hour),
+		Generation:   4,
+		State:        StateCompleted,
+		PayloadSHA1:  strings.Repeat("a", 40),
+		MimeType:     "application/octet-stream",
+		RemoteObjectID: "old-source-id",
+	}
+	verifiedAt := now.Add(-time.Minute)
+	destination := &model.WebDAVWritebackObject{
+		Path:             "/dst/old.bin",
+		Generation:       5,
+		RemoteObjectID:   "old-destination-id",
+		RemoteSHA1:       strings.Repeat("b", 40),
+		RemoteGeneration: 5,
+		RemoteVerifiedAt: &verifiedAt,
+	}
+
+	setMovedDestinationFromSource(destination, source, "/dst/file.bin", now)
+
+	if destination.Path != "/dst/file.bin" || destination.Parent != "/dst" || destination.Name != "file.bin" {
+		t.Fatalf("destination path metadata = %s / %s / %s", destination.Path, destination.Parent, destination.Name)
+	}
+	if destination.Generation != 6 || destination.State != StateCompleted {
+		t.Fatalf("destination generation/state = %d/%s", destination.Generation, destination.State)
+	}
+	if destination.PayloadSHA1 != source.PayloadSHA1 || destination.Size != source.Size {
+		t.Fatal("destination content identity was not copied from source")
+	}
+	if destination.CompletedAt == nil || !destination.CompletedAt.Equal(now) {
+		t.Fatal("completed provider MOVE destination must receive fresh consistency grace")
+	}
+	if destination.RemoteObjectID != "" || destination.RemoteSHA1 != "" || destination.RemoteGeneration != 0 || destination.RemoteVerifiedAt != nil {
+		t.Fatal("destination must not retain remote verification evidence from the overwritten generation")
+	}
+	if source.Path != "/src/file.bin" || source.Generation != 4 || source.State != StateCompleted {
+		t.Fatal("building the destination must not mutate the source canonical row")
+	}
+}
+
+func TestProviderMoveSourceTombstone(t *testing.T) {
+	now := time.Now()
+	modified := now.Add(-time.Hour)
+	created := now.Add(-2 * time.Hour)
+	source := &model.Object{
+		Name:     "file.bin",
+		Size:     12345,
+		Modified: modified,
+		Ctime:    created,
+	}
+
+	row := providerMoveSourceTombstone("/src/file.bin", source, now)
+	if row.Path != "/src/file.bin" || row.Parent != "/src" || row.Name != "file.bin" {
+		t.Fatalf("source tombstone path metadata = %s / %s / %s", row.Path, row.Parent, row.Name)
+	}
+	if row.State != StateDeleted || row.Generation != 1 || row.Size != 12345 || row.IsDir {
+		t.Fatalf("unexpected source tombstone: %+v", row)
+	}
+	if row.RetryAt == nil || !row.RetryAt.Equal(now) {
+		t.Fatal("provider MOVE source tombstone must be eligible for absence verification immediately")
+	}
+	if !row.ModTime.Equal(modified) || !row.CreateTime.Equal(created) {
+		t.Fatal("provider MOVE source tombstone should retain captured provider timestamps")
+	}
+}
