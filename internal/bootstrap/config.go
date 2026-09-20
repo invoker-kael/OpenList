@@ -155,10 +155,16 @@ func InitConfig() {
 	convertAbsPath(&conf.Conf.TempDir)
 	convertAbsPath(&conf.Conf.BleveDir)
 	convertAbsPath(&conf.Conf.DistDir)
+	convertAbsPath(&conf.Conf.WebDAVWriteback.SpoolDir)
 
 	err := os.MkdirAll(conf.Conf.TempDir, 0o777)
 	if err != nil {
 		log.Fatalf("create temp dir error: %+v", err)
+	}
+	if conf.Conf.WebDAVWriteback.Enabled {
+		if err := os.MkdirAll(conf.Conf.WebDAVWriteback.SpoolDir, 0o700); err != nil {
+			log.Fatalf("create WebDAV write-back spool dir error: %+v", err)
+		}
 	}
 	log.Debugf("config: %+v", conf.Conf)
 

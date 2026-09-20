@@ -111,6 +111,18 @@ type MCP struct {
 	Enable bool `json:"enable" env:"ENABLE"`
 }
 
+type WebDAVWritebackConfig struct {
+	Enabled                  bool   `json:"enabled" env:"ENABLED"`
+	SpoolDir                 string `json:"spool_dir" env:"SPOOL_DIR"`
+	ReserveFreeSpaceMB        uint64 `json:"reserve_free_space_mb" env:"RESERVE_FREE_SPACE_MB"`
+	Workers                  int    `json:"workers" env:"WORKERS"`
+	RetryInitialSeconds      int    `json:"retry_initial_seconds" env:"RETRY_INITIAL_SECONDS"`
+	RetryMaxSeconds          int    `json:"retry_max_seconds" env:"RETRY_MAX_SECONDS"`
+	VerifyIntervalSeconds    int    `json:"verify_interval_seconds" env:"VERIFY_INTERVAL_SECONDS"`
+	VerifyAttempts           int    `json:"verify_attempts" env:"VERIFY_ATTEMPTS"`
+	CompletedCacheTTLMinutes int    `json:"completed_cache_ttl_minutes" env:"COMPLETED_CACHE_TTL_MINUTES"`
+}
+
 type Config struct {
 	Force                 bool        `json:"force" env:"FORCE"`
 	SiteURL               string      `json:"site_url" env:"SITE_URL"`
@@ -136,8 +148,9 @@ type Config struct {
 	S3                    S3          `json:"s3" envPrefix:"S3_"`
 	FTP                   FTP         `json:"ftp" envPrefix:"FTP_"`
 	SFTP                  SFTP        `json:"sftp" envPrefix:"SFTP_"`
-	MCP                   MCP         `json:"mcp" envPrefix:"MCP_"`
-	LastLaunchedVersion   string      `json:"last_launched_version"`
+	MCP                   MCP                   `json:"mcp" envPrefix:"MCP_"`
+	WebDAVWriteback       WebDAVWritebackConfig `json:"webdav_writeback" envPrefix:"WEBDAV_WRITEBACK_"`
+	LastLaunchedVersion   string                `json:"last_launched_version"`
 	ProxyAddress          string      `json:"proxy_address" env:"PROXY_ADDRESS"`
 }
 
@@ -253,6 +266,17 @@ func DefaultConfig(dataDir string) *Config {
 		},
 		MCP: MCP{
 			Enable: false,
+		},
+		WebDAVWriteback: WebDAVWritebackConfig{
+			Enabled:                  true,
+			SpoolDir:                 filepath.Join(dataDir, "writeback"),
+			ReserveFreeSpaceMB:        20 * 1024,
+			Workers:                  4,
+			RetryInitialSeconds:      30,
+			RetryMaxSeconds:          30 * 60,
+			VerifyIntervalSeconds:    5,
+			VerifyAttempts:           60,
+			CompletedCacheTTLMinutes: 30,
 		},
 		LastLaunchedVersion: "",
 		ProxyAddress:        "",

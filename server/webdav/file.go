@@ -15,6 +15,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/writeback"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/pkg/errors"
 )
@@ -129,6 +130,16 @@ func walkFS(ctx context.Context, depth int, name string, info model.Obj, walkFn 
 	meta, _ := op.GetNearestMeta(name)
 	// Read directory names.
 	objs, err := fs.List(context.WithValue(ctx, conf.MetaKey, meta), name, &fs.ListArgs{})
+	if writeback.Enabled() {
+		overlaid, hasWriteback, overlayErr := writeback.OverlayList(name, objs)
+		if overlayErr != nil {
+			return walkFn(name, info, overlayErr)
+		}
+		if err == nil || hasWriteback {
+			objs = overlaid
+			err = nil
+		}
+	}
 	//f, err := fs.OpenFile(ctx, name, os.O_RDONLY, 0)
 	//if err != nil {
 	//	return walkFn(name, info, err)

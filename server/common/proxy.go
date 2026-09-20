@@ -50,7 +50,10 @@ func Proxy(w http.ResponseWriter, r *http.Request, link *model.Link, file model.
 		})
 	}
 
-	//transparent proxy
+	// transparent proxy. Preserve caller-supplied canonical WebDAV metadata
+	// instead of leaking provider-side timestamps/ETags back to sync clients.
+	canonicalETag := w.Header().Get("Etag")
+	canonicalLastModified := w.Header().Get("Last-Modified")
 	header := net.ProcessHeader(r.Header, link.Header)
 	res, err := net.RequestHttp(r.Context(), r.Method, header, link.URL)
 	if err != nil {
@@ -59,6 +62,12 @@ func Proxy(w http.ResponseWriter, r *http.Request, link *model.Link, file model.
 	defer res.Body.Close()
 
 	maps.Copy(w.Header(), res.Header)
+	if canonicalETag != "" {
+		w.Header().Set("Etag", canonicalETag)
+	}
+	if canonicalLastModified != "" {
+		w.Header().Set("Last-Modified", canonicalLastModified)
+	}
 	w.Header().Set("Content-Disposition", utils.GenerateContentDisposition(file.GetName()))
 	w.WriteHeader(res.StatusCode)
 	if r.Method == http.MethodHead {
@@ -79,7 +88,9 @@ func attachHeader(w http.ResponseWriter, file model.Obj, link *model.Link) {
 	if size <= 0 {
 		size = file.GetSize()
 	}
-	w.Header().Set("Etag", GetEtag(file, size))
+	if w.Header().Get("Etag") == "" {
+		w.Header().Set("Etag", GetEtag(file, size))
+	}
 	contentType := link.Header.Get("Content-Type")
 	if len(contentType) > 0 {
 		w.Header().Set("Content-Type", contentType)

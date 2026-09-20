@@ -22,6 +22,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/internal/writeback"
 	"github.com/pkg/errors"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -204,7 +205,17 @@ func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) (status 
 		return http.StatusForbidden, err
 	}
 	allow := "OPTIONS, LOCK, PUT, MKCOL"
-	if fi, err := fs.Get(ctx, reqPath, &fs.GetArgs{}); err == nil {
+	fi, found, deleted, wbErr := writeback.Canonical(reqPath)
+	if wbErr != nil {
+		return http.StatusInternalServerError, wbErr
+	}
+	if !found {
+		fi, err = fs.Get(ctx, reqPath, &fs.GetArgs{})
+	} else if deleted {
+		fi = nil
+		err = errs.ObjectNotFound
+	}
+	if err == nil && fi != nil {
 		if fi.IsDir() {
 			allow = "OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND"
 		} else {
@@ -239,9 +250,18 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 	if !common.CanAccess(user, meta, reqPath, password) {
 		return http.StatusForbidden, errs.PermissionDenied
 	}
-	fi, err := fs.Get(ctx, reqPath, &fs.GetArgs{})
-	if err != nil {
-		return http.StatusNotFound, err
+	fi, found, deleted, wbErr := writeback.Canonical(reqPath)
+	if wbErr != nil {
+		return http.StatusInternalServerError, wbErr
+	}
+	if deleted {
+		return http.StatusNotFound, errs.ObjectNotFound
+	}
+	if !found {
+		fi, err = fs.Get(ctx, reqPath, &fs.GetArgs{})
+		if err != nil {
+			return http.StatusNotFound, err
+		}
 	}
 	if fi.IsDir() {
 		if r.Method == http.MethodHead {
@@ -251,9 +271,29 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 		}
 		return http.StatusMethodNotAllowed, nil
 	}
+	var canonicalRow *model.WebDAVWritebackObject
+	if writeback.Enabled() && found {
+		localFile, row, localErr := writeback.OpenLocal(reqPath)
+		if localErr != nil {
+			return http.StatusInternalServerError, localErr
+		}
+		canonicalRow = row
+		if row != nil {
+			w.Header().Set("ETag", row.ETag)
+			w.Header().Set("Last-Modified", row.ModTime.UTC().Format(http.TimeFormat))
+			if row.MimeType != "" {
+				w.Header().Set("Content-Type", row.MimeType)
+			}
+		}
+		if localFile != nil {
+			defer localFile.Close()
+			http.ServeContent(w, r, row.Name, row.ModTime, localFile)
+			return 0, nil
+		}
+	}
 	// Let ServeContent determine the Content-Type header.
 	storage, _ := fs.GetStorage(reqPath, &fs.GetStoragesArgs{})
-	if storage.GetStorage().Webdav302() {
+	if !found && storage.GetStorage().Webdav302() {
 		link, _, err := fs.Link(ctx, reqPath, model.LinkArgs{IP: utils.ClientIP(r), Header: r.Header, Redirect: true})
 		if err != nil {
 			return http.StatusInternalServerError, err
@@ -263,7 +303,7 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 		return 0, nil
 	}
 
-	if storage.GetStorage().WebdavProxyURL() {
+	if !found && storage.GetStorage().WebdavProxyURL() {
 		if url := common.GenerateDownProxyURL(storage.GetStorage(), reqPath); url != "" {
 			w.Header().Set("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate")
 			http.Redirect(w, r, url, http.StatusFound)
@@ -277,7 +317,7 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 	}
 	defer link.Close()
 
-	if storage.GetStorage().ProxyRange {
+	if storage.GetStorage().ProxyRange || canonicalRow != nil {
 		link = common.ProxyRange(ctx, link, fi.GetSize())
 	}
 	err = common.Proxy(w, r, link, fi)
@@ -311,6 +351,15 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 		return http.StatusForbidden, err
 	}
 	// TODO: return MultiStatus where appropriate.
+	if writeback.Enabled() {
+		handled, wbErr := writeback.Delete(reqPath)
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
+		if handled {
+			return http.StatusNoContent, nil
+		}
+	}
 
 	// "godoc os RemoveAll" says that "If the path does not exist, RemoveAll
 	// returns nil (no error)." WebDAV semantics are that it should return a
@@ -394,13 +443,25 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	if !common.CanWrite(user, parentMeta, parentPath) {
 		return http.StatusForbidden, errs.PermissionDenied
 	}
+	mimeType := r.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = utils.GetMimeType(reqPath)
+	}
+	if writeback.Enabled() {
+		row, wbErr := writeback.Commit(ctx, reqPath, r.Body, size, obj.Modified, obj.Ctime, mimeType)
+		if wbErr != nil {
+			if strings.Contains(wbErr.Error(), "free space") {
+				return StatusInsufficientStorage, wbErr
+			}
+			return http.StatusInternalServerError, wbErr
+		}
+		w.Header().Set("Etag", row.ETag)
+		return http.StatusCreated, nil
+	}
 	fsStream := &stream.FileStream{
 		Obj:      &obj,
 		Reader:   r.Body,
-		Mimetype: r.Header.Get("Content-Type"),
-	}
-	if fsStream.Mimetype == "" {
-		fsStream.Mimetype = utils.GetMimeType(reqPath)
+		Mimetype: mimeType,
 	}
 	err = fs.PutDirectly(ctx, path.Dir(reqPath), fsStream)
 	if errs.IsNotFoundError(err) {
@@ -551,6 +612,20 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 	}
 	defer release()
 
+	overwrite := r.Header.Get("Overwrite") != "F"
+	if writeback.Enabled() {
+		handled, wbErr := writeback.MovePending(src, dst, overwrite)
+		if errors.Is(wbErr, writeback.ErrDestinationExists) {
+			return http.StatusPreconditionFailed, wbErr
+		}
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
+		if handled {
+			return http.StatusCreated, nil
+		}
+	}
+
 	// Section 9.9.2 says that "The MOVE method on a collection must act as if
 	// a "Depth: infinity" header was used on it. A client must not submit a
 	// Depth header on a MOVE on a collection with any value but "infinity"."
@@ -559,7 +634,13 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 			return http.StatusBadRequest, errInvalidDepth
 		}
 	}
-	return moveFiles(ctx, src, dst, r.Header.Get("Overwrite") == "T")
+	moveStatus, moveErr := moveFiles(ctx, src, dst, overwrite)
+	if moveErr == nil && writeback.Enabled() {
+		if wbErr := writeback.MoveTreeMetadata(src, dst); wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
+	}
+	return moveStatus, moveErr
 }
 
 func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus int, retErr error) {
@@ -731,12 +812,21 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 	if !common.CanAccess(user, meta, reqPath, password) {
 		return http.StatusForbidden, errs.PermissionDenied
 	}
-	fi, err := fs.Get(ctx, reqPath, &fs.GetArgs{})
-	if err != nil {
-		if errs.IsNotFoundError(err) {
-			return http.StatusNotFound, err
+	fi, found, deleted, wbErr := writeback.Canonical(reqPath)
+	if wbErr != nil {
+		return http.StatusInternalServerError, wbErr
+	}
+	if deleted {
+		return http.StatusNotFound, errs.ObjectNotFound
+	}
+	if !found {
+		fi, err = fs.Get(ctx, reqPath, &fs.GetArgs{})
+		if err != nil {
+			if errs.IsNotFoundError(err) {
+				return http.StatusNotFound, err
+			}
+			return http.StatusMethodNotAllowed, err
 		}
-		return http.StatusMethodNotAllowed, err
 	}
 	depth := infiniteDepth
 	if hdr := r.Header.Get("Depth"); hdr != "" {
