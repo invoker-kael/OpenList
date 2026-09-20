@@ -1361,7 +1361,7 @@ func CommitLockNull(ctx context.Context, p string, now time.Time, duration time.
 				saved = row
 				return nil
 			}
-			if !canonicalDeleted(row) {
+			if !canonicalDeleted(&row) {
 				saved = row
 				return nil
 			}
@@ -2562,7 +2562,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 				return advanceReceiveFence(tx, fence, receiveSequence)
 			}
 			oldSpool = row.SpoolPath
-			if canonicalDeleted(row) {
+			if canonicalDeleted(&row) {
 				created = true
 			}
 			row.Generation++
@@ -2661,7 +2661,7 @@ func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*m
 			return findErr
 		}
 		if findErr == nil {
-			if !canonicalDeleted(row) && !row.IsDir {
+			if !canonicalDeleted(&row) && !row.IsDir {
 				return ErrDestinationExists
 			}
 			row.Generation++
