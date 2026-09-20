@@ -829,20 +829,19 @@ func TestRemoteMatchesCanonicalUsesGenerationScopedEvidence(t *testing.T) {
 	}
 }
 
-
 func TestSetMovedDestinationFromSourceCreatesIndependentGeneration(t *testing.T) {
 	now := time.Now()
 	source := &model.WebDAVWritebackObject{
-		Path:         "/src/file.bin",
-		Parent:       "/src",
-		Name:         "file.bin",
-		Size:         8192,
-		ModTime:      now.Add(-time.Hour),
-		CreateTime:   now.Add(-2 * time.Hour),
-		Generation:   4,
-		State:        StateCompleted,
-		PayloadSHA1:  strings.Repeat("a", 40),
-		MimeType:     "application/octet-stream",
+		Path:           "/src/file.bin",
+		Parent:         "/src",
+		Name:           "file.bin",
+		Size:           8192,
+		ModTime:        now.Add(-time.Hour),
+		CreateTime:     now.Add(-2 * time.Hour),
+		Generation:     4,
+		State:          StateCompleted,
+		PayloadSHA1:    strings.Repeat("a", 40),
+		MimeType:       "application/octet-stream",
 		RemoteObjectID: "old-source-id",
 	}
 	verifiedAt := now.Add(-time.Minute)
@@ -900,5 +899,38 @@ func TestProviderMoveSourceTombstone(t *testing.T) {
 	}
 	if !row.ModTime.Equal(modified) || !row.CreateTime.Equal(created) {
 		t.Fatal("provider MOVE source tombstone should retain captured provider timestamps")
+	}
+}
+
+
+func TestCanReverifyCompletedDuplicatePut(t *testing.T) {
+	sha := strings.Repeat("e", 40)
+	row := &model.WebDAVWritebackObject{
+		Size:        64 * 1024,
+		Generation:  8,
+		State:       StateCompleted,
+		PayloadSHA1: sha,
+	}
+	if !canReverifyCompletedDuplicatePut(row, row.Size, strings.ToUpper(sha)) {
+		t.Fatal("completed same-content PUT without a spool should use remote re-verification")
+	}
+	if canReverifyCompletedDuplicatePut(row, row.Size, strings.Repeat("f", 40)) {
+		t.Fatal("different encrypted content must create a new canonical generation")
+	}
+	row.State = StateQueued
+	if canReverifyCompletedDuplicatePut(row, row.Size, sha) {
+		t.Fatal("only a completed generation may be revived for duplicate re-verification")
+	}
+
+	row.State = StateCompleted
+	row.PayloadSHA1 = ""
+	row.RemoteSHA1 = sha
+	row.RemoteGeneration = row.Generation
+	if !canReverifyCompletedDuplicatePut(row, row.Size, sha) {
+		t.Fatal("current-generation verified SHA1 should identify duplicate content after spool cleanup")
+	}
+	row.RemoteGeneration--
+	if canReverifyCompletedDuplicatePut(row, row.Size, sha) {
+		t.Fatal("stale remote evidence must not coalesce a newer canonical generation")
 	}
 }

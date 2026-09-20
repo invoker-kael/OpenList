@@ -115,6 +115,19 @@ func canCoalesceDuplicatePut(row *model.WebDAVWritebackObject, size int64, paylo
 		strings.EqualFold(row.PayloadSHA1, payloadSHA1)
 }
 
+func canReverifyCompletedDuplicatePut(row *model.WebDAVWritebackObject, size int64, payloadSHA1 string) bool {
+	if row == nil ||
+		row.IsDir ||
+		row.State != StateCompleted ||
+		row.SpoolPath != "" ||
+		row.Size != size ||
+		payloadSHA1 == "" {
+		return false
+	}
+	canonicalSHA1 := canonicalContentSHA1(row)
+	return canonicalSHA1 != "" && strings.EqualFold(canonicalSHA1, payloadSHA1)
+}
+
 var ErrDestinationExists = errors.New("write-back destination already exists")
 
 func removeSpoolIfUnreferenced(spoolPath string) {
@@ -580,6 +593,25 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 					saved = row
 					return nil
 				}
+			}
+			if canReverifyCompletedDuplicatePut(&row, actualSize, payloadSHA1) {
+				now := time.Now()
+				row.State = StateVerifying
+				row.SpoolPath = finalName
+				row.PayloadSHA1 = payloadSHA1
+				row.MimeType = mime
+				row.CleanupPath = ""
+				row.LastError = ""
+				row.RetryCount = 0
+				row.VerifyCount = 0
+				row.RetryAt = &now
+				row.CompletedAt = nil
+				clearRemoteVerification(&row)
+				if err := tx.Save(&row).Error; err != nil {
+					return err
+				}
+				saved = row
+				return nil
 			}
 			oldSpool = row.SpoolPath
 			if row.State == StateDeleted {
@@ -1392,7 +1424,6 @@ func setProviderCompletedRoot(row *model.WebDAVWritebackObject, dst string, sour
 	row.CompletedAt = &now
 }
 
-
 func setMovedDestinationFromSource(row, source *model.WebDAVWritebackObject, dst string, now time.Time) {
 	if row == nil || source == nil {
 		return
@@ -1983,19 +2014,18 @@ func Stop() {
 func (m *workerManager) recoverInterrupted() error {
 	// An UPLOADING row is ambiguous after a process crash: the provider may
 	// already contain the exact encrypted payload even though MySQL never
-	// durably recorded VERIFYING. Re-queue it as a retry so processUpload first
-	// performs the same size/SHA-1 remote verification used after normal retry
-	// backoff. 115 therefore avoids retransmitting a successfully accepted large
-	// object while still requiring exact content identity before completion.
+	// durably recorded VERIFYING. Resume it in VERIFYING so the normal
+	// multi-attempt size/SHA-1 window runs before any retransmission. If the
+	// object never becomes visible, processVerify re-queues the durable spool
+	// for upload after the verification window expires.
 	now := time.Now()
 	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("state = ?", StateUploading).
 		Updates(map[string]any{
-			"state":        StateQueued,
+			"state":        StateVerifying,
 			"retry_at":     &now,
-			"retry_count":  gorm.Expr("retry_count + 1"),
 			"verify_count": 0,
-			"last_error":   "re-queued after restart; remote content will be verified before retransmit",
+			"last_error":   "resuming remote verification after interrupted upload",
 		}).Error
 }
 
@@ -2221,15 +2251,14 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	if res.Error != nil {
 		// The provider PUT has already returned success. If MySQL briefly fails
 		// here, do not strand the row forever in UPLOADING. A best-effort
-		// recovery update turns it into a retry, whose first action is remote
-		// size/SHA-1 verification before any retransmit.
+		// recovery update resumes VERIFYING, preserving the multi-attempt remote
+		// consistency window before any retransmit.
 		next := time.Now().Add(2 * time.Second)
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
 			Updates(map[string]any{
-				"state":        StateQueued,
+				"state":        StateVerifying,
 				"retry_at":     &next,
-				"retry_count":  gorm.Expr("retry_count + 1"),
 				"verify_count": 0,
 				"last_error":   fmt.Sprintf("provider upload succeeded but verification state persistence failed: %v", res.Error),
 			}).Error
