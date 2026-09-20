@@ -87,13 +87,13 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 		State:     StateCompleted,
 		SpoolPath: "",
 	}
-	if !shouldDropCanonicalAfterRemoteList(completedNoSpool, true, false) {
+	if !shouldDropCanonicalAfterRemoteList(completedNoSpool, true, false, time.Now()) {
 		t.Fatal("missing remote object should be surfaced after a reliable listing")
 	}
-	if shouldDropCanonicalAfterRemoteList(completedNoSpool, false, false) {
+	if shouldDropCanonicalAfterRemoteList(completedNoSpool, false, false, time.Now()) {
 		t.Fatal("provider/listing failure must not drop canonical metadata")
 	}
-	if shouldDropCanonicalAfterRemoteList(completedNoSpool, true, true) {
+	if shouldDropCanonicalAfterRemoteList(completedNoSpool, true, true, time.Now()) {
 		t.Fatal("present remote object must keep canonical metadata")
 	}
 
@@ -101,7 +101,7 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 		State:     StateCompleted,
 		SpoolPath: "/spool/object.data",
 	}
-	if shouldDropCanonicalAfterRemoteList(completedCached, true, false) {
+	if shouldDropCanonicalAfterRemoteList(completedCached, true, false, time.Now()) {
 		t.Fatal("locally cached completed object must remain authoritative")
 	}
 
@@ -109,7 +109,7 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 		State:     StateQueued,
 		SpoolPath: "/spool/object.data",
 	}
-	if shouldDropCanonicalAfterRemoteList(queued, true, false) {
+	if shouldDropCanonicalAfterRemoteList(queued, true, false, time.Now()) {
 		t.Fatal("pending upload must remain visible even before provider listing catches up")
 	}
 }
@@ -351,6 +351,51 @@ func TestCopyToSpoolComputesPayloadSHA1(t *testing.T) {
 	want := utils.HashData(utils.SHA1, []byte(payload))
 	if sha1sum != want {
 		t.Fatalf("payload sha1 = %q, want %q", sha1sum, want)
+	}
+}
+
+func TestCanonicalShadowGraceProtectsFreshCompletedFile(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{
+		WebDAVWriteback: conf.WebDAVWritebackConfig{DirectoryGraceSeconds: 60},
+	}
+	defer func() { conf.Conf = oldConf }()
+
+	now := time.Now()
+	completed := now.Add(-30 * time.Second)
+	row := &model.WebDAVWritebackObject{
+		State:       StateCompleted,
+		CompletedAt: &completed,
+	}
+	if !canonicalShadowInGrace(row, now) {
+		t.Fatal("fresh completed file metadata should stay canonical during provider consistency grace")
+	}
+	if shouldDropCanonicalAfterRemoteList(row, true, false, now) {
+		t.Fatal("fresh completed file must not be dropped on a transient provider miss")
+	}
+
+	completed = now.Add(-61 * time.Second)
+	row.CompletedAt = &completed
+	if canonicalShadowInGrace(row, now) {
+		t.Fatal("completed file metadata should leave grace after the configured window")
+	}
+	if !shouldDropCanonicalAfterRemoteList(row, true, false, now) {
+		t.Fatal("expired completed file should expose a confirmed provider loss")
+	}
+}
+
+func TestProviderOverwriteQuiescent(t *testing.T) {
+	if !providerOverwriteQuiescent([]model.WebDAVWritebackObject{
+		{State: StateCompleted},
+		{State: StateCompleted},
+	}) {
+		t.Fatal("all-completed destination tree should be safe for provider overwrite")
+	}
+	for _, state := range []string{StateQueued, StateUploading, StateVerifying, StateFailed, StateDeleted} {
+		rows := []model.WebDAVWritebackObject{{State: StateCompleted}, {State: state}}
+		if providerOverwriteQuiescent(rows) {
+			t.Fatalf("destination state %q must block provider fallback overwrite", state)
+		}
 	}
 }
 

@@ -680,12 +680,10 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 	if err != nil {
 		return status, err
 	}
-
 	dst, status, err := h.stripPrefix(u.Path)
 	if err != nil {
 		return status, err
 	}
-
 	if dst == "" {
 		return http.StatusBadGateway, errInvalidDestination
 	}
@@ -705,45 +703,35 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 	}
 
 	if r.Method == "COPY" {
-		// Section 7.5.1 says that a COPY only needs to lock the destination,
-		// not both destination and source. Strictly speaking, this is racy,
-		// even though a COPY doesn't modify the source, if a concurrent
-		// operation modifies the source. However, the litmus test explicitly
-		// checks that COPYing a locked-by-another source is OK.
 		release, status, err := h.confirmLocks(r, "", dst)
 		if err != nil {
 			return status, err
 		}
 		defer release()
 
-		// Section 9.8.3 says that "The COPY method on a collection without a Depth
-		// header must act as if a Depth header with value "infinity" was included".
 		depth := infiniteDepth
 		if hdr := r.Header.Get("Depth"); hdr != "" {
 			depth = parseDepth(hdr)
 			if depth != 0 && depth != infiniteDepth {
-				// Section 9.8.3 says that "A client may submit a Depth header on a
-				// COPY on a collection with a value of "0" or "infinity"."
 				return http.StatusBadRequest, errInvalidDepth
 			}
 		}
 		overwrite := r.Header.Get("Overwrite") != "F"
+		dstExisted := false
+		dstTracked := false
 		if writeback.Enabled() {
-			dstExists, existsErr := resourceExists(ctx, dst)
-			if existsErr != nil {
-				return http.StatusInternalServerError, existsErr
+			dstExisted, err = resourceExists(ctx, dst)
+			if err != nil {
+				return http.StatusInternalServerError, err
 			}
-			if dstExists && !overwrite {
+			if dstExisted && !overwrite {
 				return http.StatusPreconditionFailed, nil
 			}
-			_, dstTracked, _, wbErr := writeback.Canonical(dst)
-			if wbErr != nil {
-				return http.StatusInternalServerError, wbErr
+			_, dstTracked, _, err = writeback.Canonical(dst)
+			if err != nil {
+				return http.StatusInternalServerError, err
 			}
-			// A provider-only destination must use the provider path so overwrite
-			// semantics are applied to the real remote object. Canonical/tombstoned
-			// destinations can stay entirely inside the write-back transaction.
-			if !dstExists || dstTracked {
+			if !dstExisted || dstTracked {
 				handled, overwritten, wbErr := writeback.CopyPending(src, dst, overwrite)
 				if errors.Is(wbErr, writeback.ErrDestinationExists) {
 					return http.StatusPreconditionFailed, wbErr
@@ -752,14 +740,29 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 					return http.StatusInternalServerError, wbErr
 				}
 				if handled {
-					if dstExists || overwritten {
+					if dstExisted || overwritten {
 						return http.StatusNoContent, nil
 					}
 					return http.StatusCreated, nil
 				}
 			}
+			if dstTracked {
+				_, busy, prepErr := writeback.PrepareProviderOverwrite(dst)
+				if prepErr != nil {
+					return http.StatusInternalServerError, prepErr
+				}
+				if busy {
+					w.Header().Set("Retry-After", "2")
+					return http.StatusServiceUnavailable, nil
+				}
+			}
 		}
-		return copyFiles(ctx, src, dst, overwrite)
+
+		copyStatus, copyErr := copyFiles(ctx, src, dst, overwrite, depth)
+		if copyErr == nil && dstExisted && copyStatus == http.StatusCreated {
+			copyStatus = http.StatusNoContent
+		}
+		return copyStatus, copyErr
 	}
 
 	release, status, err := h.confirmLocks(r, src, dst)
@@ -768,20 +771,26 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 	}
 	defer release()
 
+	if hdr := r.Header.Get("Depth"); hdr != "" && parseDepth(hdr) != infiniteDepth {
+		return http.StatusBadRequest, errInvalidDepth
+	}
+
 	overwrite := r.Header.Get("Overwrite") != "F"
+	dstExisted := false
+	dstTracked := false
 	if writeback.Enabled() {
-		dstExists, existsErr := resourceExists(ctx, dst)
-		if existsErr != nil {
-			return http.StatusInternalServerError, existsErr
+		dstExisted, err = resourceExists(ctx, dst)
+		if err != nil {
+			return http.StatusInternalServerError, err
 		}
-		if dstExists && !overwrite {
+		if dstExisted && !overwrite {
 			return http.StatusPreconditionFailed, nil
 		}
-		_, dstTracked, _, wbErr := writeback.Canonical(dst)
-		if wbErr != nil {
-			return http.StatusInternalServerError, wbErr
+		_, dstTracked, _, err = writeback.Canonical(dst)
+		if err != nil {
+			return http.StatusInternalServerError, err
 		}
-		if !dstExists || dstTracked {
+		if !dstExisted || dstTracked {
 			handled, overwritten, wbErr := writeback.MovePending(src, dst, overwrite)
 			if errors.Is(wbErr, writeback.ErrDestinationExists) {
 				return http.StatusPreconditionFailed, wbErr
@@ -790,27 +799,32 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 				return http.StatusInternalServerError, wbErr
 			}
 			if handled {
-				if dstExists || overwritten {
+				if dstExisted || overwritten {
 					return http.StatusNoContent, nil
 				}
 				return http.StatusCreated, nil
 			}
 		}
-	}
-
-	// Section 9.9.2 says that "The MOVE method on a collection must act as if
-	// a "Depth: infinity" header was used on it. A client must not submit a
-	// Depth header on a MOVE on a collection with any value but "infinity"."
-	if hdr := r.Header.Get("Depth"); hdr != "" {
-		if parseDepth(hdr) != infiniteDepth {
-			return http.StatusBadRequest, errInvalidDepth
+		if dstTracked {
+			_, busy, prepErr := writeback.PrepareProviderOverwrite(dst)
+			if prepErr != nil {
+				return http.StatusInternalServerError, prepErr
+			}
+			if busy {
+				w.Header().Set("Retry-After", "2")
+				return http.StatusServiceUnavailable, nil
+			}
 		}
 	}
+
 	moveStatus, moveErr := moveFiles(ctx, src, dst, overwrite)
 	if moveErr == nil && writeback.Enabled() {
 		if wbErr := writeback.MoveTreeMetadata(src, dst); wbErr != nil {
 			return http.StatusInternalServerError, wbErr
 		}
+	}
+	if moveErr == nil && dstExisted && moveStatus == http.StatusCreated {
+		moveStatus = http.StatusNoContent
 	}
 	return moveStatus, moveErr
 }

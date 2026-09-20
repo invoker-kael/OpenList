@@ -32,3 +32,26 @@ func TestPutPreconditions(t *testing.T) {
 		})
 	}
 }
+
+func TestCopyCanUseNative(t *testing.T) {
+	tests := []struct {
+		name  string
+		src   string
+		dst   string
+		depth int
+		want  bool
+	}{
+		{name: "same name cross directory", src: "/a/foo.bin", dst: "/b/foo.bin", depth: infiniteDepth, want: true},
+		{name: "renamed cross directory must be exact", src: "/a/foo.bin", dst: "/b/bar.bin", depth: infiniteDepth, want: false},
+		{name: "same directory renamed copy must be exact", src: "/a/foo.bin", dst: "/a/bar.bin", depth: infiniteDepth, want: false},
+		{name: "depth zero collection copy must be exact", src: "/a/folder", dst: "/b/folder", depth: 0, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := copyCanUseNative(tt.src, tt.dst, tt.depth); got != tt.want {
+				t.Fatalf("copyCanUseNative(%q, %q, %d) = %v, want %v", tt.src, tt.dst, tt.depth, got, tt.want)
+			}
+		})
+	}
+}
+

@@ -9,13 +9,16 @@ import (
 	"net/http"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/internal/writeback"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/pkg/errors"
 )
@@ -29,24 +32,31 @@ func slashClean(name string) string {
 	return path.Clean(name)
 }
 
-func resourceExists(ctx context.Context, name string) (bool, error) {
+func resourceObject(ctx context.Context, name string) (model.Obj, error) {
 	if writeback.Enabled() {
 		missing, err := writeback.ReconcileDirect(ctx, name)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		if missing {
-			return false, nil
+			return nil, errs.ObjectNotFound
 		}
 		obj, found, deleted, err := writeback.Canonical(name)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		if found {
-			return !deleted && obj != nil, nil
+			if deleted || obj == nil {
+				return nil, errs.ObjectNotFound
+			}
+			return obj, nil
 		}
 	}
-	_, err := fs.Get(ctx, name, &fs.GetArgs{NoLog: true})
+	return fs.Get(ctx, name, &fs.GetArgs{NoLog: true})
+}
+
+func resourceExists(ctx context.Context, name string) (bool, error) {
+	_, err := resourceObject(ctx, name)
 	if err == nil {
 		return true, nil
 	}
@@ -54,6 +64,60 @@ func resourceExists(ctx context.Context, name string) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+func copyCanUseNative(src, dst string, depth int) bool {
+	return depth == infiniteDepth &&
+		path.Dir(src) != path.Dir(dst) &&
+		path.Base(src) == path.Base(dst)
+}
+
+func copyExactFile(ctx context.Context, src, dst string) error {
+	if local, row, err := writeback.OpenLocal(src); err != nil {
+		return err
+	} else if local != nil && row != nil {
+		defer local.Close()
+		obj := &model.Object{
+			Name:     path.Base(dst),
+			Size:     row.Size,
+			Modified: row.ModTime,
+			Ctime:    row.CreateTime,
+			HashInfo: utils.NewHashInfo(utils.SHA1, row.PayloadSHA1),
+		}
+		return fs.PutDirectly(ctx, path.Dir(dst), &stream.FileStream{
+			Obj:      obj,
+			Reader:   local,
+			Mimetype: row.MimeType,
+		})
+	}
+
+	link, obj, err := fs.Link(ctx, src, model.LinkArgs{})
+	if err != nil {
+		return err
+	}
+	targetObj := &model.ObjWrapName{Name: path.Base(dst), Obj: obj}
+	ss, err := stream.NewSeekableStream(&stream.FileStream{
+		Obj: targetObj,
+		Ctx: ctx,
+	}, link)
+	if err != nil {
+		return err
+	}
+	return fs.PutDirectly(ctx, path.Dir(dst), ss)
+}
+
+func copyExactTree(ctx context.Context, src, dst string, srcObj model.Obj, depth int) error {
+	return walkFS(ctx, depth, src, srcObj, func(reqPath string, info model.Obj, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		suffix := strings.TrimPrefix(reqPath, src)
+		target := utils.FixAndCleanPath(dst + suffix)
+		if info.IsDir() {
+			return fs.MakeDir(ctx, target)
+		}
+		return copyExactFile(ctx, reqPath, target)
+	})
 }
 
 // moveFiles moves files and/or directories from src to dst.
@@ -114,7 +178,7 @@ func moveFiles(ctx context.Context, src, dst string, overwrite bool) (status int
 // Individual item permission checks are skipped for performance reasons.
 //
 // See section 9.8.5 for when various HTTP status codes apply.
-func copyFiles(ctx context.Context, src, dst string, overwrite bool) (status int, err error) {
+func copyFiles(ctx context.Context, src, dst string, overwrite bool, depth int) (status int, err error) {
 	srcDir := path.Dir(src)
 	dstDir := path.Dir(dst)
 	user := ctx.Value(conf.UserKey).(*model.User)
@@ -135,6 +199,28 @@ func copyFiles(ctx context.Context, src, dst string, overwrite bool) (status int
 	if !common.CanWrite(user, dstMeta, dstDir) {
 		return http.StatusForbidden, nil
 	}
+
+	srcObj, err := resourceObject(ctx, src)
+	if err != nil {
+		if errs.IsObjectNotFound(err) {
+			return http.StatusNotFound, err
+		}
+		return http.StatusInternalServerError, err
+	}
+	if srcObj.IsDir() && strings.HasPrefix(utils.FixAndCleanPath(dst), utils.FixAndCleanPath(src)+"/") {
+		return http.StatusForbidden, errInvalidDestination
+	}
+	dstParent, err := resourceObject(ctx, dstDir)
+	if err != nil {
+		if errs.IsObjectNotFound(err) {
+			return http.StatusConflict, err
+		}
+		return http.StatusInternalServerError, err
+	}
+	if !dstParent.IsDir() {
+		return http.StatusConflict, errNotADirectory
+	}
+
 	dstExists, err := resourceExists(ctx, dst)
 	if err != nil {
 		return http.StatusInternalServerError, err
@@ -142,7 +228,23 @@ func copyFiles(ctx context.Context, src, dst string, overwrite bool) (status int
 	if dstExists && !overwrite {
 		return http.StatusPreconditionFailed, nil
 	}
-	_, err = fs.Copy(context.WithValue(ctx, conf.NoTaskKey, struct{}{}), src, dstDir)
+	if dstExists {
+		if err := fs.Remove(ctx, dst); err != nil {
+			return http.StatusInternalServerError, err
+		}
+	}
+
+	// Native provider COPY is safe and efficient only when the final name is
+	// unchanged. A different WebDAV destination name must never use
+	// dstDir/srcName as a transient object because that path may belong to an
+	// unrelated file.
+	if copyCanUseNative(src, dst, depth) {
+		_, err = fs.Copy(context.WithValue(ctx, conf.NoTaskKey, struct{}{}), src, dstDir)
+	} else if srcObj.IsDir() {
+		err = copyExactTree(ctx, src, dst, srcObj, depth)
+	} else {
+		err = copyExactFile(ctx, src, dst)
+	}
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}

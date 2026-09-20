@@ -156,6 +156,11 @@ Cloud Sync can issue WebDAV operations before an asynchronously uploaded 115 obj
 - `COPY` can create a second canonical generation from the same immutable spool payload without waiting for 115 to expose the source file.
 - A destination overwrite returns HTTP 204; a new destination returns HTTP 201; `Overwrite: F` returns HTTP 412 when the destination already exists.
 - COPY/MOVE preflight provider-only destinations too. A target that exists on 115 but has no canonical row is not treated as a new local target; overwrite is delegated to the provider path.
+- Before provider fallback overwrites a tracked destination, the destination canonical subtree must be fully `COMPLETED`. Pending, uploading, verifying, failed or deleting state returns HTTP 503 with `Retry-After: 2` so Cloud Sync retries instead of racing an older worker.
+- Provider COPY with a different destination basename writes directly to the exact WebDAV target. It no longer uses `dstDir/srcName` as an intermediate path, so an unrelated same-name object in the destination directory is never touched. Same-name cross-directory COPY keeps the provider-native fast path.
+- `Depth: 0` collection COPY remains shallow on the exact-path fallback.
+- Provider MOVE metadata reconciliation now locks source and destination subtrees in one transaction. Exact path collisions merge into the destination generation, destination-only stale children become tombstones, and old source rows remain tombstones when needed to invalidate in-flight workers.
+- Freshly remapped `COMPLETED` metadata, including files whose local spool has already expired, receives the same short consistency grace used for directory shadows. This prevents an immediate 115 NotFound/stale listing after MOVE from being treated as a real remote deletion.
 - Shared COPY spool payloads are reference-counted in MySQL before physical cleanup, and active readers use an in-process reference count so one worker cannot make another worker's payload appear idle.
 - `DELETE` tombstones the whole tracked subtree. If descendants are tracked but the parent row is not, a synthetic directory tombstone is created so the provider-side tree is still removed.
 - A PUT below a canonical deleted/non-directory parent is rejected with HTTP 409 rather than creating an orphaned child generation.
