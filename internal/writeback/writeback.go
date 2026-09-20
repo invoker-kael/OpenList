@@ -144,7 +144,7 @@ func applyDuplicatePutMetadata(row *model.WebDAVWritebackObject, modTime, create
 }
 
 var (
-	ErrDestinationExists        = errors.New("write-back destination already exists")
+	ErrDestinationExists         = errors.New("write-back destination already exists")
 	ErrProviderOperationConflict = errors.New("conflicting provider COPY/MOVE intent is still unresolved")
 	ErrProviderOperationStale    = errors.New("provider COPY/MOVE source generation was superseded")
 )
@@ -688,9 +688,9 @@ func ObserveProviderOperationRecovery(op *model.WebDAVProviderOperation, recover
 		}
 
 		if err := tx.Model(&model.WebDAVProviderOperation{}).Where("id = ?", locked.ID).Updates(map[string]any{
-			"recovery_count": count,
-			"last_recovery":  label,
-			"last_error":     lastError,
+			"recovery_count":  count,
+			"last_recovery":   label,
+			"last_error":      lastError,
 			"last_checked_at": &now,
 		}).Error; err != nil {
 			return err
