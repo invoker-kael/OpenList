@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/writeback"
 )
 
 func TestPutPreconditions(t *testing.T) {
@@ -211,22 +213,29 @@ func TestCanonicalReadRequestDropsRangeOnIfRangeMismatch(t *testing.T) {
 	}
 }
 
-func TestCopyMoveProviderDefinitelyNotStarted(t *testing.T) {
-	for _, status := range []int{
-		http.StatusForbidden,
-		http.StatusNotFound,
-		http.StatusConflict,
-		http.StatusPreconditionFailed,
-		http.StatusServiceUnavailable,
-	} {
-		if !copyMoveProviderDefinitelyNotStarted(status) {
-			t.Fatalf("status %d should prove provider mutation did not start", status)
-		}
+func TestProviderOperationDispositionUsesMutationEvidence(t *testing.T) {
+	tests := []struct {
+		name    string
+		method  string
+		started bool
+		status  int
+		want    providerIntentDisposition
+	}{
+		{name: "copy preflight 500 retires", method: writeback.ProviderOperationCopy, started: false, status: http.StatusInternalServerError, want: providerIntentRetire},
+		{name: "copy preflight 503 retires", method: writeback.ProviderOperationCopy, started: false, status: http.StatusServiceUnavailable, want: providerIntentRetire},
+		{name: "copy overwrite 503 is failed", method: writeback.ProviderOperationCopy, started: true, status: http.StatusServiceUnavailable, want: providerIntentFailed},
+		{name: "copy started 500 is failed", method: writeback.ProviderOperationCopy, started: true, status: http.StatusInternalServerError, want: providerIntentFailed},
+		{name: "move overwrite 503 stays fenced", method: writeback.ProviderOperationMove, started: true, status: http.StatusServiceUnavailable, want: providerIntentKeep},
+		{name: "move preflight 500 retires", method: writeback.ProviderOperationMove, started: false, status: http.StatusInternalServerError, want: providerIntentRetire},
+		{name: "copy success applied", method: writeback.ProviderOperationCopy, started: true, status: http.StatusCreated, want: providerIntentApplied},
+		{name: "move overwrite success applied", method: writeback.ProviderOperationMove, started: true, status: http.StatusNoContent, want: providerIntentApplied},
 	}
-	for _, status := range []int{http.StatusCreated, http.StatusNoContent, http.StatusInternalServerError} {
-		if copyMoveProviderDefinitelyNotStarted(status) {
-			t.Fatalf("status %d must remain success/ambiguous", status)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := providerOperationDisposition(tt.method, tt.started, tt.status); got != tt.want {
+				t.Fatalf("providerOperationDisposition(%q, %v, %d) = %v, want %v", tt.method, tt.started, tt.status, got, tt.want)
+			}
+		})
 	}
 }
 

@@ -239,50 +239,52 @@ func moveAcrossDirsExact(ctx context.Context, src, dst string) error {
 // Individual item permission checks are skipped for performance reasons.
 //
 // See section 9.9.4 for when various HTTP status codes apply.
-func moveFiles(ctx context.Context, src, dst string, overwrite bool) (status int, err error) {
+func moveFiles(ctx context.Context, src, dst string, overwrite bool) (status int, mutationStarted bool, err error) {
 	srcDir := path.Dir(src)
 	dstDir := path.Dir(dst)
 	srcName := path.Base(src)
 	dstName := path.Base(dst)
 	user := ctx.Value(conf.UserKey).(*model.User)
 	if srcDir != dstDir && !user.CanMove() {
-		return http.StatusForbidden, nil
+		return http.StatusForbidden, false, nil
 	}
 	if srcName != dstName && !user.CanRename() {
-		return http.StatusForbidden, nil
+		return http.StatusForbidden, false, nil
 	}
 	srcMeta, err := op.GetNearestMeta(srcDir)
 	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
-		return http.StatusInternalServerError, err
+		return http.StatusInternalServerError, false, err
 	}
 	dstMeta, err := op.GetNearestMeta(dstDir)
 	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
-		return http.StatusInternalServerError, err
+		return http.StatusInternalServerError, false, err
 	}
 	if !common.CanWrite(user, srcMeta, srcDir) || !common.CanWrite(user, dstMeta, dstDir) {
-		return http.StatusForbidden, nil
+		return http.StatusForbidden, false, nil
 	}
 
 	dstExists, err := resourceExists(ctx, dst)
 	if err != nil {
-		return http.StatusInternalServerError, err
+		return http.StatusInternalServerError, false, err
 	}
 	if dstExists && !overwrite {
-		return http.StatusPreconditionFailed, nil
+		return http.StatusPreconditionFailed, false, nil
 	}
 	if dstExists {
+		mutationStarted = true
 		absent, verifyErr := removeProviderOverwriteDestination(ctx, dst)
 		if verifyErr != nil {
-			return http.StatusInternalServerError, verifyErr
+			return http.StatusInternalServerError, true, verifyErr
 		}
 		if !absent {
 			// Do not move the source until the provider has stopped exposing
 			// the overwritten destination. 115 requires two absence observations
 			// across a short consistency fence before the final name is reused.
-			return http.StatusServiceUnavailable, nil
+			return http.StatusServiceUnavailable, true, nil
 		}
 	}
 
+	mutationStarted = true
 	switch {
 	case srcDir == dstDir:
 		err = fs.Rename(ctx, src, dstName)
@@ -292,77 +294,80 @@ func moveFiles(ctx context.Context, src, dst string, overwrite bool) (status int
 		_, err = fs.Move(context.WithValue(ctx, conf.NoTaskKey, struct{}{}), src, dstDir)
 	}
 	if err != nil {
-		return http.StatusInternalServerError, err
+		return http.StatusInternalServerError, true, err
 	}
 	if dstExists {
-		return http.StatusNoContent, nil
+		return http.StatusNoContent, true, nil
 	}
-	return http.StatusCreated, nil
+	return http.StatusCreated, true, nil
 }
 
 // copyFiles copies files and/or directories from src to dst.
 // Individual item permission checks are skipped for performance reasons.
 //
 // See section 9.8.5 for when various HTTP status codes apply.
-func copyFiles(ctx context.Context, src, dst string, overwrite bool, depth int) (status int, err error) {
+func copyFiles(ctx context.Context, src, dst string, overwrite bool, depth int) (status int, mutationStarted bool, err error) {
 	srcDir := path.Dir(src)
 	dstDir := path.Dir(dst)
 	user := ctx.Value(conf.UserKey).(*model.User)
 	if !user.CanCopy() {
-		return http.StatusForbidden, nil
+		return http.StatusForbidden, false, nil
 	}
 	srcMeta, err := op.GetNearestMeta(srcDir)
 	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
-		return http.StatusInternalServerError, err
+		return http.StatusInternalServerError, false, err
 	}
 	if !common.CanRead(user, srcMeta, srcDir) {
-		return http.StatusForbidden, nil
+		return http.StatusForbidden, false, nil
 	}
 	dstMeta, err := op.GetNearestMeta(dstDir)
 	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
-		return http.StatusInternalServerError, err
+		return http.StatusInternalServerError, false, err
 	}
 	if !common.CanWrite(user, dstMeta, dstDir) {
-		return http.StatusForbidden, nil
+		return http.StatusForbidden, false, nil
 	}
 
 	srcObj, err := resourceObject(ctx, src)
 	if err != nil {
 		if errs.IsObjectNotFound(err) {
-			return http.StatusNotFound, err
+			return http.StatusNotFound, false, err
 		}
-		return http.StatusInternalServerError, err
+		return http.StatusInternalServerError, false, err
 	}
 	if srcObj.IsDir() && strings.HasPrefix(utils.FixAndCleanPath(dst), utils.FixAndCleanPath(src)+"/") {
-		return http.StatusForbidden, errInvalidDestination
+		return http.StatusForbidden, false, errInvalidDestination
 	}
 	dstParent, err := resourceObject(ctx, dstDir)
 	if err != nil {
 		if errs.IsObjectNotFound(err) {
-			return http.StatusConflict, err
+			return http.StatusConflict, false, err
 		}
-		return http.StatusInternalServerError, err
+		return http.StatusInternalServerError, false, err
 	}
 	if !dstParent.IsDir() {
-		return http.StatusConflict, errNotADirectory
+		return http.StatusConflict, false, errNotADirectory
 	}
 
 	dstExists, err := resourceExists(ctx, dst)
 	if err != nil {
-		return http.StatusInternalServerError, err
+		return http.StatusInternalServerError, false, err
 	}
 	if dstExists && !overwrite {
-		return http.StatusPreconditionFailed, nil
+		return http.StatusPreconditionFailed, false, nil
 	}
 	if dstExists {
+		mutationStarted = true
 		absent, verifyErr := removeProviderOverwriteDestination(ctx, dst)
 		if verifyErr != nil {
-			return http.StatusInternalServerError, verifyErr
+			return http.StatusInternalServerError, true, verifyErr
 		}
 		if !absent {
-			return http.StatusServiceUnavailable, nil
+			return http.StatusServiceUnavailable, true, nil
 		}
 	}
+
+	mutationStarted = true
 
 	// Native provider COPY is safe and efficient only when the final name is
 	// unchanged. A different WebDAV destination name must never use
@@ -376,12 +381,12 @@ func copyFiles(ctx context.Context, src, dst string, overwrite bool, depth int) 
 		err = copyExactFile(ctx, src, dst)
 	}
 	if err != nil {
-		return http.StatusInternalServerError, err
+		return http.StatusInternalServerError, true, err
 	}
 	if dstExists {
-		return http.StatusNoContent, nil
+		return http.StatusNoContent, true, nil
 	}
-	return http.StatusCreated, nil
+	return http.StatusCreated, true, nil
 }
 
 // walkFS traverses filesystem fs starting at name up to depth levels.

@@ -567,8 +567,23 @@ func MarkProviderOperationApplied(id uint) error {
 	return nil
 }
 
-func MarkProviderOperationFailed(id uint, failure error) error {
-	if id == 0 {
+func providerOperationDestinationObject(ctx context.Context, p string) (model.Obj, bool, error) {
+	// A refreshed parent listing is the recovery authority. 115 single-object
+	// lookups can expose the deleted overwrite target or incomplete metadata
+	// after a COPY failure, which is unsafe evidence for automated cleanup.
+	objs, listErr := fs.List(ctx, path.Dir(p), &fs.ListArgs{Refresh: true, NoLog: true})
+	if listErr != nil {
+		if errs.IsObjectNotFound(listErr) {
+			return nil, false, nil
+		}
+		return nil, false, listErr
+	}
+	remote := exactRemoteByName(objs, path.Base(p))
+	return remote, remote != nil, nil
+}
+
+func MarkProviderOperationFailed(ctx context.Context, op *model.WebDAVProviderOperation, failure error) error {
+	if op == nil || op.ID == 0 {
 		return errors.New("provider operation intent is missing")
 	}
 	now := time.Now()
@@ -576,13 +591,25 @@ func MarkProviderOperationFailed(id uint, failure error) error {
 	if failure != nil {
 		lastError = failure.Error()
 	}
+
+	failureObserved := false
+	failureObjectID := ""
+	if remote, present, observeErr := providerOperationDestinationObject(ctx, op.DestinationPath); observeErr != nil {
+		lastError += "; destination evidence unavailable: " + observeErr.Error()
+	} else if present {
+		failureObserved = true
+		failureObjectID = remote.GetID()
+	}
+
 	res := db.GetDb().Model(&model.WebDAVProviderOperation{}).
-		Where("id = ? AND state IN ?", id, []string{ProviderOperationStarted, ProviderOperationFailed}).
+		Where("id = ? AND state IN ?", op.ID, []string{ProviderOperationStarted, ProviderOperationFailed}).
 		Updates(map[string]any{
-			"state":           ProviderOperationFailed,
-			"last_error":      lastError,
-			"last_checked_at": &now,
-			"applied_at":      nil,
+			"state":                         ProviderOperationFailed,
+			"last_error":                    lastError,
+			"last_checked_at":               &now,
+			"applied_at":                    nil,
+			"failure_destination_observed":  failureObserved,
+			"failure_destination_object_id": failureObjectID,
 		})
 	if res.Error != nil {
 		return res.Error
@@ -590,6 +617,12 @@ func MarkProviderOperationFailed(id uint, failure error) error {
 	if res.RowsAffected == 0 {
 		return errors.New("provider operation intent was not started")
 	}
+	op.State = ProviderOperationFailed
+	op.LastError = lastError
+	op.LastCheckedAt = &now
+	op.AppliedAt = nil
+	op.FailureDestinationObserved = failureObserved
+	op.FailureDestinationObjectID = failureObjectID
 	return nil
 }
 
@@ -2866,11 +2899,50 @@ func providerOperationPathAbsent(ctx context.Context, p string) (bool, error) {
 // CleanupFailedProviderCopy removes a partial COPY destination before the same
 // durable intent is retired. COPY keeps the source intact, so a clean retry is
 // safer than leaving a mismatched directory permanently fenced.
+func failedProviderCopyCleanupAllowed(op *model.WebDAVProviderOperation, current model.Obj, strictIdentity bool) bool {
+	if op == nil || current == nil {
+		return true
+	}
+	currentID := current.GetID()
+	if op.FailureDestinationObjectID != "" && currentID != "" {
+		return op.FailureDestinationObjectID == currentID
+	}
+	if strictIdentity {
+		// 115 cleanup must never delete an object that was not positively
+		// identified at the time this COPY failed.
+		return op.FailureDestinationObserved && op.FailureDestinationObjectID != "" && currentID != ""
+	}
+	return true
+}
+
 func CleanupFailedProviderCopy(ctx context.Context, op *model.WebDAVProviderOperation) (bool, error) {
 	if op == nil ||
 		!strings.EqualFold(op.Method, ProviderOperationCopy) ||
 		op.State != ProviderOperationFailed {
 		return false, nil
+	}
+
+	current, present, err := providerOperationDestinationObject(ctx, op.DestinationPath)
+	if err != nil {
+		return false, err
+	}
+	if !present {
+		if !providerRequiresPayloadHash(op.DestinationPath) {
+			return true, nil
+		}
+		timer := time.NewTimer(providerOperationConfirmationDelay())
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-timer.C:
+		}
+		return providerOperationPathAbsent(ctx, op.DestinationPath)
+	}
+
+	strictIdentity := providerRequiresPayloadHash(op.DestinationPath)
+	if !failedProviderCopyCleanupAllowed(op, current, strictIdentity) {
+		return false, ErrProviderOperationStale
 	}
 	if err := fs.Remove(ctx, op.DestinationPath); err != nil && !errs.IsObjectNotFound(err) {
 		return false, err
@@ -2879,7 +2951,7 @@ func CleanupFailedProviderCopy(ctx context.Context, op *model.WebDAVProviderOper
 	if err != nil || !absent {
 		return absent, err
 	}
-	if !providerRequiresPayloadHash(op.DestinationPath) {
+	if !strictIdentity {
 		return true, nil
 	}
 	timer := time.NewTimer(providerOperationConfirmationDelay())

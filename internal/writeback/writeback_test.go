@@ -29,6 +29,35 @@ func TestProviderOperationCopyUsesNative(t *testing.T) {
 	}
 }
 
+func TestFailedProviderCopyCleanupIdentity(t *testing.T) {
+	op := &model.WebDAVProviderOperation{
+		FailureDestinationObserved: true,
+		FailureDestinationObjectID: "copy-partial-123",
+	}
+	same := &model.Object{ID: "copy-partial-123"}
+	replaced := &model.Object{ID: "external-replacement-999"}
+	noID := &model.Object{}
+
+	if !failedProviderCopyCleanupAllowed(op, same, true) {
+		t.Fatal("115 cleanup should allow the exact failed COPY object")
+	}
+	if failedProviderCopyCleanupAllowed(op, replaced, true) {
+		t.Fatal("115 cleanup must not delete a replacement object with a different ID")
+	}
+	if failedProviderCopyCleanupAllowed(op, noID, true) {
+		t.Fatal("115 cleanup must not delete an object whose identity cannot be proven")
+	}
+	if !failedProviderCopyCleanupAllowed(op, noID, false) {
+		t.Fatal("non-strict providers may fall back when object IDs are unavailable")
+	}
+
+	op.FailureDestinationObserved = false
+	op.FailureDestinationObjectID = ""
+	if failedProviderCopyCleanupAllowed(op, same, true) {
+		t.Fatal("115 cleanup must not claim an object that was not observed at failure time")
+	}
+}
+
 func TestFailedProviderCopyRecoveryDecision(t *testing.T) {
 	if got := providerOperationRecoveryDecision(
 		ProviderOperationCopy,
