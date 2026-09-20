@@ -148,7 +148,32 @@ var (
 	ErrDestinationExists         = errors.New("write-back destination already exists")
 	ErrProviderOperationConflict = errors.New("conflicting provider COPY/MOVE intent is still unresolved")
 	ErrProviderOperationStale    = errors.New("provider COPY/MOVE source generation was superseded")
+	ErrSpoolCapacity             = errors.New("write-back spool capacity unavailable")
 )
+
+type SpoolCapacityError struct {
+	Free     uint64
+	Required uint64
+}
+
+func (e *SpoolCapacityError) Error() string {
+	if e == nil {
+		return ErrSpoolCapacity.Error()
+	}
+	return fmt.Sprintf("%s: free=%d required=%d", ErrSpoolCapacity, e.Free, e.Required)
+}
+
+func (e *SpoolCapacityError) Unwrap() error {
+	return ErrSpoolCapacity
+}
+
+func SpoolAdmissionRetrySeconds() int {
+	seconds := 5
+	if conf.Conf != nil && conf.Conf.WebDAVWriteback.AdmissionRetrySeconds > 0 {
+		seconds = conf.Conf.WebDAVWriteback.AdmissionRetrySeconds
+	}
+	return seconds
+}
 
 const (
 	ProviderOperationCopy = "COPY"
@@ -1478,9 +1503,40 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 	return out, true, nil
 }
 
+func megabytesToBytes(mb uint64) uint64 {
+	unit := uint64(utils.MB)
+	maxUint := ^uint64(0)
+	if mb > maxUint/unit {
+		return maxUint
+	}
+	return mb * unit
+}
+
 func reserveBytes() uint64 {
-	mb := conf.Conf.WebDAVWriteback.ReserveFreeSpaceMB
-	return mb * uint64(utils.MB)
+	if conf.Conf == nil {
+		return 0
+	}
+	return megabytesToBytes(conf.Conf.WebDAVWriteback.ReserveFreeSpaceMB)
+}
+
+func incomingReservationChunkBytes() uint64 {
+	mb := uint64(64)
+	if conf.Conf != nil && conf.Conf.WebDAVWriteback.IncomingReservationChunkMB > 0 {
+		mb = conf.Conf.WebDAVWriteback.IncomingReservationChunkMB
+	}
+	return megabytesToBytes(mb)
+}
+
+func spoolAdmissionRequired(floor, reserved, additional uint64) (uint64, bool) {
+	maxUint := ^uint64(0)
+	if floor > maxUint-reserved {
+		return 0, false
+	}
+	required := floor + reserved
+	if required > maxUint-additional {
+		return 0, false
+	}
+	return required + additional, true
 }
 
 var (
@@ -1489,6 +1545,121 @@ var (
 	receivingMu      sync.Mutex
 	receivingPaths   = make(map[string]int)
 )
+
+type incomingReservation struct {
+	remaining uint64
+	released  bool
+}
+
+func (r *incomingReservation) grow(additional uint64) error {
+	if r == nil || additional == 0 {
+		return nil
+	}
+	spaceMu.Lock()
+	defer spaceMu.Unlock()
+
+	usage, err := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
+	if err != nil {
+		return err
+	}
+	required, ok := spoolAdmissionRequired(reserveBytes(), reservedIncoming, additional)
+	if !ok || usage.Free < required {
+		if !ok {
+			required = ^uint64(0)
+		}
+		return &SpoolCapacityError{Free: usage.Free, Required: required}
+	}
+	reservedIncoming += additional
+	r.remaining += additional
+	return nil
+}
+
+func (r *incomingReservation) ensureForWrite(need uint64) error {
+	if r == nil || need == 0 || r.remaining >= need {
+		return nil
+	}
+	additional := incomingReservationChunkBytes()
+	missing := need - r.remaining
+	if additional < missing {
+		additional = missing
+	}
+	return r.grow(additional)
+}
+
+func (r *incomingReservation) consume(written uint64) {
+	if r == nil || written == 0 {
+		return
+	}
+	spaceMu.Lock()
+	defer spaceMu.Unlock()
+	if written > r.remaining {
+		written = r.remaining
+	}
+	r.remaining -= written
+	if written > reservedIncoming {
+		reservedIncoming = 0
+	} else {
+		reservedIncoming -= written
+	}
+}
+
+func (r *incomingReservation) verifyCapacity() error {
+	if r == nil {
+		return nil
+	}
+	spaceMu.Lock()
+	defer spaceMu.Unlock()
+	usage, err := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
+	if err != nil {
+		return err
+	}
+	required, ok := spoolAdmissionRequired(reserveBytes(), reservedIncoming, 0)
+	if !ok || usage.Free < required {
+		if !ok {
+			required = ^uint64(0)
+		}
+		return &SpoolCapacityError{Free: usage.Free, Required: required}
+	}
+	return nil
+}
+
+func (r *incomingReservation) release() {
+	if r == nil {
+		return
+	}
+	spaceMu.Lock()
+	defer spaceMu.Unlock()
+	if r.released {
+		return
+	}
+	if r.remaining > reservedIncoming {
+		reservedIncoming = 0
+	} else {
+		reservedIncoming -= r.remaining
+	}
+	r.remaining = 0
+	r.released = true
+}
+
+func reserveIncomingBytes(expected int64) (*incomingReservation, error) {
+	reservation := &incomingReservation{}
+	var initial uint64
+	switch {
+	case expected > 0:
+		initial = uint64(expected)
+	case expected == 0:
+		if err := reservation.verifyCapacity(); err != nil {
+			return nil, err
+		}
+		return reservation, nil
+	default:
+		initial = incomingReservationChunkBytes()
+	}
+	if err := reservation.grow(initial); err != nil {
+		return nil, err
+	}
+	return reservation, nil
+}
 
 func beginReceiving(p string) func() {
 	key := pathKey(p)
@@ -1524,56 +1695,26 @@ func cloudSyncSettleDelay(size int64) time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
-func checkFreeSpace(extra uint64) error {
-	usage, err := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
-	if err != nil {
-		return err
-	}
-	required := reserveBytes() + extra
-	if usage.Free < required {
-		return fmt.Errorf("write-back spool free space %d is below required %d", usage.Free, required)
-	}
-	return nil
-}
-
-func reserveIncomingBytes(expected int64) (func(), error) {
-	if expected <= 0 {
-		if err := checkFreeSpace(0); err != nil {
-			return nil, err
-		}
-		return func() {}, nil
-	}
-	spaceMu.Lock()
-	defer spaceMu.Unlock()
-	usage, err := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
-	if err != nil {
-		return nil, err
-	}
-	need := uint64(expected)
-	required := reserveBytes() + reservedIncoming + need
-	if usage.Free < required {
-		return nil, fmt.Errorf("write-back spool free space %d is below reserved requirement %d", usage.Free, required)
-	}
-	reservedIncoming += need
-	return func() {
-		spaceMu.Lock()
-		reservedIncoming -= need
-		spaceMu.Unlock()
-	}, nil
-}
-
-func copyToSpool(dst *os.File, src io.Reader, expected int64) (int64, string, error) {
+func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incomingReservation) (int64, string, error) {
 	buf := make([]byte, 4*utils.MB)
 	payloadHasher := utils.SHA1.NewFunc()
 	writer := io.MultiWriter(dst, payloadHasher)
 	var total int64
 	var sinceCheck int64
+
 	for {
 		n, readErr := src.Read(buf)
 		if n > 0 {
+			if expected >= 0 && (int64(n) > expected || total > expected-int64(n)) {
+				return total, "", fmt.Errorf("WebDAV PUT exceeds declared size: expected %d bytes", expected)
+			}
+			if err := reservation.ensureForWrite(uint64(n)); err != nil {
+				return total, "", err
+			}
 			wn, writeErr := writer.Write(buf[:n])
 			total += int64(wn)
 			sinceCheck += int64(wn)
+			reservation.consume(uint64(wn))
 			if writeErr != nil {
 				return total, "", writeErr
 			}
@@ -1581,7 +1722,7 @@ func copyToSpool(dst *os.File, src io.Reader, expected int64) (int64, string, er
 				return total, "", io.ErrShortWrite
 			}
 			if sinceCheck >= 64*utils.MB {
-				if err := checkFreeSpace(0); err != nil {
+				if err := reservation.verifyCapacity(); err != nil {
 					return total, "", err
 				}
 				sinceCheck = 0
@@ -1624,11 +1765,11 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		return nil, false, err
 	}
 
-	releaseReservation, err := reserveIncomingBytes(expected)
+	reservation, err := reserveIncomingBytes(expected)
 	if err != nil {
 		return nil, false, err
 	}
-	defer releaseReservation()
+	defer reservation.release()
 
 	tmp, err := os.CreateTemp(spoolDir, "recv-*.part")
 	if err != nil {
@@ -1643,7 +1784,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		}
 	}()
 
-	actualSize, payloadSHA1, err := copyToSpool(tmp, body, expected)
+	actualSize, payloadSHA1, err := copyToSpool(tmp, body, expected, reservation)
 	if err != nil {
 		return nil, false, err
 	}

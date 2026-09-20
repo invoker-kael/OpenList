@@ -777,6 +777,183 @@ func TestPendingDirectoryMoveLocalAuthority(t *testing.T) {
 	}
 }
 
+func TestSpoolAdmissionRequired(t *testing.T) {
+	required, ok := spoolAdmissionRequired(20, 30, 40)
+	if !ok || required != 90 {
+		t.Fatalf("required=%d ok=%v, want 90 true", required, ok)
+	}
+	if _, ok := spoolAdmissionRequired(^uint64(0)-5, 10, 0); ok {
+		t.Fatal("overflowing admission requirement must be rejected")
+	}
+}
+
+func TestIncomingReservationConsumesWithoutLeak(t *testing.T) {
+	spaceMu.Lock()
+	oldReserved := reservedIncoming
+	reservedIncoming = 1024
+	spaceMu.Unlock()
+	defer func() {
+		spaceMu.Lock()
+		reservedIncoming = oldReserved
+		spaceMu.Unlock()
+	}()
+
+	r := &incomingReservation{remaining: 1024}
+	r.consume(256)
+	if r.remaining != 768 {
+		t.Fatalf("remaining=%d, want 768", r.remaining)
+	}
+	spaceMu.Lock()
+	got := reservedIncoming
+	spaceMu.Unlock()
+	if got != 768 {
+		t.Fatalf("global reservation=%d, want 768", got)
+	}
+	r.release()
+	spaceMu.Lock()
+	got = reservedIncoming
+	spaceMu.Unlock()
+	if got != 0 {
+		t.Fatalf("global reservation leaked %d bytes", got)
+	}
+	r.release()
+	spaceMu.Lock()
+	got = reservedIncoming
+	spaceMu.Unlock()
+	if got != 0 {
+		t.Fatalf("double release changed reservation to %d", got)
+	}
+}
+
+func TestUnknownUploadReservationCanGrowAndRelease(t *testing.T) {
+	oldConf := conf.Conf
+	tmp := t.TempDir()
+	conf.Conf = &conf.Config{
+		WebDAVWriteback: conf.WebDAVWritebackConfig{
+			SpoolDir:                   tmp,
+			ReserveFreeSpaceMB:         0,
+			IncomingReservationChunkMB: 1,
+		},
+	}
+	defer func() { conf.Conf = oldConf }()
+
+	spaceMu.Lock()
+	oldReserved := reservedIncoming
+	reservedIncoming = 0
+	spaceMu.Unlock()
+	defer func() {
+		spaceMu.Lock()
+		reservedIncoming = oldReserved
+		spaceMu.Unlock()
+	}()
+
+	r, err := reserveIncomingBytes(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := uint64(utils.MB)
+	if r.remaining != chunk {
+		t.Fatalf("initial rolling reservation=%d, want %d", r.remaining, chunk)
+	}
+	r.consume(chunk)
+	if r.remaining != 0 {
+		t.Fatalf("remaining after consume=%d, want 0", r.remaining)
+	}
+	if err := r.ensureForWrite(1); err != nil {
+		t.Fatal(err)
+	}
+	if r.remaining != chunk {
+		t.Fatalf("replenished reservation=%d, want %d", r.remaining, chunk)
+	}
+	r.release()
+	spaceMu.Lock()
+	got := reservedIncoming
+	spaceMu.Unlock()
+	if got != 0 {
+		t.Fatalf("rolling reservation leaked %d bytes", got)
+	}
+}
+
+func TestZeroByteUploadStillHonorsFreeSpaceFloor(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{
+		WebDAVWriteback: conf.WebDAVWritebackConfig{
+			SpoolDir:           t.TempDir(),
+			ReserveFreeSpaceMB: ^uint64(0),
+		},
+	}
+	defer func() { conf.Conf = oldConf }()
+
+	r, err := reserveIncomingBytes(0)
+	if r != nil {
+		r.release()
+	}
+	if !errors.Is(err, ErrSpoolCapacity) {
+		t.Fatalf("zero-byte admission error=%v, want ErrSpoolCapacity", err)
+	}
+}
+
+func TestMegabytesToBytesSaturates(t *testing.T) {
+	if got := megabytesToBytes(^uint64(0)); got != ^uint64(0) {
+		t.Fatalf("overflowing MB conversion=%d, want max uint64", got)
+	}
+}
+
+func TestUnknownUploadReservationUsesRollingChunk(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{
+		WebDAVWriteback: conf.WebDAVWritebackConfig{
+			IncomingReservationChunkMB: 8,
+		},
+	}
+	defer func() { conf.Conf = oldConf }()
+	if got := incomingReservationChunkBytes(); got != 8*uint64(utils.MB) {
+		t.Fatalf("rolling reservation chunk=%d, want %d", got, 8*uint64(utils.MB))
+	}
+}
+
+func TestSpoolCapacityErrorSupportsErrorsIs(t *testing.T) {
+	err := &SpoolCapacityError{Free: 1, Required: 2}
+	if !errors.Is(err, ErrSpoolCapacity) {
+		t.Fatal("SpoolCapacityError must unwrap to ErrSpoolCapacity")
+	}
+}
+
+func TestCopyToSpoolRejectsDeclaredSizeOverrunBeforeWrite(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "spool-*.data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	reservation := &incomingReservation{remaining: 3}
+	spaceMu.Lock()
+	oldReserved := reservedIncoming
+	reservedIncoming = 3
+	spaceMu.Unlock()
+	defer func() {
+		reservation.release()
+		spaceMu.Lock()
+		reservedIncoming = oldReserved
+		spaceMu.Unlock()
+	}()
+
+	size, _, err := copyToSpool(f, strings.NewReader("four"), 3, reservation)
+	if err == nil {
+		t.Fatal("declared-size overrun should fail")
+	}
+	if size != 0 {
+		t.Fatalf("overrun wrote %d bytes before rejection, want 0", size)
+	}
+	info, statErr := f.Stat()
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("spool contains %d bytes after pre-write overrun rejection", info.Size())
+	}
+}
+
 func TestCopyToSpoolComputesPayloadSHA1(t *testing.T) {
 	payload := "cloud-sync-encrypted-payload"
 	f, err := os.CreateTemp(t.TempDir(), "spool-*.data")
@@ -785,7 +962,12 @@ func TestCopyToSpoolComputesPayloadSHA1(t *testing.T) {
 	}
 	defer f.Close()
 
-	size, sha1sum, err := copyToSpool(f, strings.NewReader(payload), int64(len(payload)))
+	reservation := &incomingReservation{remaining: uint64(len(payload))}
+	spaceMu.Lock()
+	reservedIncoming += uint64(len(payload))
+	spaceMu.Unlock()
+	defer reservation.release()
+	size, sha1sum, err := copyToSpool(f, strings.NewReader(payload), int64(len(payload)), reservation)
 	if err != nil {
 		t.Fatal(err)
 	}

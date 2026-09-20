@@ -412,9 +412,12 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 }
 
 func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int, err error) {
+	drainBody := true
 	defer func() {
-		if n, _ := io.ReadFull(r.Body, []byte{0}); n == 1 {
-			_, _ = utils.CopyWithBuffer(io.Discard, r.Body)
+		if drainBody {
+			if n, _ := io.ReadFull(r.Body, []byte{0}); n == 1 {
+				_, _ = utils.CopyWithBuffer(io.Discard, r.Body)
+			}
 		}
 		_ = r.Body.Close()
 	}()
@@ -551,7 +554,10 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 		writebackCreateTime := h.getWritebackHeaderTime(r, "X-OC-Ctime")
 		row, created, wbErr := writeback.Commit(ctx, reqPath, r.Body, size, writebackModTime, writebackCreateTime, mimeType)
 		if wbErr != nil {
-			if strings.Contains(wbErr.Error(), "free space") {
+			if errors.Is(wbErr, writeback.ErrSpoolCapacity) {
+				drainBody = false
+				r.Close = true
+				w.Header().Set("Retry-After", strconv.Itoa(writeback.SpoolAdmissionRetrySeconds()))
 				return StatusInsufficientStorage, wbErr
 			}
 			return http.StatusInternalServerError, wbErr
