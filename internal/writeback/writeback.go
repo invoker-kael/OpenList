@@ -1478,12 +1478,17 @@ func (m *workerManager) cleanupCompleted() {
 		if _, active := activeSpools.Load(row.SpoolPath); active {
 			continue
 		}
-		if err := os.Remove(row.SpoolPath); err != nil && !os.IsNotExist(err) {
+		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ? AND spool_path = ? AND completed_at IS NOT NULL AND completed_at <= ?",
+				row.ID, row.Generation, StateCompleted, row.SpoolPath, cutoff).
+			Update("spool_path", "")
+		if res.Error != nil || res.RowsAffected == 0 {
 			continue
 		}
-		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-			Where("id = ? AND generation = ?", row.ID, row.Generation).
-			Update("spool_path", "").Error
+		// COPY can make several canonical rows reference the same immutable
+		// spool payload. Only unlink the physical file after the last database
+		// reference has been released.
+		removeSpoolIfUnreferenced(row.SpoolPath)
 	}
 }
 
