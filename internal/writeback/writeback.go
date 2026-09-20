@@ -1443,6 +1443,82 @@ func deleteCompletedCanonical(row *model.WebDAVWritebackObject) (bool, error) {
 	return res.RowsAffected > 0, nil
 }
 
+func completedDivergenceConfirmationDelay() time.Duration {
+	seconds := 1
+	if conf.Conf != nil {
+		seconds = max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func completedDivergenceConfirmed(verifyCount int, retryAt *time.Time, now time.Time) bool {
+	return verifyCount > 0 && retryAt != nil && !now.Before(*retryAt)
+}
+
+// confirmCompletedFileDivergence prevents one transient 115 view from deleting
+// the canonical identity that Cloud Sync just committed. Completed files whose
+// local spool has been released need two separated provider observations before
+// the canonical row is evicted. retry_at is safe to reuse here because
+// COMPLETED rows are not part of the worker dispatch state set.
+func confirmCompletedFileDivergence(row *model.WebDAVWritebackObject, now time.Time) (bool, error) {
+	if row == nil || row.IsDir || row.State != StateCompleted || row.SpoolPath != "" {
+		return false, nil
+	}
+	if ops, err := activeProviderOperations(); err != nil {
+		return false, err
+	} else if providerOperationProtectsCanonicalPath(ops, row.Path, now) {
+		return false, nil
+	}
+
+	confirmed := false
+	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		var current model.WebDAVWritebackObject
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
+			First(&current).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if current.IsDir {
+			return nil
+		}
+		if !completedDivergenceConfirmed(current.VerifyCount, current.RetryAt, now) {
+			next := now.Add(completedDivergenceConfirmationDelay())
+			return tx.Model(&model.WebDAVWritebackObject{}).
+				Where("id = ? AND generation = ? AND state = ?", current.ID, current.Generation, StateCompleted).
+				Updates(map[string]any{
+					"verify_count": 1,
+					"retry_at":     &next,
+					"last_error":   "remote divergence observed once; keeping canonical metadata until confirmation",
+				}).Error
+		}
+		res := tx.
+			Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", current.ID, current.Generation, StateCompleted).
+			Delete(&model.WebDAVWritebackObject{})
+		if res.Error != nil {
+			return res.Error
+		}
+		confirmed = res.RowsAffected > 0
+		return nil
+	})
+	return confirmed, err
+}
+
+func clearCompletedFileDivergence(row *model.WebDAVWritebackObject) error {
+	if row == nil || row.IsDir || row.State != StateCompleted || row.SpoolPath != "" {
+		return nil
+	}
+	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
+		Updates(map[string]any{
+			"verify_count": 0,
+			"retry_at":     nil,
+			"last_error":   "",
+		}).Error
+}
+
 // ReconcileDirect validates a completed canonical object after its local spool
 // cache is gone. A single-object provider lookup may prove an exact match, but
 // it is never allowed to prove a mismatch by itself: 115 can transiently return
@@ -1471,6 +1547,9 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 			return false, delErr
 		}
 		if !row.IsDir && compareRemoteContent(row, remote, requireHash) == remoteContentMatch {
+			if clearErr := clearCompletedFileDivergence(row); clearErr != nil {
+				return false, clearErr
+			}
 			return false, nil
 		}
 	}
@@ -1485,15 +1564,19 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	}
 	remote = exactRemoteByName(objs, row.Name)
 	if remote == nil {
-		dropped, delErr := deleteCompletedCanonical(row)
-		if delErr != nil {
-			return false, delErr
+		confirmed, confirmErr := confirmCompletedFileDivergence(row, time.Now())
+		if confirmErr != nil {
+			return false, confirmErr
 		}
-		return dropped, nil
+		return confirmed, nil
 	}
 	if remote.IsDir() != row.IsDir {
-		_, delErr := deleteCompletedCanonical(row)
-		return false, delErr
+		if row.IsDir {
+			_, delErr := deleteCompletedCanonical(row)
+			return false, delErr
+		}
+		_, confirmErr := confirmCompletedFileDivergence(row, time.Now())
+		return false, confirmErr
 	}
 	if row.IsDir {
 		_, delErr := deleteCompletedCanonical(row)
@@ -1502,6 +1585,9 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 
 	switch compareRemoteContent(row, remote, requireHash) {
 	case remoteContentMatch:
+		if clearErr := clearCompletedFileDivergence(row); clearErr != nil {
+			return false, clearErr
+		}
 		return false, nil
 	case remoteContentInconclusive:
 		// A refreshed 115 listing that still omits SHA-1 cannot prove either
@@ -1509,8 +1595,8 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 		// of manufacturing a Cloud Sync repair upload.
 		return false, nil
 	default:
-		_, delErr := deleteCompletedCanonical(row)
-		return false, delErr
+		_, confirmErr := confirmCompletedFileDivergence(row, time.Now())
+		return false, confirmErr
 	}
 }
 
@@ -1601,15 +1687,22 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 				continue
 			}
 		}
+		if !protectedByProviderOperation && row.State == StateCompleted && !row.IsDir && row.SpoolPath == "" && remoteReliable && remoteObj != nil &&
+			compareRemoteContent(row, remoteObj, providerRequiresPayloadHash(row.Path)) == remoteContentMatch {
+			if clearErr := clearCompletedFileDivergence(row); clearErr != nil {
+				return nil, false, clearErr
+			}
+		}
 		if !protectedByProviderOperation &&
 			shouldDropCanonicalAfterRemoteList(row, remoteReliable, remoteObj, now, providerRequiresPayloadHash(row.Path)) {
-			res := db.GetDb().
-				Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
-				Delete(&model.WebDAVWritebackObject{})
-			if res.Error != nil {
-				return nil, false, res.Error
+			confirmed, confirmErr := confirmCompletedFileDivergence(row, now)
+			if confirmErr != nil {
+				return nil, false, confirmErr
 			}
-			continue
+			if confirmed {
+				delete(byName, row.Name)
+				continue
+			}
 		}
 		if !remotePresent {
 			order = append(order, row.Name)

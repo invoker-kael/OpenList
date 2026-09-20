@@ -527,6 +527,29 @@ func TestShouldRemoveStaleRemote(t *testing.T) {
 	}
 }
 
+func TestCompletedDivergenceConfirmationRequiresSeparatedObservation(t *testing.T) {
+	now := time.Unix(100, 0)
+	next := now.Add(5 * time.Second)
+	if completedDivergenceConfirmed(0, nil, now) {
+		t.Fatal("first divergence observation must not evict canonical metadata")
+	}
+	if completedDivergenceConfirmed(1, &next, now.Add(4*time.Second)) {
+		t.Fatal("repeated scans inside the confirmation window must not count twice")
+	}
+	if !completedDivergenceConfirmed(1, &next, now.Add(5*time.Second)) {
+		t.Fatal("a second separated divergence observation should be eligible for confirmation")
+	}
+}
+
+func TestCompletedDivergenceConfirmationDelayUsesVerifyInterval(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyIntervalSeconds: 7}}
+	defer func() { conf.Conf = oldConf }()
+	if got := completedDivergenceConfirmationDelay(); got != 7*time.Second {
+		t.Fatalf("divergence confirmation delay=%v, want 7s", got)
+	}
+}
+
 func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 	completedNoSpool := &model.WebDAVWritebackObject{
 		State:     StateCompleted,

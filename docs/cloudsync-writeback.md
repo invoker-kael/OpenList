@@ -99,6 +99,8 @@ The write-back layer intentionally favors source correctness over avoiding dupli
 
 Canonical metadata is retained after the local completed spool cache is released so provider-side mtime changes do not cause upload loops. That metadata is not allowed to hide a genuinely missing remote object forever.
 
+A **single** 115 absence, type mismatch, size mismatch or SHA-1 mismatch is no longer allowed to evict a completed file's canonical identity. OpenList records the first divergent provider observation in the existing completed-row verification fields and keeps returning the NAS-authoritative size/mtime/ETag to Cloud Sync. A second divergent observation is required after the configured verification interval before canonical metadata is removed. Repeated PROPFIND/list scans inside that interval cannot count as the second observation, and an exact provider match clears the pending divergence evidence. This specifically prevents one stale 115 listing or transient post-upload NotFound from turning into another PUT and then an upload loop.
+
 During a successful provider directory listing, if a tracked object is `COMPLETED`, its spool payload has already been released, and the provider no longer lists that name, the canonical row is removed. The next Cloud Sync scan then observes the object as missing and uploads the source again.
 
 A failed provider listing never triggers this cleanup, so a temporary network/provider outage cannot turn into a mass re-upload.
