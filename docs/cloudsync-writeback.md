@@ -140,3 +140,34 @@ PUT honors `If-Match` and `If-None-Match` and returns HTTP 412 when the entity-t
 ### 115 verification fallback
 
 The background upload verifier does not trust a single 115 object lookup by itself. If the object lookup is missing or returns incomplete/wrong size metadata, the worker force-refreshes the parent directory and accepts an exact-name, exact-size file match. This prevents 115's post-upload metadata consistency window from turning a successful provider upload into an unnecessary duplicate retry.
+
+
+## Cloud Sync rename, copy and delete compatibility
+
+Cloud Sync can issue WebDAV operations before an asynchronously uploaded 115 object is directly visible. Write-back therefore treats the local canonical state as authoritative for these operations as well:
+
+- `MOVE` can relocate a file directly from the durable spool while it is queued, uploading, verifying, or recently completed with its cache still present.
+- `COPY` can create a second canonical generation from the same immutable spool payload without waiting for 115 to expose the source file.
+- A destination overwrite returns HTTP 204; a new destination returns HTTP 201; `Overwrite: F` returns HTTP 412 when the destination already exists.
+- Shared COPY spool payloads are reference-counted in MySQL before physical cleanup, and active readers use an in-process reference count so one worker cannot make another worker's payload appear idle.
+- `DELETE` tombstones the whole tracked subtree. If descendants are tracked but the parent row is not, a synthetic directory tombstone is created so the provider-side tree is still removed.
+- A PUT below a canonical deleted/non-directory parent is rejected with HTTP 409 rather than creating an orphaned child generation.
+
+### Delete/recreate generation race
+
+A Cloud Sync delete can be followed almost immediately by a PUT that recreates the same path. Provider deletion is generation-checked both before and after the remote remove. If an older delete overlaps a newer generation that has already completed, the newest payload is re-queued from its local spool so the stale delete cannot become the final remote state.
+
+## Direct read reconciliation
+
+After the completed local cache expires, direct `GET`, `HEAD` and single-resource `PROPFIND` perform conservative remote-loss reconciliation.
+
+A 115 single-object NotFound or type mismatch is never trusted alone. OpenList force-refreshes the parent listing and only drops canonical metadata when the exact-name parent listing confirms the object is absent or has the wrong resource type. Transient 115 lookup inconsistencies therefore remain hidden from Cloud Sync, while genuinely removed remote objects eventually become visible as missing and are uploaded again by the one-way job.
+
+`PROPPATCH` is also canonical-aware, so a just-written object does not become temporarily unpatchable merely because the backing provider has not exposed it yet.
+
+## 115 Open driver hardening
+
+This fork also hardens the 115 Open driver under the write-back workload:
+
+- `Get()` falls back to the parent listing when a non-directory object has suspicious `size <= 0` or an invalid modification time, covering the post-upload incomplete-metadata window seen by Cloud Sync.
+- failed or canceled OSS multipart uploads explicitly call `AbortMultipartUpload` before retry, avoiding accumulation of unfinished multipart sessions.
