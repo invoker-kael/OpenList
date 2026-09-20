@@ -531,13 +531,13 @@ func TestCompletedDivergenceConfirmationRequiresSeparatedObservation(t *testing.
 	now := time.Unix(100, 0)
 	next := now.Add(5 * time.Second)
 	if completedDivergenceConfirmed(0, nil, now) {
-		t.Fatal("first divergence observation must not evict canonical metadata")
+		t.Fatal("first divergence observation must not request fresh confirmation")
 	}
 	if completedDivergenceConfirmed(1, &next, now.Add(4*time.Second)) {
-		t.Fatal("repeated scans inside the confirmation window must not count twice")
+		t.Fatal("repeated scans inside the confirmation window must not request fresh confirmation")
 	}
 	if !completedDivergenceConfirmed(1, &next, now.Add(5*time.Second)) {
-		t.Fatal("a second separated divergence observation should be eligible for confirmation")
+		t.Fatal("a separated observation should require a force-refreshed provider confirmation")
 	}
 }
 

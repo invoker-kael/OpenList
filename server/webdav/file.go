@@ -411,10 +411,11 @@ func walkFS(ctx context.Context, depth int, name string, info model.Obj, walkFn 
 	}
 	meta, _ := op.GetNearestMeta(name)
 	// Read directory names.
-	objs, err := fs.List(context.WithValue(ctx, conf.MetaKey, meta), name, &fs.ListArgs{})
+	listCtx := context.WithValue(ctx, conf.MetaKey, meta)
+	objs, err := fs.List(listCtx, name, &fs.ListArgs{})
 	if writeback.Enabled() {
 		remoteReliable := err == nil
-		overlaid, hasWriteback, overlayErr := writeback.OverlayList(name, objs, remoteReliable)
+		overlaid, hasWriteback, overlayErr := writeback.OverlayList(listCtx, name, objs, remoteReliable)
 		if overlayErr != nil {
 			return walkFn(name, info, overlayErr)
 		}

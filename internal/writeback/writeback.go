@@ -1455,12 +1455,11 @@ func completedDivergenceConfirmed(verifyCount int, retryAt *time.Time, now time.
 	return verifyCount > 0 && retryAt != nil && !now.Before(*retryAt)
 }
 
-// confirmCompletedFileDivergence prevents one transient 115 view from deleting
-// the canonical identity that Cloud Sync just committed. Completed files whose
-// local spool has been released need two separated provider observations before
-// the canonical row is evicted. retry_at is safe to reuse here because
-// COMPLETED rows are not part of the worker dispatch state set.
-func confirmCompletedFileDivergence(row *model.WebDAVWritebackObject, now time.Time) (bool, error) {
+// observeCompletedFileDivergence records a suspicious provider view but never
+// deletes canonical metadata by itself. Once the confirmation interval has
+// elapsed it only reports that a fresh provider read is required. This keeps
+// cached directory listings from counting as destructive evidence.
+func observeCompletedFileDivergence(row *model.WebDAVWritebackObject, now time.Time) (bool, error) {
 	if row == nil || row.IsDir || row.State != StateCompleted || row.SpoolPath != "" {
 		return false, nil
 	}
@@ -1470,7 +1469,7 @@ func confirmCompletedFileDivergence(row *model.WebDAVWritebackObject, now time.T
 		return false, nil
 	}
 
-	confirmed := false
+	needsFreshConfirmation := false
 	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var current model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -1484,26 +1483,23 @@ func confirmCompletedFileDivergence(row *model.WebDAVWritebackObject, now time.T
 		if current.IsDir {
 			return nil
 		}
-		if !completedDivergenceConfirmed(current.VerifyCount, current.RetryAt, now) {
-			next := now.Add(completedDivergenceConfirmationDelay())
-			return tx.Model(&model.WebDAVWritebackObject{}).
-				Where("id = ? AND generation = ? AND state = ?", current.ID, current.Generation, StateCompleted).
-				Updates(map[string]any{
-					"verify_count": 1,
-					"retry_at":     &next,
-					"last_error":   "remote divergence observed once; keeping canonical metadata until confirmation",
-				}).Error
+		if completedDivergenceConfirmed(current.VerifyCount, current.RetryAt, now) {
+			needsFreshConfirmation = true
+			return nil
 		}
-		res := tx.
-			Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", current.ID, current.Generation, StateCompleted).
-			Delete(&model.WebDAVWritebackObject{})
-		if res.Error != nil {
-			return res.Error
+		if current.VerifyCount > 0 && current.RetryAt != nil {
+			return nil
 		}
-		confirmed = res.RowsAffected > 0
-		return nil
+		next := now.Add(completedDivergenceConfirmationDelay())
+		return tx.Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", current.ID, current.Generation, StateCompleted).
+			Updates(map[string]any{
+				"verify_count": 1,
+				"retry_at":     &next,
+				"last_error":   "remote divergence observed once; waiting for force-refreshed confirmation",
+			}).Error
 	})
-	return confirmed, err
+	return needsFreshConfirmation, err
 }
 
 func clearCompletedFileDivergence(row *model.WebDAVWritebackObject) error {
@@ -1565,19 +1561,23 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	}
 	remote = exactRemoteByName(objs, row.Name)
 	if remote == nil {
-		confirmed, confirmErr := confirmCompletedFileDivergence(row, time.Now())
-		if confirmErr != nil {
-			return false, confirmErr
+		ready, observeErr := observeCompletedFileDivergence(row, time.Now())
+		if observeErr != nil || !ready {
+			return false, observeErr
 		}
-		return confirmed, nil
+		return deleteCompletedCanonical(row)
 	}
 	if remote.IsDir() != row.IsDir {
 		if row.IsDir {
 			_, delErr := deleteCompletedCanonical(row)
 			return false, delErr
 		}
-		_, confirmErr := confirmCompletedFileDivergence(row, time.Now())
-		return false, confirmErr
+		ready, observeErr := observeCompletedFileDivergence(row, time.Now())
+		if observeErr != nil || !ready {
+			return false, observeErr
+		}
+		_, delErr := deleteCompletedCanonical(row)
+		return false, delErr
 	}
 	if row.IsDir {
 		_, delErr := deleteCompletedCanonical(row)
@@ -1596,8 +1596,12 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 		// of manufacturing a Cloud Sync repair upload.
 		return false, nil
 	default:
-		_, confirmErr := confirmCompletedFileDivergence(row, time.Now())
-		return false, confirmErr
+		ready, observeErr := observeCompletedFileDivergence(row, time.Now())
+		if observeErr != nil || !ready {
+			return false, observeErr
+		}
+		_, delErr := deleteCompletedCanonical(row)
+		return false, delErr
 	}
 }
 
@@ -1636,7 +1640,7 @@ func directoryShadowExpired(row *model.WebDAVWritebackObject, now time.Time) boo
 // When the provider list itself succeeded, a completed row whose local spool
 // cache has already been released is dropped if the remote object disappeared.
 // That lets one-way Cloud Sync observe the loss and upload the source again.
-func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]model.Obj, bool, error) {
+func OverlayList(ctx context.Context, parent string, remote []model.Obj, remoteReliable bool) ([]model.Obj, bool, error) {
 	if !Enabled() {
 		return remote, false, nil
 	}
@@ -1662,6 +1666,28 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 		}
 		byName[name] = obj
 	}
+
+	var freshByName map[string]model.Obj
+	freshLoaded := false
+	freshReliable := false
+	loadFresh := func() {
+		if freshLoaded {
+			return
+		}
+		freshLoaded = true
+		objs, listErr := fs.List(ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
+		if listErr != nil {
+			return
+		}
+		freshReliable = true
+		freshByName = make(map[string]model.Obj, len(objs))
+		for _, obj := range objs {
+			if obj != nil {
+				freshByName[obj.GetName()] = obj
+			}
+		}
+	}
+
 	now := time.Now()
 	for i := range rows {
 		row := &rows[i]
@@ -1696,16 +1722,44 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 		}
 		if !protectedByProviderOperation &&
 			shouldDropCanonicalAfterRemoteList(row, remoteReliable, remoteObj, now, providerRequiresPayloadHash(row.Path)) {
-			confirmed, confirmErr := confirmCompletedFileDivergence(row, now)
-			if confirmErr != nil {
-				return nil, false, confirmErr
+			ready, observeErr := observeCompletedFileDivergence(row, now)
+			if observeErr != nil {
+				return nil, false, observeErr
 			}
-			if confirmed {
-				// The canonical row is gone. If the provider still has a changed
-				// object, leave that provider object in this listing; if it is truly
-				// absent, byName already has no entry. Either view is consistent with
-				// the next request and allows Cloud Sync to repair the divergence.
-				continue
+			if ready {
+				loadFresh()
+				if freshReliable {
+					freshObj, freshPresent := freshByName[row.Name]
+					freshComparison := remoteContentMismatch
+					if freshPresent {
+						freshComparison = compareRemoteContent(row, freshObj, providerRequiresPayloadHash(row.Path))
+					}
+					switch freshComparison {
+					case remoteContentMatch:
+						if clearErr := clearCompletedFileDivergence(row); clearErr != nil {
+							return nil, false, clearErr
+						}
+					case remoteContentInconclusive:
+						// A force-refreshed 115 listing still lacks enough identity
+						// evidence. Preserve canonical metadata and retry later.
+					default:
+						deleted, delErr := deleteCompletedCanonical(row)
+						if delErr != nil {
+							return nil, false, delErr
+						}
+						if deleted {
+							if freshPresent {
+								if _, ok := byName[row.Name]; !ok {
+									order = append(order, row.Name)
+								}
+								byName[row.Name] = freshObj
+							} else {
+								delete(byName, row.Name)
+							}
+							continue
+						}
+					}
+				}
 			}
 		}
 		if !remotePresent {
