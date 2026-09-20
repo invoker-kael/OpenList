@@ -42,7 +42,7 @@ jobs:
           go-version: "1.27.1"
           cache: true
 
-      - name: Format check
+      - name: Format preview
         run: |
           files=(
             internal/model/webdav_writeback.go
@@ -56,12 +56,14 @@ jobs:
             drivers/115_open/types.go
             drivers/115_open/upload.go
           )
-          unformatted="$(gofmt -l "${files[@]}")"
-          if [[ -n "$unformatted" ]]; then
-            echo "The following files need gofmt:"
-            echo "$unformatted"
-            exit 1
+          gofmt -w "${files[@]}"
+          if ! git diff --quiet -- "${files[@]}"; then
+            echo "gofmt would change:"
+            git diff -- "${files[@]}"
           fi
 
       - name: Unit and compile tests
         run: go test ./internal/writeback ./server/webdav ./drivers/115_open
+
+      - name: Format gate
+        run: git diff --exit-code
