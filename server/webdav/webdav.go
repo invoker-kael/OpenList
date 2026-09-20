@@ -528,7 +528,13 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 		mimeType = utils.GetMimeType(reqPath)
 	}
 	if writeback.Enabled() {
-		row, created, wbErr := writeback.Commit(ctx, reqPath, r.Body, size, obj.Modified, obj.Ctime, mimeType)
+		// Only explicitly supplied client timestamps may mutate an existing
+		// canonical generation. The legacy WebDAV helpers intentionally fall
+		// back to time.Now()/mtime for synchronous uploads, which would make a
+		// header-less Cloud Sync retry look like a metadata change.
+		writebackModTime := h.getWritebackHeaderTime(r, "X-OC-Mtime")
+		writebackCreateTime := h.getWritebackHeaderTime(r, "X-OC-Ctime")
+		row, created, wbErr := writeback.Commit(ctx, reqPath, r.Body, size, writebackModTime, writebackCreateTime, mimeType)
 		if wbErr != nil {
 			if strings.Contains(wbErr.Error(), "free space") {
 				return StatusInsufficientStorage, wbErr
@@ -536,6 +542,10 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 			return http.StatusInternalServerError, wbErr
 		}
 		w.Header().Set("Etag", row.ETag)
+		w.Header().Set("Last-Modified", row.ModTime.UTC().Format(http.TimeFormat))
+		if !writebackModTime.IsZero() {
+			w.Header().Set("X-OC-MTime", "accepted")
+		}
 		if created {
 			return http.StatusCreated, nil
 		}

@@ -17,6 +17,19 @@ func (h *Handler) getCreateTime(r *http.Request) time.Time {
 	return h.getHeaderTime(r, "X-OC-Ctime", "X-OC-Mtime")
 }
 
+func (h *Handler) getWritebackHeaderTime(r *http.Request, header string) time.Time {
+	hVal := r.Header.Get(header)
+	if hVal == "" {
+		return time.Time{}
+	}
+	unixTime, err := strconv.ParseInt(hVal, 10, 64)
+	if err != nil {
+		log.Warnf("getWritebackHeaderTime in Webdav, failed to parse %s, %s", header, err)
+		return time.Time{}
+	}
+	return time.Unix(unixTime, 0)
+}
+
 func (h *Handler) getHeaderTime(r *http.Request, header, alternative string) time.Time {
 	hVal := r.Header.Get(header)
 	// try alternative

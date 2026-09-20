@@ -12,6 +12,17 @@ on:
       - "internal/model/webdav_writeback.go"
       - "internal/conf/**"
       - ".github/workflows/writeback.yml"
+  push:
+    branches: ["feature/cloudsync-writeback"]
+    paths:
+      - "internal/writeback/**"
+      - "server/webdav/**"
+      - "server/common/proxy.go"
+      - "server/common/proxy_test.go"
+      - "drivers/115_open/**"
+      - "internal/model/webdav_writeback.go"
+      - "internal/conf/**"
+      - ".github/workflows/writeback.yml"
   workflow_dispatch:
 
 permissions:
@@ -45,6 +56,8 @@ jobs:
             server/webdav/webdav.go
             server/webdav/precondition.go
             server/webdav/precondition_test.go
+            server/webdav/util.go
+            server/webdav/util_test.go
             server/common/proxy.go
             server/common/proxy_test.go
             drivers/115_open/driver.go
