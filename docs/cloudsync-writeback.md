@@ -88,6 +88,7 @@ The write-back layer intentionally favors source correctness over avoiding dupli
 - Same-size remote objects are not trusted after an ambiguous process crash; the spool payload is uploaded again.
 - During normal post-upload verification, 115 SHA-1 is compared with the persisted encrypted payload SHA-1 whenever available; size equality alone is not enough to complete the generation.
 - A superseded upload to the same path is never followed by an eager delete, preventing an old worker from erasing the path while a newer generation is waiting.
+- Delete completion is also eventually-consistency aware: MySQL tombstones remain authoritative until two refreshed provider views agree that the name is absent.
 - Duplicate provider writes can occur after a crash. For one-way encrypted backup this is preferable to silently accepting the wrong generation.
 - Client-level retries of the exact same encrypted payload are coalesced while the durable spool is still present, reducing duplicate provider traffic without weakening remote-loss recovery.
 
@@ -171,6 +172,7 @@ Cloud Sync can issue WebDAV operations before an asynchronously uploaded 115 obj
 - Freshly remapped `COMPLETED` metadata, including files whose local spool has already expired, receives the same short consistency grace used for directory shadows. This prevents an immediate 115 NotFound/stale listing after MOVE from being treated as a real remote deletion.
 - Shared COPY spool payloads are reference-counted in MySQL before physical cleanup, and active readers use an in-process reference count so one worker cannot make another worker's payload appear idle.
 - `DELETE` tombstones the whole tracked subtree. If descendants are tracked but the parent row is not, a synthetic directory tombstone is created so the provider-side tree is still removed.
+- A tombstone is not released merely because provider `Remove()` returned success/NotFound. OpenList force-refreshes the parent and requires two consecutive absence confirmations separated by the verify interval. Provider/listing errors or a still-visible same-name resource reset the confirmation count and keep the path hidden from Cloud Sync.
 - A PUT below a canonical deleted/non-directory parent is rejected with HTTP 409 rather than creating an orphaned child generation.
 - Background child jobs also stop at a canonical deleted/non-directory parent, covering races where the parent changes after the child PUT was already committed.
 

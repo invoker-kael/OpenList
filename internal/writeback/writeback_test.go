@@ -536,3 +536,19 @@ func TestCanCoalesceDuplicatePut(t *testing.T) {
 	}
 }
 
+func TestRemoteListContainsName(t *testing.T) {
+	objs := []model.Obj{
+		&model.Object{Name: "keep.bin"},
+		&model.Object{Name: "folder", IsFolder: true},
+	}
+	if !remoteListContainsName(objs, "keep.bin") {
+		t.Fatal("exact file name should be detected in provider listing")
+	}
+	if !remoteListContainsName(objs, "folder") {
+		t.Fatal("same-name directory should still block delete confirmation")
+	}
+	if remoteListContainsName(objs, "missing.bin") {
+		t.Fatal("absent name must not be reported present")
+	}
+}
+

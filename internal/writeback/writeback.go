@@ -2209,6 +2209,31 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		}).Error
 }
 
+func remoteListContainsName(objs []model.Obj, name string) bool {
+	for _, obj := range objs {
+		if obj.GetName() == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *workerManager) remoteDeleteAbsent(row *model.WebDAVWritebackObject) (bool, error) {
+	remote, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true})
+	if getErr == nil && remote != nil {
+		return false, nil
+	}
+	if getErr != nil && !errs.IsObjectNotFound(getErr) {
+		return false, getErr
+	}
+
+	objs, listErr := fs.List(m.ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	if listErr != nil {
+		return false, listErr
+	}
+	return !remoteListContainsName(objs, row.Name), nil
+}
+
 func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 	// A tombstone can be superseded by a fast Cloud Sync recreate of the same
 	// path. Re-check the generation before touching the provider so a queued old
@@ -2249,6 +2274,42 @@ func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 				wake()
 			}
 		}
+		return
+	}
+
+	absent, verifyErr := m.remoteDeleteAbsent(row)
+	if verifyErr != nil {
+		m.failDeleted(row, verifyErr)
+		return
+	}
+	if !absent {
+		m.failDeleted(row, errors.New("remote object is still visible after delete"))
+		return
+	}
+
+	// A single NotFound/list miss is not enough for an eventually-consistent
+	// provider. Keep the tombstone through two force-refreshed absence checks.
+	const deleteConfirmations = 2
+	nextCount := row.VerifyCount + 1
+	if nextCount < deleteConfirmations {
+		interval := time.Duration(max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)) * time.Second
+		next := time.Now().Add(interval)
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateDeleted).
+			Updates(map[string]any{
+				"retry_at":     &next,
+				"verify_count": nextCount,
+				"last_error":   "first remote delete absence confirmation; waiting for second",
+			}).Error
+		return
+	}
+
+	// Re-check one final time after the verification request. A PUT may have
+	// recreated the path while we were waiting on the provider listing.
+	if err := db.GetDb().First(&current, row.ID).Error; err != nil {
+		return
+	}
+	if current.Generation != row.Generation || current.State != StateDeleted {
 		return
 	}
 
@@ -2298,9 +2359,10 @@ func (m *workerManager) failDeleted(row *model.WebDAVWritebackObject, err error)
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateDeleted).
 		Updates(map[string]any{
-			"retry_at":    &next,
-			"retry_count": row.RetryCount + 1,
-			"last_error":  err.Error(),
+			"retry_at":     &next,
+			"retry_count":  row.RetryCount + 1,
+			"verify_count": 0,
+			"last_error":   err.Error(),
 		}).Error
 }
 
