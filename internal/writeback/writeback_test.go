@@ -691,11 +691,11 @@ func TestMutationFenceInvalidatesEarlierPutSequence(t *testing.T) {
 func TestDirectoryMutationFenceScope(t *testing.T) {
 	root := "/encrypted/album"
 	for path, want := range map[string]bool{
-		"/encrypted/album":          true,
-		"/encrypted/album/a.bin":    true,
+		"/encrypted/album":           true,
+		"/encrypted/album/a.bin":     true,
 		"/encrypted/album/sub/b.bin": true,
-		"/encrypted/album2/a.bin":   false,
-		"/encrypted":                false,
+		"/encrypted/album2/a.bin":    false,
+		"/encrypted":                 false,
 	} {
 		if got := isPathOrDescendant(path, root); got != want {
 			t.Fatalf("mutation fence scope for %q = %v, want %v", path, got, want)
