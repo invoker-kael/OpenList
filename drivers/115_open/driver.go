@@ -186,7 +186,10 @@ func (d *Open115) Get(ctx context.Context, path string) (model.Obj, error) {
 		Upt:  parseTime(resp.UTime),
 		UpPt: parseTime(resp.PTime),
 	}
-	if !obj.IsDir() && obj.ModTime().Unix() <= 0 {
+	if !obj.IsDir() && (obj.GetSize() <= 0 || obj.ModTime().Unix() <= 0) {
+		// 115 Open can briefly return incomplete metadata immediately after an
+		// upload (notably size=0 and/or epoch timestamps). The parent listing is
+		// more reliable in that window and is also safe for legitimate empty files.
 		return d.getFromParent(ctx, path, obj.GetID())
 	}
 	return obj, nil
