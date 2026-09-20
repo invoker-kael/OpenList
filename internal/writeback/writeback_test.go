@@ -30,6 +30,50 @@ func TestProviderOperationKeyIsStableAndScoped(t *testing.T) {
 	}
 }
 
+func TestProviderOperationConflictRules(t *testing.T) {
+	existing := &model.WebDAVProviderOperation{
+		OperationKey:    providerOperationKey(ProviderOperationCopy, "/src/a", "/dst/a", -1),
+		Method:          ProviderOperationCopy,
+		SourcePath:      "/src/a",
+		DestinationPath: "/dst/a",
+	}
+	if !providerOperationsConflict(existing, ProviderOperationCopy, "/other", "/dst/a/child", -1) {
+		t.Fatal("destination subtree overlap must be fenced")
+	}
+	if providerOperationsConflict(existing, ProviderOperationCopy, "/src/a", "/dst/b", -1) {
+		t.Fatal("parallel COPY operations may share a stable source")
+	}
+	if !providerOperationsConflict(existing, ProviderOperationMove, "/src/a", "/dst/b", -1) {
+		t.Fatal("MOVE must conflict with an unresolved operation touching its source")
+	}
+
+	same := providerOperationKey(ProviderOperationCopy, "/src/a", "/dst/a", -1)
+	existing.OperationKey = same
+	if providerOperationsConflict(existing, ProviderOperationCopy, "/src/a", "/dst/a", -1) {
+		t.Fatal("the exact retry intent must not conflict with itself")
+	}
+}
+
+func TestProviderOperationSourceMatchesCanonicalGeneration(t *testing.T) {
+	op := &model.WebDAVProviderOperation{
+		SourceIsDir:      false,
+		SourceGeneration: 7,
+		SourceETag:       ""olwb-generation-7"",
+		SourceSize:       1024,
+	}
+	source := &CanonicalObject{
+		Object: model.Object{Size: 1024},
+		etag:   ""olwb-generation-7"",
+	}
+	if !ProviderOperationSourceMatches(op, source) {
+		t.Fatal("matching canonical generation ETag should retain the intent")
+	}
+	source.etag = ""olwb-generation-8""
+	if ProviderOperationSourceMatches(op, source) {
+		t.Fatal("a newer canonical generation must supersede the old intent source")
+	}
+}
+
 func TestProviderOperationSourceMatches(t *testing.T) {
 	modTime := time.Date(2026, time.September, 20, 8, 0, 0, 0, time.UTC)
 	sha := strings.Repeat("a", 40)

@@ -143,7 +143,11 @@ func applyDuplicatePutMetadata(row *model.WebDAVWritebackObject, modTime, create
 	}
 }
 
-var ErrDestinationExists = errors.New("write-back destination already exists")
+var (
+	ErrDestinationExists        = errors.New("write-back destination already exists")
+	ErrProviderOperationConflict = errors.New("conflicting provider COPY/MOVE intent is still unresolved")
+	ErrProviderOperationStale    = errors.New("provider COPY/MOVE source generation was superseded")
+)
 
 const (
 	ProviderOperationCopy = "COPY"
@@ -184,6 +188,7 @@ func ProviderOperationSourceObject(op *model.WebDAVProviderOperation) model.Obj 
 		return nil
 	}
 	obj := &model.Object{
+		ID:       op.SourceObjectID,
 		Path:     op.SourcePath,
 		Name:     path.Base(op.SourcePath),
 		Size:     op.SourceSize,
@@ -201,7 +206,15 @@ func ProviderOperationSourceMatches(op *model.WebDAVProviderOperation, source mo
 	if op == nil || source == nil || op.SourceIsDir != source.IsDir() {
 		return false
 	}
+	if op.SourceGeneration > 0 {
+		if canonical, ok := source.(*CanonicalObject); ok && op.SourceETag != "" {
+			return canonical.etag == op.SourceETag
+		}
+	}
 	if op.SourceIsDir {
+		if op.SourceObjectID != "" && source.GetID() != "" {
+			return op.SourceObjectID == source.GetID()
+		}
 		if op.SourceModTime.IsZero() || source.ModTime().IsZero() {
 			return false
 		}
@@ -214,10 +227,57 @@ func ProviderOperationSourceMatches(op *model.WebDAVProviderOperation, source mo
 	if op.SourceSHA1 != "" || sourceSHA1 != "" {
 		return op.SourceSHA1 != "" && sourceSHA1 != "" && strings.EqualFold(op.SourceSHA1, sourceSHA1)
 	}
+	if op.SourceObjectID != "" && source.GetID() != "" {
+		return op.SourceObjectID == source.GetID()
+	}
 	if op.SourceModTime.IsZero() || source.ModTime().IsZero() {
 		return false
 	}
 	return op.SourceModTime.Unix() == source.ModTime().Unix()
+}
+
+func pathsOverlap(a, b string) bool {
+	a = utils.FixAndCleanPath(a)
+	b = utils.FixAndCleanPath(b)
+	return isPathOrDescendant(a, b) || isPathOrDescendant(b, a)
+}
+
+func providerOperationsConflict(existing *model.WebDAVProviderOperation, method, src, dst string, depth int) bool {
+	if existing == nil {
+		return false
+	}
+	method = strings.ToUpper(method)
+	src = utils.FixAndCleanPath(src)
+	dst = utils.FixAndCleanPath(dst)
+	if existing.OperationKey == providerOperationKey(method, src, dst, depth) {
+		return false
+	}
+
+	if pathsOverlap(existing.DestinationPath, dst) ||
+		pathsOverlap(existing.DestinationPath, src) ||
+		pathsOverlap(existing.SourcePath, dst) {
+		return true
+	}
+	if strings.EqualFold(existing.Method, ProviderOperationMove) || method == ProviderOperationMove {
+		return pathsOverlap(existing.SourcePath, src)
+	}
+	return false
+}
+
+func ProviderOperationConflict(method, src, dst string, depth int) (*model.WebDAVProviderOperation, error) {
+	if !Enabled() {
+		return nil, nil
+	}
+	var ops []model.WebDAVProviderOperation
+	if err := db.GetDb().Order("updated_at asc").Find(&ops).Error; err != nil {
+		return nil, err
+	}
+	for i := range ops {
+		if providerOperationsConflict(&ops[i], method, src, dst, depth) {
+			return &ops[i], nil
+		}
+	}
+	return nil, nil
 }
 
 func GetProviderOperation(method, src, dst string, depth int) (*model.WebDAVProviderOperation, error) {
@@ -246,8 +306,11 @@ func PrepareProviderOperation(method, src, dst string, depth int, source model.O
 	op := model.WebDAVProviderOperation{
 		OperationKey:       providerOperationKey(method, src, dst, depth),
 		Method:             method,
+		SourceKey:          pathKey(src),
+		DestinationKey:     pathKey(dst),
 		SourcePath:         src,
 		DestinationPath:    dst,
+		SourceObjectID:     source.GetID(),
 		SourceIsDir:        source.IsDir(),
 		SourceSize:         source.GetSize(),
 		SourceSHA1:         strings.ToLower(source.GetHash().GetHash(utils.SHA1)),
@@ -257,17 +320,45 @@ func PrepareProviderOperation(method, src, dst string, depth int, source model.O
 		Depth:              depth,
 		DestinationExisted: destinationExisted,
 		State:              ProviderOperationPrepared,
+		RecoveryCount:      0,
+		LastRecovery:       "",
+		LastError:          "",
+		LastCheckedAt:      nil,
 		AppliedAt:          nil,
 		UpdatedAt:          now,
 	}
-	err := db.GetDb().Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "operation_key"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			"method", "source_path", "destination_path", "source_is_dir", "source_size",
-			"source_sha1", "source_mod_time", "source_create_time", "overwrite", "depth",
-			"destination_existed", "state", "applied_at", "updated_at",
-		}),
-	}).Create(&op).Error
+	if canonical, err := getByPath(src); err != nil {
+		return nil, err
+	} else if canonical != nil && canonical.State != StateDeleted {
+		op.SourceGeneration = canonical.Generation
+		op.SourceETag = canonical.ETag
+		if op.SourceSHA1 == "" {
+			op.SourceSHA1 = strings.ToLower(canonicalContentSHA1(canonical))
+		}
+	}
+
+	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		var existing []model.WebDAVProviderOperation
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Order("updated_at asc").Find(&existing).Error; err != nil {
+			return err
+		}
+		var same *model.WebDAVProviderOperation
+		for i := range existing {
+			if existing[i].OperationKey == op.OperationKey {
+				same = &existing[i]
+				continue
+			}
+			if providerOperationsConflict(&existing[i], method, src, dst, depth) {
+				return ErrProviderOperationConflict
+			}
+		}
+		if same != nil {
+			op.ID = same.ID
+			op.CreatedAt = same.CreatedAt
+			return tx.Save(&op).Error
+		}
+		return tx.Create(&op).Error
+	})
 	if err != nil {
 		return nil, err
 	}

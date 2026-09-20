@@ -45,8 +45,13 @@ type WebDAVProviderOperation struct {
 	ID                 uint       `json:"id" gorm:"primaryKey"`
 	OperationKey       string     `json:"operation_key" gorm:"size:64;uniqueIndex"`
 	Method             string     `json:"method" gorm:"size:8;index"`
+	SourceKey          string     `json:"source_key" gorm:"size:64;index"`
+	DestinationKey     string     `json:"destination_key" gorm:"size:64;index"`
 	SourcePath         string     `json:"source_path" gorm:"type:text"`
 	DestinationPath    string     `json:"destination_path" gorm:"type:text"`
+	SourceObjectID     string     `json:"source_object_id" gorm:"size:255"`
+	SourceGeneration   uint64     `json:"source_generation"`
+	SourceETag         string     `json:"source_etag" gorm:"size:160"`
 	SourceIsDir        bool       `json:"source_is_dir"`
 	SourceSize         int64      `json:"source_size"`
 	SourceSHA1         string     `json:"source_sha1" gorm:"size:40"`
@@ -56,6 +61,10 @@ type WebDAVProviderOperation struct {
 	Depth              int        `json:"depth"`
 	DestinationExisted bool       `json:"destination_existed"`
 	State              string     `json:"state" gorm:"size:16;index"`
+	RecoveryCount      int        `json:"recovery_count"`
+	LastRecovery       string     `json:"last_recovery" gorm:"size:24"`
+	LastError          string     `json:"last_error" gorm:"type:text"`
+	LastCheckedAt      *time.Time `json:"last_checked_at"`
 	AppliedAt          *time.Time `json:"applied_at"`
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`
