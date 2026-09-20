@@ -3,7 +3,9 @@ package writeback
 import (
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
@@ -125,5 +127,56 @@ func TestReceivingPathReferenceCount(t *testing.T) {
 	release2()
 	if isReceiving(p) {
 		t.Fatal("path should stop receiving after the final PUT finishes")
+	}
+}
+
+
+func TestCanonicalDirectoryObject(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		ID:         7,
+		Path:       "/encrypted/folder",
+		Name:       "folder",
+		IsDir:      true,
+		Generation: 1,
+		ETag:       canonicalETag(pathKey("/encrypted/folder"), 1, 0),
+	}
+	obj := toObject(row)
+	if !obj.IsDir() {
+		t.Fatal("canonical directory must be exposed as a WebDAV collection")
+	}
+	if obj.GetName() != "folder" {
+		t.Fatalf("canonical directory name = %q, want folder", obj.GetName())
+	}
+}
+
+func TestDirectoryShadowGrace(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{
+		WebDAVWriteback: conf.WebDAVWritebackConfig{
+			DirectoryGraceSeconds: 60,
+		},
+	}
+	defer func() { conf.Conf = oldConf }()
+
+	now := time.Now()
+	completed := now.Add(-30 * time.Second)
+	row := &model.WebDAVWritebackObject{
+		IsDir:       true,
+		State:       StateCompleted,
+		CompletedAt: &completed,
+	}
+	if directoryShadowExpired(row, now) {
+		t.Fatal("directory shadow must remain visible during provider consistency grace")
+	}
+
+	completed = now.Add(-61 * time.Second)
+	row.CompletedAt = &completed
+	if !directoryShadowExpired(row, now) {
+		t.Fatal("directory shadow should expire after provider consistency grace")
+	}
+
+	row.State = StateQueued
+	if directoryShadowExpired(row, now) {
+		t.Fatal("pending directory shadow must never expire while creation is queued")
 	}
 }
