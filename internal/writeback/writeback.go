@@ -789,7 +789,6 @@ func DeleteTree(p string) (bool, error) {
 	return handled, nil
 }
 
-
 func tombstoneMovedSource(row *model.WebDAVWritebackObject, now time.Time) {
 	row.Generation++
 	row.State = StateDeleted
@@ -1051,22 +1050,22 @@ func copyPendingDirectory(src, dst string, recursive bool) (handled bool, overwr
 			}
 
 			row := model.WebDAVWritebackObject{
-				PathKey:      pathKey(newPath),
-				ParentKey:    pathKey(newParent),
-				Path:         newPath,
-				Parent:       newParent,
-				Name:         path.Base(newPath),
-				IsDir:        sourceRow.IsDir,
-				Size:         sourceRow.Size,
-				ModTime:      sourceRow.ModTime,
-				CreateTime:   sourceRow.CreateTime,
-				ETag:         canonicalETag(pathKey(newPath), 1, sourceRow.Size),
-				Generation:   1,
-				State:        StateQueued,
-				SpoolPath:    spoolPath,
-				PayloadSHA1:  payloadSHA1,
-				MimeType:     sourceRow.MimeType,
-				RetryAt:      &retryAt,
+				PathKey:     pathKey(newPath),
+				ParentKey:   pathKey(newParent),
+				Path:        newPath,
+				Parent:      newParent,
+				Name:        path.Base(newPath),
+				IsDir:       sourceRow.IsDir,
+				Size:        sourceRow.Size,
+				ModTime:     sourceRow.ModTime,
+				CreateTime:  sourceRow.CreateTime,
+				ETag:        canonicalETag(pathKey(newPath), 1, sourceRow.Size),
+				Generation:  1,
+				State:       StateQueued,
+				SpoolPath:   spoolPath,
+				PayloadSHA1: payloadSHA1,
+				MimeType:    sourceRow.MimeType,
+				RetryAt:     &retryAt,
 			}
 			if err := tx.Create(&row).Error; err != nil {
 				return err
@@ -1301,7 +1300,6 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 	wake()
 	return true, overwritten, nil
 }
-
 
 func providerOverwriteQuiescent(rows []model.WebDAVWritebackObject) bool {
 	for i := range rows {

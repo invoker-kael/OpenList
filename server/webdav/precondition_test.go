@@ -1,6 +1,9 @@
 package webdav
 
-import "testing"
+import (
+	"net/http"
+	"testing"
+)
 
 func TestPutPreconditions(t *testing.T) {
 	tests := []struct {
@@ -93,4 +96,3 @@ func TestCopyMoveProviderSucceeded(t *testing.T) {
 		}
 	}
 }
-

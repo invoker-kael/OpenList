@@ -1,9 +1,9 @@
 package writeback
 
 import (
-	"reflect"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -36,7 +36,6 @@ func TestCanonicalETagChangesWithGeneration(t *testing.T) {
 		t.Fatalf("unexpected etag %q", a)
 	}
 }
-
 
 func TestShouldRemoveStaleRemote(t *testing.T) {
 	tests := []struct {
@@ -84,7 +83,6 @@ func TestShouldRemoveStaleRemote(t *testing.T) {
 	}
 }
 
-
 func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 	completedNoSpool := &model.WebDAVWritebackObject{
 		State:     StateCompleted,
@@ -117,7 +115,6 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 	}
 }
 
-
 func TestReceivingPathReferenceCount(t *testing.T) {
 	p := "/encrypted/placeholder.bin"
 	release1 := beginReceiving(p)
@@ -134,7 +131,6 @@ func TestReceivingPathReferenceCount(t *testing.T) {
 		t.Fatal("path should stop receiving after the final PUT finishes")
 	}
 }
-
 
 func TestCanonicalDirectoryObject(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
@@ -186,7 +182,6 @@ func TestDirectoryShadowGrace(t *testing.T) {
 	}
 }
 
-
 func TestCloudSyncPlaceholderSettleDelay(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = &conf.Config{
@@ -204,7 +199,6 @@ func TestCloudSyncPlaceholderSettleDelay(t *testing.T) {
 		t.Fatalf("zero-byte placeholder settle delay = %v, want 10s", got)
 	}
 }
-
 
 func TestIsPathOrDescendant(t *testing.T) {
 	tests := []struct {
@@ -385,7 +379,7 @@ func TestCanonicalShadowGraceProtectsFreshCompletedFile(t *testing.T) {
 	if canonicalShadowInGrace(row, now) {
 		t.Fatal("completed file metadata should leave grace after the configured window")
 	}
-	if !shouldDropCanonicalAfterRemoteList(row, true, false, now) {
+	if !shouldDropCanonicalAfterRemoteList(row, true, nil, now) {
 		t.Fatal("expired completed file should expose a confirmed provider loss")
 	}
 }
@@ -731,4 +725,3 @@ func TestDescendantLikePattern(t *testing.T) {
 		}
 	}
 }
-
