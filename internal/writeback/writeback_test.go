@@ -600,6 +600,89 @@ func TestCompletedDivergenceProbeStateClaimsAndRearms(t *testing.T) {
 	}
 }
 
+func TestSplitOverlayRowsIncludesParentWithoutListingItAsAChild(t *testing.T) {
+	parent := "/encrypted/album"
+	parentKey := pathKey(parent)
+	childPath := parent + "/chunk.bin"
+	rows, canonicalParent := splitOverlayRows(parent, parentKey, []model.WebDAVWritebackObject{
+		{
+			PathKey:        parentKey,
+			ParentKey:      pathKey("/encrypted"),
+			Path:           parent,
+			IsDir:          true,
+			CanonicalState: CanonicalStateAcked,
+		},
+		{
+			PathKey:        pathKey(childPath),
+			ParentKey:      parentKey,
+			Path:           childPath,
+			Name:           "chunk.bin",
+			CanonicalState: CanonicalStateAcked,
+		},
+	})
+	if !canonicalParent {
+		t.Fatal("canonical directory parent should be reported from the combined overlay query")
+	}
+	if len(rows) != 1 || rows[0].Path != childPath {
+		t.Fatalf("overlay children = %#v, want only %s", rows, childPath)
+	}
+}
+
+func TestSplitOverlayRowsExcludesRootSelfReference(t *testing.T) {
+	parent := "/"
+	parentKey := pathKey(parent)
+	childPath := "/child"
+	rows, canonicalParent := splitOverlayRows(parent, parentKey, []model.WebDAVWritebackObject{
+		{
+			PathKey:        parentKey,
+			ParentKey:      parentKey,
+			Path:           parent,
+			IsDir:          true,
+			CanonicalState: CanonicalStateAcked,
+		},
+		{
+			PathKey:        pathKey(childPath),
+			ParentKey:      parentKey,
+			Path:           childPath,
+			Name:           "child",
+			CanonicalState: CanonicalStateAcked,
+		},
+	})
+	if !canonicalParent {
+		t.Fatal("canonical root should be reported as the parent")
+	}
+	if len(rows) != 1 || rows[0].Path != childPath {
+		t.Fatalf("root overlay children = %#v, want only %s", rows, childPath)
+	}
+}
+
+func TestOverlayRowsSkipProviderOperationLookupOnDurableHotPath(t *testing.T) {
+	now := time.Now()
+	completed := now
+	rows := []model.WebDAVWritebackObject{
+		{
+			State:       StateQueued,
+			SpoolPath:   "/spool/queued.data",
+			CompletedAt: nil,
+		},
+		{
+			State:       StateCompleted,
+			SpoolPath:   "/spool/cached.data",
+			CompletedAt: &completed,
+		},
+	}
+	if overlayRowsNeedProviderOperationProtection(rows, true, now) {
+		t.Fatal("queued or locally cached canonical rows must not query provider-operation intents")
+	}
+	rows[1].SpoolPath = ""
+	if !overlayRowsNeedProviderOperationProtection(rows, true, now) {
+		t.Fatal("completed no-spool file reconciliation must retain provider-operation protection")
+	}
+	if overlayRowsNeedProviderOperationProtection(rows, false, now) {
+		t.Fatal("failed provider listing cannot destructively reconcile and should not query provider-operation intents")
+	}
+}
+
 func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 	completedNoSpool := &model.WebDAVWritebackObject{
 		State:     StateCompleted,

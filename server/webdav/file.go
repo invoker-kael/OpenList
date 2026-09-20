@@ -415,15 +415,9 @@ func walkFS(ctx context.Context, depth int, name string, info model.Obj, walkFn 
 	objs, err := fs.List(listCtx, name, &fs.ListArgs{})
 	if writeback.Enabled() {
 		remoteReliable := err == nil
-		overlaid, hasWriteback, overlayErr := writeback.OverlayList(listCtx, name, objs, remoteReliable)
+		overlaid, hasWriteback, canonicalParent, overlayErr := writeback.OverlayListState(listCtx, name, objs, remoteReliable)
 		if overlayErr != nil {
 			return walkFn(name, info, overlayErr)
-		}
-		canonicalParent := false
-		if canonical, found, deleted, canonicalErr := writeback.Canonical(name); canonicalErr != nil {
-			return walkFn(name, info, canonicalErr)
-		} else if found && !deleted && canonical != nil && canonical.IsDir() {
-			canonicalParent = true
 		}
 		// A just-created canonical directory is a valid empty collection even
 		// before an eventually-consistent provider can list it. This is needed

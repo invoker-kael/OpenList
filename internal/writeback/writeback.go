@@ -480,15 +480,9 @@ func providerOperationTreeObjects(ctx context.Context, current string, overlay b
 	}
 
 	remoteReliable := err == nil
-	overlaid, hasWriteback, overlayErr := OverlayList(ctx, current, objs, remoteReliable)
+	overlaid, hasWriteback, canonicalParent, overlayErr := OverlayListState(ctx, current, objs, remoteReliable)
 	if overlayErr != nil {
 		return nil, overlayErr
-	}
-	canonicalParent := false
-	if canonical, found, deleted, canonicalErr := Canonical(current); canonicalErr != nil {
-		return nil, canonicalErr
-	} else if found && !deleted && canonical != nil && canonical.IsDir() {
-		canonicalParent = true
 	}
 	if remoteReliable || hasWriteback || canonicalParent {
 		return overlaid, nil
@@ -1813,26 +1807,95 @@ func directoryShadowExpired(row *model.WebDAVWritebackObject, now time.Time) boo
 	return row.IsDir && row.State == StateCompleted && row.CompletedAt != nil && !canonicalShadowInGrace(row, now)
 }
 
+func splitOverlayRows(parent, parentKey string, candidates []model.WebDAVWritebackObject) ([]model.WebDAVWritebackObject, bool) {
+	rows := make([]model.WebDAVWritebackObject, 0, len(candidates))
+	canonicalParent := false
+	for i := range candidates {
+		row := candidates[i]
+		if row.PathKey == parentKey && utils.FixAndCleanPath(row.Path) == parent {
+			canonicalParent = !canonicalDeleted(&row) && row.IsDir
+			continue
+		}
+		if row.ParentKey == parentKey {
+			rows = append(rows, row)
+		}
+	}
+	return rows, canonicalParent
+}
+
+func loadOverlayRows(parent string) ([]model.WebDAVWritebackObject, bool, error) {
+	parent = utils.FixAndCleanPath(parent)
+	key := pathKey(parent)
+	var candidates []model.WebDAVWritebackObject
+	if err := db.GetDb().
+		Where("parent_key = ? OR path_key = ?", key, key).
+		Find(&candidates).Error; err != nil {
+		return nil, false, err
+	}
+	rows, canonicalParent := splitOverlayRows(parent, key, candidates)
+	return rows, canonicalParent, nil
+}
+
+func overlayRowsNeedProviderOperationProtection(rows []model.WebDAVWritebackObject, remoteReliable bool, now time.Time) bool {
+	if !remoteReliable {
+		return false
+	}
+	for i := range rows {
+		row := &rows[i]
+		if canonicalDeleted(row) {
+			continue
+		}
+		if row.IsDir {
+			if directoryShadowExpired(row, now) {
+				return true
+			}
+			continue
+		}
+		if row.State == StateCompleted && row.SpoolPath == "" {
+			return true
+		}
+	}
+	return false
+}
+
 // OverlayList replaces remote objects with their canonical WebDAV metadata and
 // injects locally committed objects that are not visible on the remote yet.
 // When the provider list itself succeeded, a completed row whose local spool
 // cache has already been released is dropped if the remote object disappeared.
 // That lets one-way Cloud Sync observe the loss and upload the source again.
 func OverlayList(ctx context.Context, parent string, remote []model.Obj, remoteReliable bool) ([]model.Obj, bool, error) {
+	overlaid, hasWriteback, _, err := OverlayListState(ctx, parent, remote, remoteReliable)
+	return overlaid, hasWriteback, err
+}
+
+// OverlayListState also reports whether the listed collection itself is a
+// canonical directory. Parent and child canonical rows are loaded together so
+// recursive PROPFIND does not issue a second MySQL lookup for every directory.
+func OverlayListState(ctx context.Context, parent string, remote []model.Obj, remoteReliable bool) ([]model.Obj, bool, bool, error) {
 	if !Enabled() {
-		return remote, false, nil
+		return remote, false, false, nil
 	}
 	parent = utils.FixAndCleanPath(parent)
-	var rows []model.WebDAVWritebackObject
-	if err := db.GetDb().Where("parent_key = ?", pathKey(parent)).Find(&rows).Error; err != nil {
-		return nil, false, err
+	rows, canonicalParent, err := loadOverlayRows(parent)
+	if err != nil {
+		return nil, false, false, err
 	}
+	overlaid, hasWriteback, err := overlayListRows(ctx, parent, remote, remoteReliable, rows)
+	return overlaid, hasWriteback, canonicalParent, err
+}
+
+func overlayListRows(ctx context.Context, parent string, remote []model.Obj, remoteReliable bool, rows []model.WebDAVWritebackObject) ([]model.Obj, bool, error) {
 	if len(rows) == 0 {
 		return remote, false, nil
 	}
-	activeOps, err := activeProviderOperations()
-	if err != nil {
-		return nil, false, err
+	now := time.Now()
+	var activeOps []model.WebDAVProviderOperation
+	if overlayRowsNeedProviderOperationProtection(rows, remoteReliable, now) {
+		var err error
+		activeOps, err = activeProviderOperations()
+		if err != nil {
+			return nil, false, err
+		}
 	}
 
 	byName := make(map[string]model.Obj, len(remote)+len(rows))
@@ -1866,7 +1929,6 @@ func OverlayList(ctx context.Context, parent string, remote []model.Obj, remoteR
 		}
 	}
 
-	now := time.Now()
 	for i := range rows {
 		row := &rows[i]
 		protectedByProviderOperation := providerOperationProtectsCanonicalPath(activeOps, row.Path, now)
