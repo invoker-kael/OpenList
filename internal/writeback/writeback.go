@@ -466,6 +466,49 @@ func providerOperationPathState(ctx context.Context, p string, op *model.WebDAVP
 	}
 }
 
+func providerOperationSourcePathState(ctx context.Context, op *model.WebDAVProviderOperation) (providerOperationRemoteState, model.Obj, error) {
+	if op == nil {
+		return providerOperationRemoteInconclusive, nil, nil
+	}
+	p := op.SourcePath
+	remote, getErr := fs.Get(ctx, p, &fs.GetArgs{NoLog: true})
+	if getErr == nil && remote != nil {
+		if ProviderOperationSourceMatches(op, remote) {
+			return providerOperationRemoteMatch, remote, nil
+		}
+		// Confirm a mismatch with the refreshed parent view.
+	} else if getErr != nil && !errs.IsObjectNotFound(getErr) {
+		return providerOperationRemoteInconclusive, nil, getErr
+	}
+
+	objs, listErr := fs.List(ctx, path.Dir(p), &fs.ListArgs{Refresh: true, NoLog: true})
+	if listErr != nil {
+		if errs.IsObjectNotFound(listErr) {
+			return providerOperationRemoteAbsent, nil, nil
+		}
+		return providerOperationRemoteInconclusive, nil, listErr
+	}
+	remote = exactRemoteByName(objs, path.Base(p))
+	if remote == nil {
+		return providerOperationRemoteAbsent, nil, nil
+	}
+	if ProviderOperationSourceMatches(op, remote) {
+		return providerOperationRemoteMatch, remote, nil
+	}
+	if op.SourceIsDir && (op.SourceObjectID == "" || remote.GetID() == "") {
+		return providerOperationRemoteInconclusive, remote, nil
+	}
+	if !op.SourceIsDir && op.SourceSHA1 == "" && op.SourceObjectID == "" {
+		return providerOperationRemoteInconclusive, remote, nil
+	}
+	return providerOperationRemoteMismatch, remote, nil
+}
+
+func ProviderOperationSourceRecreated(ctx context.Context, op *model.WebDAVProviderOperation) (bool, error) {
+	state, _, err := providerOperationSourcePathState(ctx, op)
+	return state == providerOperationRemoteMismatch, err
+}
+
 func providerOperationRecoveryDecision(method, state string, dstState, srcState providerOperationRemoteState, sourceIsDir bool) ProviderOperationRecovery {
 	method = strings.ToUpper(method)
 	if state == ProviderOperationPrepared {
@@ -497,12 +540,26 @@ func providerOperationRecoveryDecision(method, state string, dstState, srcState 
 	if method != ProviderOperationMove {
 		return ProviderOperationInconclusive
 	}
+	if state == ProviderOperationApplied {
+		if dstState == providerOperationRemoteMatch {
+			return ProviderOperationRecovered
+		}
+		return ProviderOperationInconclusive
+	}
 	switch srcState {
 	case providerOperationRemoteMismatch:
-		// The source path now contains a different object, so this intent is
-		// stale and must not suppress a new MOVE.
-		return ProviderOperationNotApplied
-	case providerOperationRemoteMatch, providerOperationRemoteInconclusive:
+		// A different object can legitimately reappear at the source after the
+		// old MOVE succeeded. A matching destination proves the old payload was
+		// moved; otherwise the old intent is safe to retry only after the normal
+		// not-applied confirmation fence.
+		if dstState == providerOperationRemoteMatch {
+			return ProviderOperationRecovered
+		}
+		if dstState == providerOperationRemoteAbsent || dstState == providerOperationRemoteMismatch {
+			return ProviderOperationNotApplied
+		}
+		return ProviderOperationInconclusive
+	case providerOperationRemoteMatch:
 		if dstState == providerOperationRemoteAbsent || dstState == providerOperationRemoteMismatch {
 			return ProviderOperationNotApplied
 		}
@@ -527,12 +584,159 @@ func RecoverProviderOperation(ctx context.Context, op *model.WebDAVProviderOpera
 	}
 	srcState := providerOperationRemoteInconclusive
 	if strings.EqualFold(op.Method, ProviderOperationMove) {
-		srcState, _, err = providerOperationPathState(ctx, op.SourcePath, op)
+		srcState, _, err = providerOperationSourcePathState(ctx, op)
 		if err != nil {
 			return ProviderOperationInconclusive, dstObj, err
 		}
 	}
 	return providerOperationRecoveryDecision(op.Method, op.State, dstState, srcState, op.SourceIsDir), dstObj, nil
+}
+
+func providerOperationRecoveryLabel(recovery ProviderOperationRecovery) string {
+	switch recovery {
+	case ProviderOperationNotApplied:
+		return "not_applied"
+	case ProviderOperationRecovered:
+		return "recovered"
+	default:
+		return "inconclusive"
+	}
+}
+
+func providerOperationConfirmationDelay() time.Duration {
+	seconds := 1
+	if conf.Conf != nil && conf.Conf.WebDAVWriteback.VerifyIntervalSeconds > 0 {
+		seconds = conf.Conf.WebDAVWriteback.VerifyIntervalSeconds
+	}
+	if seconds > 2 {
+		seconds = 2
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// ObserveProviderOperationRecovery persists recovery evidence. A STARTED
+// operation needs two separated "not applied" observations before WebDAV may
+// execute the provider mutation again; one stale 115 view is never sufficient.
+func ObserveProviderOperationRecovery(op *model.WebDAVProviderOperation, recovery ProviderOperationRecovery, checkErr error) (bool, error) {
+	if op == nil || op.ID == 0 {
+		return recovery != ProviderOperationInconclusive && checkErr == nil, nil
+	}
+	now := time.Now()
+	label := providerOperationRecoveryLabel(recovery)
+	lastError := ""
+	if checkErr != nil {
+		label = providerOperationRecoveryLabel(ProviderOperationInconclusive)
+		lastError = checkErr.Error()
+		recovery = ProviderOperationInconclusive
+	}
+
+	confirmed := recovery != ProviderOperationInconclusive
+	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		var locked model.WebDAVProviderOperation
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&locked, op.ID).Error; err != nil {
+			return err
+		}
+
+		count := 1
+		sameObservation := locked.LastRecovery == label
+		if sameObservation {
+			count = locked.RecoveryCount + 1
+		}
+		if recovery == ProviderOperationNotApplied && locked.State == ProviderOperationStarted {
+			confirmed = sameObservation &&
+				locked.RecoveryCount >= 1 &&
+				locked.LastCheckedAt != nil &&
+				now.Sub(*locked.LastCheckedAt) >= providerOperationConfirmationDelay()
+		}
+
+		if err := tx.Model(&model.WebDAVProviderOperation{}).Where("id = ?", locked.ID).Updates(map[string]any{
+			"recovery_count": count,
+			"last_recovery":  label,
+			"last_error":     lastError,
+			"last_checked_at": &now,
+		}).Error; err != nil {
+			return err
+		}
+		op.RecoveryCount = count
+		op.LastRecovery = label
+		op.LastError = lastError
+		op.LastCheckedAt = &now
+		return nil
+	})
+	return confirmed, err
+}
+
+func providerOperationSourceSuperseded(op *model.WebDAVProviderOperation) (bool, error) {
+	if op == nil {
+		return false, nil
+	}
+	current, err := getByPath(op.SourcePath)
+	if err != nil {
+		return false, err
+	}
+	if op.SourceGeneration == 0 {
+		return current != nil && current.State != StateDeleted, nil
+	}
+	if current == nil {
+		return true, nil
+	}
+	return current.Generation != op.SourceGeneration || current.State == StateDeleted, nil
+}
+
+func applyProviderOperationDestinationRoot(op *model.WebDAVProviderOperation) error {
+	if op == nil {
+		return nil
+	}
+	now := time.Now()
+	source := ProviderOperationSourceObject(op)
+	return db.GetDb().Transaction(func(tx *gorm.DB) error {
+		var dst model.WebDAVWritebackObject
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("path_key = ?", pathKey(op.DestinationPath)).First(&dst).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err == nil && !dst.UpdatedAt.IsZero() && !op.CreatedAt.IsZero() && dst.UpdatedAt.After(op.CreatedAt) {
+			expected := providerOperationExpectedRow(op)
+			if compareRemoteContent(expected, toObject(&dst), false) != remoteContentMatch {
+				return ErrProviderOperationStale
+			}
+		}
+		setProviderCompletedRoot(&dst, op.DestinationPath, source, now)
+		if dst.ID == 0 {
+			return tx.Create(&dst).Error
+		}
+		return tx.Save(&dst).Error
+	})
+}
+
+// ReconcileProviderOperationMetadata binds metadata recovery to the source
+// generation captured before provider mutation. If that source was superseded,
+// file operations can safely restore only the destination root from the durable
+// snapshot; directory trees remain blocked rather than touching newer children.
+func ReconcileProviderOperationMetadata(op *model.WebDAVProviderOperation) error {
+	if op == nil {
+		return nil
+	}
+	if applied, err := ProviderOperationMetadataApplied(op); err != nil || applied {
+		return err
+	}
+	superseded, err := providerOperationSourceSuperseded(op)
+	if err != nil {
+		return err
+	}
+	if superseded {
+		if op.SourceIsDir {
+			return ErrProviderOperationStale
+		}
+		return applyProviderOperationDestinationRoot(op)
+	}
+
+	sourceRoot := ProviderOperationSourceObject(op)
+	if strings.EqualFold(op.Method, ProviderOperationMove) {
+		return MoveTreeMetadata(op.SourcePath, op.DestinationPath, sourceRoot)
+	}
+	return CopyTreeMetadata(op.SourcePath, op.DestinationPath, sourceRoot)
 }
 
 func ProviderOperationMetadataApplied(op *model.WebDAVProviderOperation) (bool, error) {
@@ -559,9 +763,19 @@ func ProviderOperationMetadataApplied(op *model.WebDAVProviderOperation) (bool, 
 		if err != nil {
 			return false, err
 		}
-		if src == nil || src.State != StateDeleted {
+		if op.SourceGeneration > 0 {
+			// A tombstone from the old move or any newer source generation means
+			// the old source must no longer be mutated by this intent. With a
+			// matching destination above, the old operation is converged.
+			if src == nil || src.Generation > op.SourceGeneration {
+				return true, nil
+			}
 			return false, nil
 		}
+		if src == nil || src.State == StateDeleted {
+			return true, nil
+		}
+		return false, nil
 	}
 	return true, nil
 }

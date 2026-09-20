@@ -725,66 +725,62 @@ func recoverProviderCopyMove(ctx context.Context, method, src, dst string, depth
 	if err != nil || op == nil {
 		return 0, false, err
 	}
-	if currentSource != nil && !writeback.ProviderOperationSourceMatches(op, currentSource) {
-		// The source changed after an older intent. That intent must not suppress
-		// a new client operation against the new source generation.
+	sourceChanged := currentSource != nil && !writeback.ProviderOperationSourceMatches(op, currentSource)
+
+	if applied, appliedErr := writeback.ProviderOperationMetadataApplied(op); appliedErr != nil {
+		return http.StatusServiceUnavailable, true, appliedErr
+	} else if applied {
+		_ = writeback.FinishProviderOperation(op.ID)
+		if sourceChanged {
+			return 0, false, nil
+		}
+		return providerOperationResponseStatus(op), true, nil
+	}
+
+	// PREPARED is durable proof that this process never reached the provider
+	// mutation call. It is safe to retire immediately and start the request.
+	if op.State == writeback.ProviderOperationPrepared {
 		if finishErr := writeback.FinishProviderOperation(op.ID); finishErr != nil {
 			return http.StatusServiceUnavailable, true, finishErr
 		}
 		return 0, false, nil
 	}
 
-	if strings.EqualFold(method, writeback.ProviderOperationCopy) {
-		if applied, appliedErr := writeback.ProviderOperationMetadataApplied(op); appliedErr != nil {
-			return http.StatusServiceUnavailable, true, appliedErr
-		} else if applied {
-			_ = writeback.FinishProviderOperation(op.ID)
-			return providerOperationResponseStatus(op), true, nil
-		}
-	}
-
 	recovery, _, recoveryErr := writeback.RecoverProviderOperation(ctx, op)
-	if recoveryErr != nil {
+	confirmed, observeErr := writeback.ObserveProviderOperationRecovery(op, recovery, recoveryErr)
+	if observeErr != nil {
+		return http.StatusServiceUnavailable, true, observeErr
+	}
+	if recoveryErr != nil || recovery == writeback.ProviderOperationInconclusive {
 		return http.StatusServiceUnavailable, true, recoveryErr
 	}
-	switch recovery {
-	case writeback.ProviderOperationNotApplied:
-		if op.State == writeback.ProviderOperationApplied {
-			// An already-finished intent now points at a different/recreated
-			// source. Retire it before starting a fresh client operation.
-			if finishErr := writeback.FinishProviderOperation(op.ID); finishErr != nil {
-				return http.StatusServiceUnavailable, true, finishErr
-			}
+	if recovery == writeback.ProviderOperationNotApplied {
+		if !confirmed {
+			return http.StatusServiceUnavailable, true, nil
+		}
+		if finishErr := writeback.FinishProviderOperation(op.ID); finishErr != nil {
+			return http.StatusServiceUnavailable, true, finishErr
 		}
 		return 0, false, nil
-	case writeback.ProviderOperationInconclusive:
-		return http.StatusServiceUnavailable, true, nil
 	}
 
-	if strings.EqualFold(method, writeback.ProviderOperationMove) {
-		if applied, appliedErr := writeback.ProviderOperationMetadataApplied(op); appliedErr != nil {
-			return http.StatusServiceUnavailable, true, appliedErr
-		} else if applied {
-			_ = writeback.FinishProviderOperation(op.ID)
-			return providerOperationResponseStatus(op), true, nil
-		}
-	}
-
-	sourceRoot := currentSource
-	if sourceRoot == nil {
-		sourceRoot = writeback.ProviderOperationSourceObject(op)
-	}
-	reconcile := func() error {
-		if strings.EqualFold(method, writeback.ProviderOperationMove) {
-			return writeback.MoveTreeMetadata(src, dst, sourceRoot)
-		}
-		return writeback.CopyTreeMetadata(src, dst, sourceRoot)
-	}
-	if reconcileErr := retryMetadataReconciliation(ctx, reconcile); reconcileErr != nil {
+	if reconcileErr := retryMetadataReconciliation(ctx, func() error {
+		return writeback.ReconcileProviderOperationMetadata(op)
+	}); reconcileErr != nil {
 		return http.StatusServiceUnavailable, true, reconcileErr
 	}
 	if finishErr := writeback.FinishProviderOperation(op.ID); finishErr != nil {
 		log.Warnf("provider %s metadata reconciled but intent cleanup failed for %s -> %s: %v", method, src, dst, finishErr)
+	}
+	if sourceChanged {
+		// The old intent is now safely converged; continue this request against
+		// the newer source instead of consuming it as the old retry.
+		return 0, false, nil
+	}
+	if strings.EqualFold(method, writeback.ProviderOperationMove) {
+		if recreated, recreateErr := writeback.ProviderOperationSourceRecreated(ctx, op); recreateErr == nil && recreated {
+			return 0, false, nil
+		}
 	}
 	return providerOperationResponseStatus(op), true, nil
 }

@@ -58,17 +58,17 @@ func TestProviderOperationSourceMatchesCanonicalGeneration(t *testing.T) {
 	op := &model.WebDAVProviderOperation{
 		SourceIsDir:      false,
 		SourceGeneration: 7,
-		SourceETag:       ""olwb-generation-7"",
+		SourceETag:       "\"olwb-generation-7\"",
 		SourceSize:       1024,
 	}
 	source := &CanonicalObject{
 		Object: model.Object{Size: 1024},
-		etag:   ""olwb-generation-7"",
+		etag:   "\"olwb-generation-7\"",
 	}
 	if !ProviderOperationSourceMatches(op, source) {
 		t.Fatal("matching canonical generation ETag should retain the intent")
 	}
-	source.etag = ""olwb-generation-8""
+	source.etag = "\"olwb-generation-8\""
 	if ProviderOperationSourceMatches(op, source) {
 		t.Fatal("a newer canonical generation must supersede the old intent source")
 	}
@@ -95,6 +95,37 @@ func TestProviderOperationSourceMatches(t *testing.T) {
 	source.HashInfo = utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40))
 	if ProviderOperationSourceMatches(op, source) {
 		t.Fatal("changed source content must invalidate a stale provider intent")
+	}
+}
+
+func TestProviderOperationNotAppliedConfirmationNeedsTwoObservations(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyIntervalSeconds: 2}}
+	defer func() { conf.Conf = oldConf }()
+
+	if got := providerOperationConfirmationDelay(); got != 2*time.Second {
+		t.Fatalf("provider operation confirmation delay = %v, want 2s", got)
+	}
+}
+
+func TestProviderOperationRecoveryDecisionMoveRecreate(t *testing.T) {
+	if got := providerOperationRecoveryDecision(
+		ProviderOperationMove,
+		ProviderOperationStarted,
+		providerOperationRemoteMatch,
+		providerOperationRemoteMismatch,
+		false,
+	); got != ProviderOperationRecovered {
+		t.Fatalf("MOVE with recreated source and matching destination = %v, want recovered", got)
+	}
+	if got := providerOperationRecoveryDecision(
+		ProviderOperationMove,
+		ProviderOperationApplied,
+		providerOperationRemoteMatch,
+		providerOperationRemoteMatch,
+		false,
+	); got != ProviderOperationRecovered {
+		t.Fatalf("APPLIED MOVE with lagging source visibility = %v, want recovered", got)
 	}
 }
 
