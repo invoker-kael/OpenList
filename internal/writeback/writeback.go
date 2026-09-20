@@ -2614,6 +2614,106 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 	return nil
 }
 
+const providerOperationPreparedAbandonAfter = 30 * time.Second
+
+func providerOperationPreparedExpired(op *model.WebDAVProviderOperation, now time.Time) bool {
+	if op == nil || op.State != ProviderOperationPrepared {
+		return false
+	}
+	stamp := op.UpdatedAt
+	if stamp.IsZero() {
+		stamp = op.CreatedAt
+	}
+	return !stamp.IsZero() && !now.Before(stamp.Add(providerOperationPreparedAbandonAfter))
+}
+
+func recordProviderOperationError(id uint, err error) {
+	if id == 0 || err == nil {
+		return
+	}
+	now := time.Now()
+	_ = db.GetDb().Model(&model.WebDAVProviderOperation{}).Where("id = ?", id).Updates(map[string]any{
+		"last_error":      err.Error(),
+		"last_checked_at": &now,
+	}).Error
+}
+
+func (m *workerManager) maintainProviderOperations() {
+	var ops []model.WebDAVProviderOperation
+	if err := db.GetDb().Order("updated_at asc").Limit(64).Find(&ops).Error; err != nil {
+		log.Errorf("write-back provider operation scan failed: %v", err)
+		return
+	}
+	if len(ops) == 0 {
+		return
+	}
+
+	now := time.Now()
+	recovered := 0
+	retired := 0
+	for i := range ops {
+		op := &ops[i]
+		if applied, err := ProviderOperationMetadataApplied(op); err != nil {
+			recordProviderOperationError(op.ID, err)
+			continue
+		} else if applied {
+			if err := FinishProviderOperation(op.ID); err != nil {
+				recordProviderOperationError(op.ID, err)
+			} else {
+				retired++
+			}
+			continue
+		}
+
+		if providerOperationPreparedExpired(op, now) {
+			if err := FinishProviderOperation(op.ID); err != nil {
+				recordProviderOperationError(op.ID, err)
+			} else {
+				retired++
+			}
+			continue
+		}
+
+		recovery, _, recoveryErr := RecoverProviderOperation(m.ctx, op)
+		confirmed, observeErr := ObserveProviderOperationRecovery(op, recovery, recoveryErr)
+		if observeErr != nil {
+			recordProviderOperationError(op.ID, observeErr)
+			continue
+		}
+		if recoveryErr != nil || recovery == ProviderOperationInconclusive {
+			continue
+		}
+
+		switch recovery {
+		case ProviderOperationNotApplied:
+			if !confirmed {
+				continue
+			}
+			// Two separated provider observations agree that the started
+			// mutation did not take effect. Retire the stale fence so a later
+			// client request can safely prepare a new operation.
+			if err := FinishProviderOperation(op.ID); err != nil {
+				recordProviderOperationError(op.ID, err)
+			} else {
+				retired++
+			}
+		case ProviderOperationRecovered:
+			if err := ReconcileProviderOperationMetadata(op); err != nil {
+				recordProviderOperationError(op.ID, err)
+				continue
+			}
+			if err := FinishProviderOperation(op.ID); err != nil {
+				recordProviderOperationError(op.ID, err)
+				continue
+			}
+			recovered++
+		}
+	}
+	if recovered > 0 || retired > 0 {
+		log.Infof("write-back provider operation maintenance: recovered=%d retired=%d pending=%d", recovered, retired, len(ops)-recovered-retired)
+	}
+}
+
 var (
 	managerMu      sync.Mutex
 	manager        *workerManager
@@ -2696,6 +2796,7 @@ func Start() {
 		if err := m.recoverInterrupted(); err != nil {
 			log.Errorf("write-back recovery failed: %v", err)
 		}
+		m.maintainProviderOperations()
 		m.cleanupOrphans()
 		workers := max(1, conf.Conf.WebDAVWriteback.Workers)
 		for i := 0; i < workers; i++ {
@@ -2761,6 +2862,7 @@ func (m *workerManager) scheduler() {
 		case <-m.wake:
 		case <-ticker.C:
 		case <-cleanupTicker.C:
+			m.maintainProviderOperations()
 			m.cleanupCompleted()
 		}
 	}

@@ -98,6 +98,31 @@ func TestProviderOperationSourceMatches(t *testing.T) {
 	}
 }
 
+func TestProviderOperationPreparedExpiry(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-providerOperationPreparedAbandonAfter - time.Second)
+	fresh := now.Add(-providerOperationPreparedAbandonAfter + time.Second)
+
+	if !providerOperationPreparedExpired(&model.WebDAVProviderOperation{
+		State:     ProviderOperationPrepared,
+		UpdatedAt: old,
+	}, now) {
+		t.Fatal("old PREPARED intent should be retired")
+	}
+	if providerOperationPreparedExpired(&model.WebDAVProviderOperation{
+		State:     ProviderOperationPrepared,
+		UpdatedAt: fresh,
+	}, now) {
+		t.Fatal("fresh PREPARED intent must not race the request that is starting it")
+	}
+	if providerOperationPreparedExpired(&model.WebDAVProviderOperation{
+		State:     ProviderOperationStarted,
+		UpdatedAt: old,
+	}, now) {
+		t.Fatal("STARTED intent must never be age-deleted without provider evidence")
+	}
+}
+
 func TestProviderOperationNotAppliedConfirmationNeedsTwoObservations(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyIntervalSeconds: 2}}
