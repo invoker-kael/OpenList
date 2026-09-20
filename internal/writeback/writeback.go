@@ -120,6 +120,58 @@ func Canonical(p string) (obj model.Obj, found bool, deleted bool, err error) {
 	return toObject(row), true, false, nil
 }
 
+// ReconcileDirect confirms that a completed canonical object whose local
+// cache is gone has not disappeared from the provider. 115 single-object Get
+// can transiently lie, so a miss/type mismatch is only trusted after a
+// force-refreshed exact-name parent listing agrees.
+func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
+	if !Enabled() {
+		return false, nil
+	}
+	row, err := getByPath(p)
+	if err != nil || row == nil || row.State != StateCompleted || row.SpoolPath != "" {
+		return false, err
+	}
+	if row.IsDir && !directoryShadowExpired(row, time.Now()) {
+		return false, nil
+	}
+
+	remote, getErr := fs.Get(ctx, row.Path, &fs.GetArgs{NoLog: true})
+	if getErr == nil && remote != nil && remote.IsDir() == row.IsDir {
+		return false, nil
+	}
+	if getErr != nil && !errs.IsObjectNotFound(getErr) {
+		return false, nil
+	}
+
+	objs, listErr := fs.List(ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	if listErr != nil {
+		return false, nil
+	}
+	for _, obj := range objs {
+		if obj.GetName() != row.Name {
+			continue
+		}
+		if obj.IsDir() == row.IsDir {
+			return false, nil
+		}
+		// The name exists with the wrong resource type. Stop shadowing it so
+		// Cloud Sync can observe the real provider conflict.
+		res := db.GetDb().
+			Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
+			Delete(&model.WebDAVWritebackObject{})
+		return false, res.Error
+	}
+
+	res := db.GetDb().
+		Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
+		Delete(&model.WebDAVWritebackObject{})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
+}
+
 func shouldDropCanonicalAfterRemoteList(row *model.WebDAVWritebackObject, remoteReliable, remotePresent bool) bool {
 	return remoteReliable &&
 		!row.IsDir &&
@@ -650,7 +702,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		}
 		return false, false, err
 	}
-	if srcRow.IsDir || srcRow.State == StateDeleted || srcRow.State == StateCompleted {
+	if srcRow.IsDir || srcRow.State == StateDeleted || srcRow.SpoolPath == "" {
 		return false, false, nil
 	}
 
@@ -661,7 +713,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).First(&lockedSrc).Error; err != nil {
 			return err
 		}
-		if lockedSrc.IsDir || lockedSrc.State == StateDeleted || lockedSrc.State == StateCompleted {
+		if lockedSrc.IsDir || lockedSrc.State == StateDeleted || lockedSrc.SpoolPath == "" {
 			return gorm.ErrRecordNotFound
 		}
 
