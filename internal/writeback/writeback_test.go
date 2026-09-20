@@ -1221,6 +1221,89 @@ func TestSetProviderCompletedRoot(t *testing.T) {
 	}
 }
 
+func TestCloudSyncRemoteVerificationEvidencePolicy(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	row := &model.WebDAVWritebackObject{
+		Size:        8192,
+		PayloadSHA1: sha,
+	}
+	matching := &model.Object{
+		Size:     row.Size,
+		HashInfo: utils.NewHashInfo(utils.SHA1, sha),
+	}
+	missingHash := &model.Object{Size: row.Size}
+	wrongHash := &model.Object{
+		Size:     row.Size,
+		HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40)),
+	}
+
+	tests := []struct {
+		name        string
+		remote      model.Obj
+		err         error
+		requireHash bool
+		want        remoteVerificationState
+	}{
+		{name: "exact 115 object converges", remote: matching, requireHash: true, want: remoteVerificationMatch},
+		{name: "115 missing sha1 stays inconclusive", remote: missingHash, requireHash: true, want: remoteVerificationInconclusive},
+		{name: "provider error stays inconclusive", err: errors.New("temporary provider outage"), requireHash: true, want: remoteVerificationInconclusive},
+		{name: "fresh confirmed absence is divergent", remote: nil, err: nil, requireHash: true, want: remoteVerificationDivergent},
+		{name: "wrong sha1 is divergent", remote: wrongHash, requireHash: true, want: remoteVerificationDivergent},
+		{name: "hashless provider can converge by size", remote: missingHash, requireHash: false, want: remoteVerificationMatch},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyRemoteVerification(row, tt.remote, tt.err, tt.requireHash); got != tt.want {
+				t.Fatalf("classifyRemoteVerification()=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCloudSyncInconclusiveVerificationNeverConsumesReuploadBudget(t *testing.T) {
+	count := 0
+	for i := 0; i < 100; i++ {
+		var retry bool
+		count, retry = advanceRemoteVerification(remoteVerificationInconclusive, count, 3)
+		if retry {
+			t.Fatalf("inconclusive observation %d unexpectedly requested provider reupload", i+1)
+		}
+	}
+	if count != 0 {
+		t.Fatalf("inconclusive observations consumed divergence budget: %d", count)
+	}
+
+	for i := 0; i < 2; i++ {
+		var retry bool
+		count, retry = advanceRemoteVerification(remoteVerificationDivergent, count, 3)
+		if retry {
+			t.Fatalf("divergence %d retried before configured threshold", i+1)
+		}
+	}
+	count, retry := advanceRemoteVerification(remoteVerificationDivergent, count, 3)
+	if !retry || count != 3 {
+		t.Fatalf("three conclusive divergences should permit one repair upload: count=%d retry=%v", count, retry)
+	}
+}
+
+func TestRemoteVerificationInconclusiveDelayReducesProviderPolling(t *testing.T) {
+	oldConf := conf.Conf
+	defer func() { conf.Conf = oldConf }()
+
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{
+		VerifyIntervalSeconds: 5,
+		RetryInitialSeconds:   30,
+	}}
+	if got := remoteVerificationInconclusiveDelay(); got != 30*time.Second {
+		t.Fatalf("default inconclusive delay=%v, want 30s", got)
+	}
+
+	conf.Conf.WebDAVWriteback.VerifyIntervalSeconds = 60
+	if got := remoteVerificationInconclusiveDelay(); got != 60*time.Second {
+		t.Fatalf("long configured verify interval=%v, want 60s", got)
+	}
+}
+
 func TestRemoteMatchesCanonical(t *testing.T) {
 	wantSHA1 := strings.Repeat("a", 40)
 	row := &model.WebDAVWritebackObject{

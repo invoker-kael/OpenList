@@ -4220,6 +4220,56 @@ func remoteMatchesCanonical(row *model.WebDAVWritebackObject, remote model.Obj, 
 	return compareRemoteContent(row, remote, requireHash) == remoteContentMatch
 }
 
+type remoteVerificationState uint8
+
+const (
+	remoteVerificationInconclusive remoteVerificationState = iota
+	remoteVerificationMatch
+	remoteVerificationDivergent
+)
+
+func classifyRemoteVerification(row *model.WebDAVWritebackObject, remote model.Obj, verifyErr error, requireHash bool) remoteVerificationState {
+	if row == nil || verifyErr != nil {
+		return remoteVerificationInconclusive
+	}
+	// remoteForVerify returns nil,nil only after a force-refreshed parent
+	// listing succeeded and the exact name was absent. A direct NotFound or a
+	// failed refresh is returned as an error and therefore stays inconclusive.
+	if remote == nil {
+		return remoteVerificationDivergent
+	}
+	switch compareRemoteContent(row, remote, requireHash) {
+	case remoteContentMatch:
+		return remoteVerificationMatch
+	case remoteContentMismatch:
+		return remoteVerificationDivergent
+	default:
+		return remoteVerificationInconclusive
+	}
+}
+
+func advanceRemoteVerification(state remoteVerificationState, current, attempts int) (next int, retryUpload bool) {
+	if state != remoteVerificationDivergent {
+		return current, false
+	}
+	next = current + 1
+	return next, next >= max(1, attempts)
+}
+
+func remoteVerificationInconclusiveDelay() time.Duration {
+	verifySeconds := 1
+	retrySeconds := 1
+	if conf.Conf != nil {
+		verifySeconds = max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)
+		retrySeconds = max(1, conf.Conf.WebDAVWriteback.RetryInitialSeconds)
+	}
+	// Inconclusive evidence cannot justify another upload. Poll it less
+	// aggressively than the normal post-upload visibility window while keeping
+	// a bounded cadence for providers that eventually populate hashes.
+	seconds := max(verifySeconds, min(retrySeconds, 30))
+	return time.Duration(seconds) * time.Second
+}
+
 func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model.Obj, error) {
 	requireHash := providerRequiresPayloadHash(row.Path)
 	remote, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true})
@@ -4227,24 +4277,19 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model
 		return remote, nil
 	}
 
-	// 115 Open can briefly return NotFound or zero/incomplete metadata from
-	// single-object lookup immediately after upload while the parent listing is
-	// already correct. Force-refresh the parent and match the exact name/size
-	// before deciding that the upload failed.
+	// A direct 115 miss/mismatch is never destructive evidence by itself.
+	// Force-refresh the parent. If that refresh fails, return its error instead
+	// of leaking an earlier direct NotFound/mismatch into the retry budget.
 	objs, listErr := fs.List(m.ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
-	if listErr == nil {
-		if obj := exactRemoteByName(objs, row.Name); obj != nil && remoteMatchesCanonical(row, obj, requireHash) {
-			return obj, nil
-		}
-	}
-
-	if getErr != nil {
-		return nil, getErr
-	}
-	if listErr != nil && remote == nil {
+	if listErr != nil {
 		return nil, listErr
 	}
-	return remote, nil
+	if obj := exactRemoteByName(objs, row.Name); obj != nil {
+		return obj, nil
+	}
+	// A successful refreshed parent listing with no exact name is the only
+	// absence representation consumed by classifyRemoteVerification.
+	return nil, nil
 }
 
 type remoteVerificationEvidence struct {
@@ -4311,14 +4356,35 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 
 	requireHash := providerRequiresPayloadHash(row.Path)
 	remote, err := m.remoteForVerify(row)
-	if err == nil && remoteMatchesCanonical(row, remote, requireHash) {
+	verification := classifyRemoteVerification(row, remote, err, requireHash)
+	if verification == remoteVerificationMatch {
 		m.completeRemoteVerification(row, remote, []string{StateVerifying})
 		return
 	}
 
+	if verification == remoteVerificationInconclusive {
+		next := time.Now().Add(remoteVerificationInconclusiveDelay())
+		msg := "remote verification is inconclusive; keeping canonical generation without reupload"
+		if err != nil {
+			msg = fmt.Sprintf("remote verification is inconclusive: %v", err)
+		} else if remote != nil && requireHash && remote.GetSize() == row.Size &&
+			remote.GetHash().GetHash(utils.SHA1) == "" {
+			msg = "remote size matches but required 115 SHA-1 is unavailable; keeping canonical generation without reupload"
+		}
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
+			Updates(map[string]any{
+				"state":        StateVerifying,
+				"retry_at":     &next,
+				"verify_count": row.VerifyCount,
+				"last_error":   msg,
+			}).Error
+		return
+	}
+
 	attempts := max(1, conf.Conf.WebDAVWriteback.VerifyAttempts)
-	nextCount := row.VerifyCount + 1
-	if nextCount >= attempts {
+	nextCount, retryUpload := advanceRemoteVerification(verification, row.VerifyCount, attempts)
+	if retryUpload {
 		next := time.Now().Add(retryDelay(row.RetryCount + 1))
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
@@ -4327,22 +4393,23 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 				"retry_at":     &next,
 				"retry_count":  row.RetryCount + 1,
 				"verify_count": 0,
-				"last_error":   "remote object did not become stable before verify timeout",
+				"last_error":   "fresh provider evidence stayed divergent through the verification window",
 			}).Error
 		return
 	}
+
 	interval := time.Duration(max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)) * time.Second
 	next := time.Now().Add(interval)
-	msg := "remote object is not stable yet"
-	if err != nil {
-		msg = err.Error()
-	} else if remote != nil {
+	msg := "remote object is absent from the refreshed provider listing"
+	if remote != nil {
 		remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
 		expectedSHA1 := canonicalContentSHA1(row)
-		if expectedSHA1 != "" && remoteSHA1 != "" && !strings.EqualFold(remoteSHA1, expectedSHA1) {
+		if remote.GetSize() != row.Size {
+			msg = fmt.Sprintf("remote size %d does not match canonical size %d", remote.GetSize(), row.Size)
+		} else if expectedSHA1 != "" && remoteSHA1 != "" && !strings.EqualFold(remoteSHA1, expectedSHA1) {
 			msg = fmt.Sprintf("remote sha1 %s does not match canonical sha1 %s", remoteSHA1, expectedSHA1)
 		} else {
-			msg = fmt.Sprintf("remote size %d does not match canonical size %d", remote.GetSize(), row.Size)
+			msg = "refreshed provider metadata is conclusively divergent from canonical content"
 		}
 	}
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).

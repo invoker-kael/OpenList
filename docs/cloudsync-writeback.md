@@ -103,6 +103,8 @@ A **single** 115 absence, type mismatch, size mismatch or SHA-1 mismatch is no l
 
 During successful provider directory listings, if a tracked object is `COMPLETED`, its spool payload has already been released, and the provider continues to omit or disagree with that object across the separated confirmation window, the canonical row is removed. The next Cloud Sync scan then observes the confirmed remote divergence and repairs it from the NAS.
 
+Post-upload verification now separates **match**, **conclusive divergence**, and **inconclusive provider evidence**. Only a successful refreshed parent listing that proves absence, or refreshed size/SHA-1 metadata that proves different content, consumes the retry budget that can eventually schedule another provider upload. A direct 115 NotFound followed by a failed refresh, a provider/network error, or a same-size 115 object whose SHA-1 is temporarily missing stays in `VERIFYING` and cannot consume the re-upload budget. Inconclusive checks use a slower bounded polling cadence (30 seconds with the default configuration) rather than the five-second normal visibility cadence. This prevents an unavailable 115 hash or transient API failure from turning a successful encrypted upload into an infinite upload loop.
+
 A failed provider listing never triggers this cleanup, so a temporary network/provider outage cannot turn into a mass re-upload.
 
 
@@ -156,7 +158,7 @@ PUT honors `If-Match` and `If-None-Match` and returns HTTP 412 when the entity-t
 
 ### 115 verification fallback
 
-The background upload verifier does not trust a single 115 object lookup by itself. If the object lookup is missing or returns incomplete metadata, the worker force-refreshes the parent directory. For 115 Open, verification now requires the exact encrypted payload size **and** the persisted payload SHA-1 returned by `Obj.GetHash()`; a same-size stale generation is therefore not accepted as the newly uploaded object, and a temporary 115 response with an empty SHA-1 is treated as incomplete metadata rather than a successful verification. Providers whose storage driver genuinely does not expose a content hash retain the size-based fallback. This prevents 115's post-upload metadata consistency window from turning either a successful upload into an unnecessary retry or an older same-size object into a false completion.
+The background upload verifier does not trust a single 115 object lookup by itself. If the object lookup is missing or returns incomplete metadata, the worker force-refreshes the parent directory. A direct NotFound or mismatch is never allowed to consume repair/re-upload attempts when that refreshed listing itself fails. For 115 Open, verification requires the exact encrypted payload size **and** the persisted payload SHA-1 returned by `Obj.GetHash()`; a same-size stale generation is therefore not accepted as the newly uploaded object. At the same time, a same-size object with a temporarily unavailable SHA-1 is explicitly **inconclusive**, not failed: OpenList preserves the canonical generation and durable spool and continues low-frequency verification without ever promoting that evidence to another upload. Providers whose storage driver genuinely does not expose a content hash retain the size-based fallback. This prevents 115's post-upload metadata consistency window from turning either a successful upload into an unnecessary retry loop or an older same-size object into a false completion.
 
 
 ## Cloud Sync rename, copy and delete compatibility
