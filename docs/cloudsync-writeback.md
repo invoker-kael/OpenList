@@ -30,7 +30,7 @@ PUT
 
 A successful PUT means the payload is durable in the local spool and its metadata is committed to the OpenList database. It does **not** mean the backing cloud has already finished uploading.
 
-Failed remote uploads retry in the background. Interrupted `UPLOADING` rows resume from `VERIFYING` after restart so an upload that reached the provider before a crash is not immediately duplicated.
+Failed remote uploads retry in the background. An interrupted `UPLOADING` row is deliberately re-queued from the durable spool after restart. This can duplicate a provider upload after a crash, but it avoids treating an older same-sized encrypted object as proof that the newest generation arrived. The remote write contract is therefore **at-least-once across crashes**, with the local canonical generation remaining authoritative to Cloud Sync.
 
 ## MySQL
 
@@ -64,9 +64,20 @@ For large Cloud Sync jobs, using SSD/NVMe for the spool is recommended. When fre
 
 - Repeated PROPFIND calls use canonical metadata instead of provider mtime/size.
 - GET/HEAD use the local payload while it is cached and fall back to the backing provider after cleanup.
-- A newer PUT increments the generation and invalidates an older in-flight upload.
+- A newer PUT increments the generation and invalidates an older in-flight upload. If the old upload finishes later at the same path, it is not deleted; the queued newer generation overwrites it next. Old remote paths are only cleaned when the object was moved or deleted.
 - DELETE creates an immediate WebDAV tombstone and removes the provider object asynchronously.
 - MOVE of a pending file updates the queued destination without requiring the provider object to exist first.
 - A successful provider MOVE updates canonical metadata for tracked descendants.
 
 This mode is intentionally optimized for **NAS -> OpenList -> cloud**. It does not attempt to propagate provider-side edits back to Synology Cloud Sync.
+
+
+## Failure model
+
+The write-back layer intentionally favors source correctness over avoiding duplicate provider traffic:
+
+- A WebDAV success is returned only after the payload and canonical row are durable locally.
+- Provider timestamps are never used as the Cloud Sync source-of-truth.
+- Same-size remote objects are not trusted after an ambiguous process crash; the spool payload is uploaded again.
+- A superseded upload to the same path is never followed by an eager delete, preventing an old worker from erasing the path while a newer generation is waiting.
+- Duplicate provider writes can occur after a crash. For one-way encrypted backup this is preferable to silently accepting the wrong generation.
