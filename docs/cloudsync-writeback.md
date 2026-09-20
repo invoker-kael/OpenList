@@ -63,7 +63,7 @@ For large Cloud Sync jobs, using SSD/NVMe for the spool is recommended. When fre
 ## Semantics
 
 - Repeated PROPFIND calls use canonical metadata instead of provider mtime/size.
-- GET/HEAD use the local payload while it is cached and fall back to the backing provider after cleanup.
+- GET/HEAD use the local payload while it is cached and fall back to the backing provider after cleanup. After the local completed cache has expired, a successful provider directory listing that no longer contains the object removes the stale canonical row so Cloud Sync can see the loss and upload it again.
 - A newer PUT increments the generation and invalidates an older in-flight upload. If the old upload finishes later at the same path, it is not deleted; the queued newer generation overwrites it next. Old remote paths are only cleaned when the object was moved or deleted.
 - DELETE creates an immediate WebDAV tombstone and removes the provider object asynchronously.
 - MOVE of a pending file updates the queued destination without requiring the provider object to exist first.
@@ -81,3 +81,12 @@ The write-back layer intentionally favors source correctness over avoiding dupli
 - Same-size remote objects are not trusted after an ambiguous process crash; the spool payload is uploaded again.
 - A superseded upload to the same path is never followed by an eager delete, preventing an old worker from erasing the path while a newer generation is waiting.
 - Duplicate provider writes can occur after a crash. For one-way encrypted backup this is preferable to silently accepting the wrong generation.
+
+
+### Remote-loss reconciliation
+
+Canonical metadata is retained after the local completed spool cache is released so provider-side mtime changes do not cause upload loops. That metadata is not allowed to hide a genuinely missing remote object forever.
+
+During a successful provider directory listing, if a tracked object is `COMPLETED`, its spool payload has already been released, and the provider no longer lists that name, the canonical row is removed. The next Cloud Sync scan then observes the object as missing and uploads the source again.
+
+A failed provider listing never triggers this cleanup, so a temporary network/provider outage cannot turn into a mass re-upload.
