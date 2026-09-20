@@ -561,8 +561,8 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 
 func TestReceivingPathReferenceCount(t *testing.T) {
 	p := "/encrypted/placeholder.bin"
-	release1 := beginReceiving(p)
-	release2 := beginReceiving(p)
+	_, release1 := beginReceiving(p)
+	_, release2 := beginReceiving(p)
 	if !isReceiving(p) {
 		t.Fatal("path should be marked receiving while PUTs are active")
 	}
@@ -574,6 +574,46 @@ func TestReceivingPathReferenceCount(t *testing.T) {
 	if isReceiving(p) {
 		t.Fatal("path should stop receiving after the final PUT finishes")
 	}
+}
+
+func TestReceivingCommitOrderKeepsNewerStartedPut(t *testing.T) {
+	p := "/encrypted/overlap.bin"
+	older, releaseOlder := beginReceiving(p)
+	newer, releaseNewer := beginReceiving(p)
+	defer releaseOlder()
+	defer releaseNewer()
+
+	if newer.lockCommit() {
+		newer.unlockCommit(false)
+		t.Fatal("newer PUT cannot be stale before any successful commit")
+	}
+	newer.unlockCommit(true)
+
+	if !older.lockCommit() {
+		older.unlockCommit(false)
+		t.Fatal("older PUT finishing after a committed newer PUT must be superseded")
+	}
+	older.unlockCommit(false)
+}
+
+func TestReceivingFailedNewerPutDoesNotSuppressOlderCommit(t *testing.T) {
+	p := "/encrypted/newer-fails.bin"
+	older, releaseOlder := beginReceiving(p)
+	newer, releaseNewer := beginReceiving(p)
+	defer releaseOlder()
+	defer releaseNewer()
+
+	if newer.lockCommit() {
+		newer.unlockCommit(false)
+		t.Fatal("newer PUT cannot begin stale")
+	}
+	newer.unlockCommit(false)
+
+	if older.lockCommit() {
+		older.unlockCommit(false)
+		t.Fatal("failed newer PUT must not suppress an older durable receiver")
+	}
+	older.unlockCommit(true)
 }
 
 func TestCanonicalDirectoryObject(t *testing.T) {

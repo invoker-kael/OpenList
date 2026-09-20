@@ -1539,11 +1539,24 @@ func spoolAdmissionRequired(floor, reserved, additional uint64) (uint64, bool) {
 	return required + additional, true
 }
 
+type receivingPathState struct {
+	active          int
+	latestCommitted uint64
+	commitMu        sync.Mutex
+}
+
+type receivingSession struct {
+	key      string
+	sequence uint64
+	state    *receivingPathState
+}
+
 var (
-	spaceMu          sync.Mutex
-	reservedIncoming uint64
-	receivingMu      sync.Mutex
-	receivingPaths   = make(map[string]int)
+	spaceMu           sync.Mutex
+	reservedIncoming  uint64
+	receivingMu       sync.Mutex
+	receivingSequence uint64
+	receivingPaths    = make(map[string]*receivingPathState)
 )
 
 type incomingReservation struct {
@@ -1661,27 +1674,53 @@ func reserveIncomingBytes(expected int64) (*incomingReservation, error) {
 	return reservation, nil
 }
 
-func beginReceiving(p string) func() {
+func beginReceiving(p string) (*receivingSession, func()) {
 	key := pathKey(p)
 	receivingMu.Lock()
-	receivingPaths[key]++
+	receivingSequence++
+	state := receivingPaths[key]
+	if state == nil {
+		state = &receivingPathState{}
+		receivingPaths[key] = state
+	}
+	state.active++
+	session := &receivingSession{
+		key:      key,
+		sequence: receivingSequence,
+		state:    state,
+	}
 	receivingMu.Unlock()
-	return func() {
+
+	return session, func() {
 		receivingMu.Lock()
-		if receivingPaths[key] <= 1 {
-			delete(receivingPaths, key)
-		} else {
-			receivingPaths[key]--
+		if current := receivingPaths[key]; current == state {
+			state.active--
+			if state.active <= 0 {
+				delete(receivingPaths, key)
+			}
 		}
 		receivingMu.Unlock()
 	}
+}
+
+func (s *receivingSession) lockCommit() bool {
+	s.state.commitMu.Lock()
+	return s.state.latestCommitted > s.sequence
+}
+
+func (s *receivingSession) unlockCommit(committed bool) {
+	if committed && s.sequence > s.state.latestCommitted {
+		s.state.latestCommitted = s.sequence
+	}
+	s.state.commitMu.Unlock()
 }
 
 func isReceiving(p string) bool {
 	key := pathKey(p)
 	receivingMu.Lock()
 	defer receivingMu.Unlock()
-	return receivingPaths[key] > 0
+	state := receivingPaths[key]
+	return state != nil && state.active > 0
 }
 
 func cloudSyncSettleDelay(size int64) time.Duration {
@@ -1758,7 +1797,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	p = utils.FixAndCleanPath(p)
 	modTimeProvided := !modTime.IsZero()
 	createTimeProvided := !createTime.IsZero()
-	releaseReceiving := beginReceiving(p)
+	receiveSession, releaseReceiving := beginReceiving(p)
 	defer releaseReceiving()
 	spoolDir := conf.Conf.WebDAVWriteback.SpoolDir
 	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
@@ -1815,6 +1854,24 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	duplicate := false
 	wakeDuplicate := false
 	settleAt := time.Now().Add(cloudSyncSettleDelay(actualSize))
+
+	// Same-path Cloud Sync retries can overlap. Serialize only the final canonical
+	// commit and preserve request-start order: if a later-started PUT has already
+	// committed, this older receiver must not manufacture a newer generation just
+	// because its larger body finished later.
+	if receiveSession.lockCommit() {
+		current, lookupErr := getByPath(p)
+		receiveSession.unlockCommit(false)
+		_ = os.Remove(finalName)
+		syncDir(spoolDir)
+		if lookupErr != nil {
+			return nil, false, lookupErr
+		}
+		if current == nil {
+			return nil, false, errors.New("superseded WebDAV PUT has no canonical successor")
+		}
+		return current, false, nil
+	}
 
 	err = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var row model.WebDAVWritebackObject
@@ -1910,6 +1967,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		saved = row
 		return nil
 	})
+	receiveSession.unlockCommit(err == nil)
 	if err != nil {
 		_ = os.Remove(finalName)
 		return nil, false, err
