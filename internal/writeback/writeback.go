@@ -629,10 +629,21 @@ func Stop() {
 }
 
 func (m *workerManager) recoverInterrupted() error {
+	// An UPLOADING row is ambiguous after a process crash: the provider may
+	// have accepted the payload even though we never durably recorded the
+	// transition to VERIFYING. Do not accept a same-sized pre-existing remote
+	// object as proof that this generation arrived. Re-queue the durable spool
+	// payload instead. Remote writes are therefore at-least-once across crashes,
+	// which is safer for one-way Cloud Sync than a false-positive completion.
 	now := time.Now()
 	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("state = ?", StateUploading).
-		Updates(map[string]any{"state": StateVerifying, "retry_at": &now, "verify_count": 0}).Error
+		Updates(map[string]any{
+			"state":        StateQueued,
+			"retry_at":     &now,
+			"verify_count": 0,
+			"last_error":   "re-queued after restart because upload completion was not durably confirmed",
+		}).Error
 }
 
 func (m *workerManager) scheduler() {
@@ -707,6 +718,16 @@ func (m *workerManager) process(id uint) {
 	}
 }
 
+func shouldRemoveStaleRemote(uploadedPath string, current *model.WebDAVWritebackObject) bool {
+	if current == nil {
+		return false
+	}
+	// A newer generation at the same path must win by being uploaded next.
+	// Removing the remote object here would create an avoidable visibility gap
+	// and can race with another worker/process writing the new generation.
+	return current.State == StateDeleted || current.Path != uploadedPath
+}
+
 func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	if row.SpoolPath == "" {
 		m.fail(row, errors.New("spool payload is missing"))
@@ -752,7 +773,9 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		return
 	}
 	if current.Generation != row.Generation || current.State == StateDeleted || current.Path != row.Path {
-		_ = fs.Remove(m.ctx, row.Path)
+		if shouldRemoveStaleRemote(row.Path, &current) {
+			_ = fs.Remove(m.ctx, row.Path)
+		}
 		if current.SpoolPath != row.SpoolPath {
 			removeSpoolIfUnreferenced(row.SpoolPath)
 		}
