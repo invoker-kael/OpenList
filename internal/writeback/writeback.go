@@ -198,24 +198,55 @@ func Canonical(p string) (obj model.Obj, found bool, deleted bool, err error) {
 	return toObject(row), true, false, nil
 }
 
-func remoteContentMatchesCanonical(row *model.WebDAVWritebackObject, remote model.Obj) bool {
-	if row == nil || remote == nil || remote.IsDir() != row.IsDir {
-		return false
+type remoteContentComparison uint8
+
+const (
+	remoteContentInconclusive remoteContentComparison = iota
+	remoteContentMatch
+	remoteContentMismatch
+)
+
+func compareRemoteContent(row *model.WebDAVWritebackObject, remote model.Obj, requireHash bool) remoteContentComparison {
+	if row == nil || remote == nil {
+		return remoteContentInconclusive
+	}
+	if remote.IsDir() != row.IsDir {
+		return remoteContentMismatch
 	}
 	if row.IsDir {
-		return true
+		return remoteContentMatch
 	}
 	if remote.GetSize() != row.Size {
-		return false
+		return remoteContentMismatch
 	}
 	expectedSHA1 := canonicalContentSHA1(row)
-	if expectedSHA1 != "" {
-		remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
-		if remoteSHA1 != "" && !strings.EqualFold(remoteSHA1, expectedSHA1) {
-			return false
+	if expectedSHA1 == "" {
+		return remoteContentMatch
+	}
+	remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
+	if remoteSHA1 == "" {
+		if requireHash {
+			return remoteContentInconclusive
+		}
+		return remoteContentMatch
+	}
+	if strings.EqualFold(remoteSHA1, expectedSHA1) {
+		return remoteContentMatch
+	}
+	return remoteContentMismatch
+}
+
+func remoteContentMatchesCanonical(row *model.WebDAVWritebackObject, remote model.Obj) bool {
+	return compareRemoteContent(row, remote, false) == remoteContentMatch
+}
+
+func exactRemoteByName(objs []model.Obj, name string) model.Obj {
+	for _, obj := range objs {
+		if obj != nil && obj.GetName() == name {
+			return obj
 		}
 	}
-	return true
+	return nil
 }
 
 func deleteCompletedCanonical(row *model.WebDAVWritebackObject) (bool, error) {
@@ -229,8 +260,11 @@ func deleteCompletedCanonical(row *model.WebDAVWritebackObject) (bool, error) {
 }
 
 // ReconcileDirect validates a completed canonical object after its local spool
-// cache is gone. Provider mtime is deliberately ignored; content identity is
-// based on resource type, size and SHA-1 when the provider exposes it.
+// cache is gone. A single-object provider lookup may prove an exact match, but
+// it is never allowed to prove a mismatch by itself: 115 can transiently return
+// size=0, missing hashes, stale type metadata, or NotFound after upload. Any
+// apparent mismatch is confirmed through one force-refreshed exact-name parent
+// listing before canonical metadata is dropped.
 func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	if !Enabled() {
 		return false, nil
@@ -243,18 +277,21 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 		return false, nil
 	}
 
+	requireHash := providerRequiresPayloadHash(row.Path)
 	remote, getErr := fs.Get(ctx, row.Path, &fs.GetArgs{NoLog: true})
-	if getErr == nil && remote != nil && remote.IsDir() == row.IsDir {
-		if !row.IsDir && remoteContentMatchesCanonical(row, remote) {
+	if getErr == nil && remote != nil {
+		if row.IsDir && remote.IsDir() {
+			// Once the directory consistency grace expires, a visible provider
+			// collection can take ownership of directory metadata immediately.
+			_, delErr := deleteCompletedCanonical(row)
+			return false, delErr
+		}
+		if !row.IsDir && compareRemoteContent(row, remote, requireHash) == remoteContentMatch {
 			return false, nil
 		}
-		// Expired directory shadows hand control back to the provider. For files,
-		// a known size/SHA1 mismatch exposes the real remote object so one-way
-		// Cloud Sync can repair it.
-		_, delErr := deleteCompletedCanonical(row)
-		return false, delErr
 	}
 	if getErr != nil && !errs.IsObjectNotFound(getErr) {
+		// Provider/network failures are not evidence of remote loss.
 		return false, nil
 	}
 
@@ -262,27 +299,35 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	if listErr != nil {
 		return false, nil
 	}
-	for _, obj := range objs {
-		if obj.GetName() != row.Name {
-			continue
-		}
-		if obj.IsDir() == row.IsDir {
-			if !row.IsDir && remoteContentMatchesCanonical(row, obj) {
-				return false, nil
-			}
-			_, delErr := deleteCompletedCanonical(row)
+	remote = exactRemoteByName(objs, row.Name)
+	if remote == nil {
+		dropped, delErr := deleteCompletedCanonical(row)
+		if delErr != nil {
 			return false, delErr
 		}
-		// The name exists with the wrong resource type.
+		return dropped, nil
+	}
+	if remote.IsDir() != row.IsDir {
+		_, delErr := deleteCompletedCanonical(row)
+		return false, delErr
+	}
+	if row.IsDir {
 		_, delErr := deleteCompletedCanonical(row)
 		return false, delErr
 	}
 
-	dropped, delErr := deleteCompletedCanonical(row)
-	if delErr != nil {
+	switch compareRemoteContent(row, remote, requireHash) {
+	case remoteContentMatch:
+		return false, nil
+	case remoteContentInconclusive:
+		// A refreshed 115 listing that still omits SHA-1 cannot prove either
+		// identity or loss. Keep canonical metadata and try again later instead
+		// of manufacturing a Cloud Sync repair upload.
+		return false, nil
+	default:
+		_, delErr := deleteCompletedCanonical(row)
 		return false, delErr
 	}
-	return dropped, nil
 }
 
 func shouldDropCanonicalAfterRemoteList(row *model.WebDAVWritebackObject, remoteReliable bool, remote model.Obj, now time.Time) bool {
@@ -296,7 +341,7 @@ func shouldDropCanonicalAfterRemoteList(row *model.WebDAVWritebackObject, remote
 	if remote == nil {
 		return true
 	}
-	return !remoteContentMatchesCanonical(row, remote)
+	return compareRemoteContent(row, remote, providerRequiresPayloadHash(row.Path)) == remoteContentMismatch
 }
 
 func canonicalShadowInGrace(row *model.WebDAVWritebackObject, now time.Time) bool {
@@ -2359,18 +2404,10 @@ func providerRequiresPayloadHash(p string) bool {
 }
 
 func remoteMatchesCanonical(row *model.WebDAVWritebackObject, remote model.Obj, requireHash bool) bool {
-	if row == nil || remote == nil || remote.IsDir() || remote.GetSize() != row.Size {
+	if row == nil || row.IsDir || remote == nil || remote.IsDir() {
 		return false
 	}
-	expectedSHA1 := canonicalContentSHA1(row)
-	if expectedSHA1 == "" {
-		return true
-	}
-	remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
-	if remoteSHA1 == "" {
-		return !requireHash
-	}
-	return strings.EqualFold(remoteSHA1, expectedSHA1)
+	return compareRemoteContent(row, remote, requireHash) == remoteContentMatch
 }
 
 func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model.Obj, error) {
@@ -2386,10 +2423,8 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model
 	// before deciding that the upload failed.
 	objs, listErr := fs.List(m.ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
 	if listErr == nil {
-		for _, obj := range objs {
-			if obj.GetName() == row.Name && remoteMatchesCanonical(row, obj, requireHash) {
-				return obj, nil
-			}
+		if obj := exactRemoteByName(objs, row.Name); obj != nil && remoteMatchesCanonical(row, obj, requireHash) {
+			return obj, nil
 		}
 	}
 

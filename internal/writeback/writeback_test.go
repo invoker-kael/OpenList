@@ -628,6 +628,52 @@ func TestRemoteContentMatchesCanonical(t *testing.T) {
 	}
 }
 
+func TestCompareRemoteContentRequires115HashForConclusiveMatch(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	row := &model.WebDAVWritebackObject{
+		Size:        8192,
+		PayloadSHA1: sha,
+	}
+
+	if got := compareRemoteContent(row, &model.Object{Size: 8192}, true); got != remoteContentInconclusive {
+		t.Fatalf("missing required SHA1 comparison = %v, want inconclusive", got)
+	}
+	if got := compareRemoteContent(row, &model.Object{Size: 8192}, false); got != remoteContentMatch {
+		t.Fatalf("non-hash provider comparison = %v, want match", got)
+	}
+	if got := compareRemoteContent(row, &model.Object{
+		Size:     8192,
+		HashInfo: utils.NewHashInfo(utils.SHA1, strings.ToUpper(sha)),
+	}, true); got != remoteContentMatch {
+		t.Fatalf("matching 115 SHA1 comparison = %v, want match", got)
+	}
+	if got := compareRemoteContent(row, &model.Object{
+		Size:     8192,
+		HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40)),
+	}, true); got != remoteContentMismatch {
+		t.Fatalf("wrong 115 SHA1 comparison = %v, want mismatch", got)
+	}
+	if got := compareRemoteContent(row, &model.Object{
+		Size:     0,
+		HashInfo: utils.NewHashInfo(utils.SHA1, sha),
+	}, true); got != remoteContentMismatch {
+		t.Fatalf("zero-size stale metadata comparison = %v, want mismatch pending parent confirmation", got)
+	}
+}
+
+func TestExactRemoteByName(t *testing.T) {
+	objs := []model.Obj{
+		&model.Object{Name: "other.bin"},
+		&model.Object{Name: "target.bin", Size: 1024},
+	}
+	if got := exactRemoteByName(objs, "target.bin"); got == nil || got.GetName() != "target.bin" {
+		t.Fatal("exact provider name was not found")
+	}
+	if got := exactRemoteByName(objs, "missing.bin"); got != nil {
+		t.Fatalf("unexpected provider match: %q", got.GetName())
+	}
+}
+
 func TestRefreshUnknownProviderOverwrite(t *testing.T) {
 	now := time.Now()
 	row := &model.WebDAVWritebackObject{
