@@ -1314,11 +1314,48 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 }
 
 func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
+	// A tombstone can be superseded by a fast Cloud Sync recreate of the same
+	// path. Re-check the generation before touching the provider so a queued old
+	// delete cannot blindly remove a newer canonical generation.
+	var current model.WebDAVWritebackObject
+	if err := db.GetDb().First(&current, row.ID).Error; err != nil {
+		return
+	}
+	if current.Generation != row.Generation || current.State != StateDeleted {
+		return
+	}
+
 	err := fs.Remove(m.ctx, row.Path)
 	if err != nil && !errs.IsObjectNotFound(err) {
 		m.failDeleted(row, err)
 		return
 	}
+
+	// The generation may have changed while the provider delete was in flight.
+	// If a newer generation already reached COMPLETED, the stale delete may
+	// have removed that object after its verification. Re-queue from the local
+	// spool so the newest Cloud Sync payload deterministically wins.
+	if err := db.GetDb().First(&current, row.ID).Error; err != nil {
+		return
+	}
+	if current.Generation != row.Generation || current.State != StateDeleted {
+		if current.State == StateCompleted && current.SpoolPath != "" {
+			now := time.Now()
+			res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+				Where("id = ? AND generation = ? AND state = ?", current.ID, current.Generation, StateCompleted).
+				Updates(map[string]any{
+					"state":        StateQueued,
+					"retry_at":     &now,
+					"completed_at": nil,
+					"last_error":   "re-queued because an older delete overlapped this generation",
+				})
+			if res.Error == nil && res.RowsAffected > 0 {
+				wake()
+			}
+		}
+		return
+	}
+
 	if row.CleanupPath != "" && row.CleanupPath != row.Path {
 		_ = fs.Remove(m.ctx, row.CleanupPath)
 	}
