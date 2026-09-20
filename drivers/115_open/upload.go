@@ -84,6 +84,12 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 	if err != nil {
 		return err
 	}
+	completed := false
+	defer func() {
+		if !completed {
+			_ = bucket.AbortMultipartUpload(imur)
+		}
+	}()
 
 	fileSize := stream.GetSize()
 	chunkSize := calPartSize(fileSize)
@@ -145,6 +151,7 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 	if err != nil {
 		return err
 	}
+	completed = true
 
 	return nil
 }
