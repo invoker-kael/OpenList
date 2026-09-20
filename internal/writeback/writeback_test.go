@@ -76,3 +76,36 @@ func TestShouldRemoveStaleRemote(t *testing.T) {
 		})
 	}
 }
+
+
+func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
+	completedNoSpool := &model.WebDAVWritebackObject{
+		State:     StateCompleted,
+		SpoolPath: "",
+	}
+	if !shouldDropCanonicalAfterRemoteList(completedNoSpool, true, false) {
+		t.Fatal("missing remote object should be surfaced after a reliable listing")
+	}
+	if shouldDropCanonicalAfterRemoteList(completedNoSpool, false, false) {
+		t.Fatal("provider/listing failure must not drop canonical metadata")
+	}
+	if shouldDropCanonicalAfterRemoteList(completedNoSpool, true, true) {
+		t.Fatal("present remote object must keep canonical metadata")
+	}
+
+	completedCached := &model.WebDAVWritebackObject{
+		State:     StateCompleted,
+		SpoolPath: "/spool/object.data",
+	}
+	if shouldDropCanonicalAfterRemoteList(completedCached, true, false) {
+		t.Fatal("locally cached completed object must remain authoritative")
+	}
+
+	queued := &model.WebDAVWritebackObject{
+		State:     StateQueued,
+		SpoolPath: "/spool/object.data",
+	}
+	if shouldDropCanonicalAfterRemoteList(queued, true, false) {
+		t.Fatal("pending upload must remain visible even before provider listing catches up")
+	}
+}
