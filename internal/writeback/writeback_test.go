@@ -670,6 +670,39 @@ func TestReceivingPathReferenceCount(t *testing.T) {
 	}
 }
 
+func TestMutationFenceInvalidatesEarlierPutSequence(t *testing.T) {
+	fence := &model.WebDAVWritebackReceiveFence{
+		NextSequence:          7,
+		LastCommittedSequence: 5,
+	}
+	fence.NextSequence++
+	fence.LastCommittedSequence = fence.NextSequence
+	if fence.NextSequence != 8 || fence.LastCommittedSequence != 8 {
+		t.Fatalf("mutation fence = next:%d committed:%d, want 8/8", fence.NextSequence, fence.LastCommittedSequence)
+	}
+	if !receiveSequenceSuperseded(fence.LastCommittedSequence, 7) {
+		t.Fatal("a mutation committed after PUT sequence 7 must invalidate that older in-flight PUT")
+	}
+	if receiveSequenceSuperseded(fence.LastCommittedSequence, 9) {
+		t.Fatal("a PUT allocated after the mutation must remain eligible")
+	}
+}
+
+func TestDirectoryMutationFenceScope(t *testing.T) {
+	root := "/encrypted/album"
+	for path, want := range map[string]bool{
+		"/encrypted/album":          true,
+		"/encrypted/album/a.bin":    true,
+		"/encrypted/album/sub/b.bin": true,
+		"/encrypted/album2/a.bin":   false,
+		"/encrypted":                false,
+	} {
+		if got := isPathOrDescendant(path, root); got != want {
+			t.Fatalf("mutation fence scope for %q = %v, want %v", path, got, want)
+		}
+	}
+}
+
 func TestReceiveSequenceSuperseded(t *testing.T) {
 	if receiveSequenceSuperseded(0, 1) {
 		t.Fatal("first receive sequence cannot be superseded")

@@ -2054,23 +2054,32 @@ func receiveSequenceSuperseded(lastCommitted, current uint64) bool {
 	return lastCommitted > current
 }
 
-func beginReceiveSequence(ctx context.Context, p string) (uint64, error) {
+func lockOrCreateReceiveFence(tx *gorm.DB, p string) (*model.WebDAVWritebackReceiveFence, error) {
 	p = utils.FixAndCleanPath(p)
 	key := pathKey(p)
+	seed := model.WebDAVWritebackReceiveFence{PathKey: key, Path: p}
+	if err := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "path_key"}},
+		DoNothing: true,
+	}).Create(&seed).Error; err != nil {
+		return nil, err
+	}
+
+	var fence model.WebDAVWritebackReceiveFence
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("path_key = ?", key).
+		First(&fence).Error; err != nil {
+		return nil, err
+	}
+	return &fence, nil
+}
+
+func beginReceiveSequence(ctx context.Context, p string) (uint64, error) {
+	p = utils.FixAndCleanPath(p)
 	var sequence uint64
 	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		seed := model.WebDAVWritebackReceiveFence{PathKey: key, Path: p}
-		if err := tx.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "path_key"}},
-			DoNothing: true,
-		}).Create(&seed).Error; err != nil {
-			return err
-		}
-
-		var fence model.WebDAVWritebackReceiveFence
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("path_key = ?", key).
-			First(&fence).Error; err != nil {
+		fence, err := lockOrCreateReceiveFence(tx, p)
+		if err != nil {
 			return err
 		}
 		fence.NextSequence++
@@ -2087,14 +2096,54 @@ func beginReceiveSequence(ctx context.Context, p string) (uint64, error) {
 }
 
 func lockReceiveFence(tx *gorm.DB, p string) (*model.WebDAVWritebackReceiveFence, error) {
-	key := pathKey(p)
-	var fence model.WebDAVWritebackReceiveFence
-	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("path_key = ?", key).
-		First(&fence).Error; err != nil {
-		return nil, err
+	return lockOrCreateReceiveFence(tx, p)
+}
+
+func advanceMutationFence(tx *gorm.DB, p string) error {
+	fence, err := lockOrCreateReceiveFence(tx, p)
+	if err != nil {
+		return err
 	}
-	return &fence, nil
+	fence.NextSequence++
+	fence.LastCommittedSequence = fence.NextSequence
+	return tx.Model(&model.WebDAVWritebackReceiveFence{}).
+		Where("id = ?", fence.ID).
+		Updates(map[string]any{
+			"path":                    utils.FixAndCleanPath(p),
+			"next_sequence":           fence.NextSequence,
+			"last_committed_sequence": fence.LastCommittedSequence,
+		}).Error
+}
+
+func advanceMutationFenceTree(tx *gorm.DB, root string) error {
+	root = utils.FixAndCleanPath(root)
+	if _, err := lockOrCreateReceiveFence(tx, root); err != nil {
+		return err
+	}
+	var fences []model.WebDAVWritebackReceiveFence
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("path = ? OR path LIKE ? ESCAPE '~'", root, descendantLikePattern(root)).
+		Order("id asc").
+		Find(&fences).Error; err != nil {
+		return err
+	}
+	for i := range fences {
+		fence := &fences[i]
+		if !isPathOrDescendant(fence.Path, root) {
+			continue
+		}
+		fence.NextSequence++
+		fence.LastCommittedSequence = fence.NextSequence
+		if err := tx.Model(&model.WebDAVWritebackReceiveFence{}).
+			Where("id = ?", fence.ID).
+			Updates(map[string]any{
+				"next_sequence":           fence.NextSequence,
+				"last_committed_sequence": fence.LastCommittedSequence,
+			}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func advanceReceiveFence(tx *gorm.DB, fence *model.WebDAVWritebackReceiveFence, sequence uint64) error {
@@ -2427,6 +2476,9 @@ func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*m
 	created := false
 
 	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := advanceMutationFence(tx, p); err != nil {
+			return err
+		}
 		var row model.WebDAVWritebackObject
 		findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", key).First(&row).Error
 		if findErr != nil && !errors.Is(findErr, gorm.ErrRecordNotFound) {
@@ -2505,6 +2557,9 @@ func DeleteTree(p string) (bool, error) {
 	handled := false
 
 	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		if err := advanceMutationFenceTree(tx, p); err != nil {
+			return err
+		}
 		var candidates []model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("path = ? OR path LIKE ? ESCAPE '~'", p, descendantLikePattern(p)).
@@ -2597,6 +2652,9 @@ func StageProviderDelete(ctx context.Context, p string, source model.Obj) (bool,
 	alreadyDeleted := false
 
 	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := advanceMutationFenceTree(tx, p); err != nil {
+			return err
+		}
 		var candidates []model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("path = ? OR path LIKE ? ESCAPE '~'", p, descendantLikePattern(p)).
