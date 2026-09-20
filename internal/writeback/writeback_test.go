@@ -725,3 +725,38 @@ func TestDescendantLikePattern(t *testing.T) {
 		}
 	}
 }
+
+func TestCaptureRemoteVerification(t *testing.T) {
+	now := time.Date(2026, time.September, 20, 7, 30, 0, 0, time.UTC)
+	sha := strings.Repeat("A", 40)
+	row := &model.WebDAVWritebackObject{Generation: 9}
+	remote := &model.Object{
+		ID:       "115-file-id-123",
+		HashInfo: utils.NewHashInfo(utils.SHA1, sha),
+	}
+
+	evidence := captureRemoteVerification(row, remote, now)
+	if evidence.objectID != "115-file-id-123" {
+		t.Fatalf("remote object id = %q", evidence.objectID)
+	}
+	if evidence.sha1 != strings.ToLower(sha) {
+		t.Fatalf("remote sha1 = %q", evidence.sha1)
+	}
+	if evidence.generation != 9 {
+		t.Fatalf("remote generation = %d", evidence.generation)
+	}
+	if !evidence.verifiedAt.Equal(now) {
+		t.Fatalf("verified at = %v, want %v", evidence.verifiedAt, now)
+	}
+}
+
+func TestCaptureRemoteVerificationWithoutProviderHash(t *testing.T) {
+	now := time.Date(2026, time.September, 20, 7, 30, 0, 0, time.UTC)
+	row := &model.WebDAVWritebackObject{Generation: 3}
+	remote := &model.Object{ID: "provider-object"}
+
+	evidence := captureRemoteVerification(row, remote, now)
+	if evidence.objectID != "provider-object" || evidence.sha1 != "" || evidence.generation != 3 {
+		t.Fatalf("unexpected verification evidence: %+v", evidence)
+	}
+}

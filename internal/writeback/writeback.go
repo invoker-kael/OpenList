@@ -2074,6 +2074,14 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 			Update("retry_at", &next).Error
 		return
 	}
+	if row.RetryCount > 0 {
+		requireHash := providerRequiresPayloadHash(row.Path)
+		remote, verifyErr := m.remoteForVerify(row)
+		if verifyErr == nil && remoteMatchesCanonical(row, remote, requireHash) {
+			m.completeRemoteVerification(row, remote, []string{StateQueued, StateFailed})
+			return
+		}
+	}
 	if row.SpoolPath == "" {
 		m.fail(row, errors.New("spool payload is missing"))
 		return
@@ -2234,29 +2242,59 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model
 	return remote, nil
 }
 
+type remoteVerificationEvidence struct {
+	objectID   string
+	sha1       string
+	generation uint64
+	verifiedAt time.Time
+}
+
+func captureRemoteVerification(row *model.WebDAVWritebackObject, remote model.Obj, now time.Time) remoteVerificationEvidence {
+	evidence := remoteVerificationEvidence{verifiedAt: now}
+	if row != nil {
+		evidence.generation = row.Generation
+	}
+	if remote != nil {
+		evidence.objectID = remote.GetID()
+		evidence.sha1 = strings.ToLower(remote.GetHash().GetHash(utils.SHA1))
+	}
+	return evidence
+}
+
+func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObject, remote model.Obj, allowedStates []string) bool {
+	now := time.Now()
+	evidence := captureRemoteVerification(row, remote, now)
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, allowedStates).
+		Updates(map[string]any{
+			"state":              StateCompleted,
+			"completed_at":       &now,
+			"retry_at":           nil,
+			"last_error":         "",
+			"retry_count":        0,
+			"verify_count":       0,
+			"remote_object_id":   evidence.objectID,
+			"remote_sha1":        evidence.sha1,
+			"remote_generation":  evidence.generation,
+			"remote_verified_at": &evidence.verifiedAt,
+		})
+	if res.Error != nil || res.RowsAffected == 0 {
+		return false
+	}
+	if row.CleanupPath != "" && row.CleanupPath != row.Path {
+		_ = fs.Remove(m.ctx, row.CleanupPath)
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ?", row.ID, row.Generation).
+			Update("cleanup_path", "").Error
+	}
+	return true
+}
+
 func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 	requireHash := providerRequiresPayloadHash(row.Path)
 	remote, err := m.remoteForVerify(row)
 	if err == nil && remoteMatchesCanonical(row, remote, requireHash) {
-		now := time.Now()
-		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
-			Updates(map[string]any{
-				"state":        StateCompleted,
-				"completed_at": &now,
-				"retry_at":     nil,
-				"last_error":   "",
-				"verify_count": 0,
-			})
-		if res.Error != nil || res.RowsAffected == 0 {
-			return
-		}
-		if row.CleanupPath != "" && row.CleanupPath != row.Path {
-			_ = fs.Remove(m.ctx, row.CleanupPath)
-			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-				Where("id = ? AND generation = ?", row.ID, row.Generation).
-				Update("cleanup_path", "").Error
-		}
+		m.completeRemoteVerification(row, remote, []string{StateVerifying})
 		return
 	}
 

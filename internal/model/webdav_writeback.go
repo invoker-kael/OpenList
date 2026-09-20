@@ -8,28 +8,32 @@ import "time"
 // PathKey and ParentKey are SHA-256 hex strings. Keeping hashes in indexes
 // avoids MySQL utf8mb4 index length limits for long WebDAV paths.
 type WebDAVWritebackObject struct {
-	ID          uint       `json:"id" gorm:"primaryKey"`
-	PathKey     string     `json:"path_key" gorm:"size:64;uniqueIndex"`
-	ParentKey   string     `json:"parent_key" gorm:"size:64;index"`
-	Path        string     `json:"path" gorm:"type:text"`
-	Parent      string     `json:"parent" gorm:"type:text"`
-	Name        string     `json:"name" gorm:"size:1024"`
-	IsDir       bool       `json:"is_dir" gorm:"index"`
-	Size        int64      `json:"size"`
-	ModTime     time.Time  `json:"mod_time"`
-	CreateTime  time.Time  `json:"create_time"`
-	ETag        string     `json:"etag" gorm:"size:160"`
-	Generation  uint64     `json:"generation"`
-	State       string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1"`
-	SpoolPath   string     `json:"spool_path" gorm:"type:text"`
-	PayloadSHA1 string     `json:"payload_sha1" gorm:"size:40"`
-	MimeType    string     `json:"mime_type" gorm:"size:255"`
-	CleanupPath string     `json:"cleanup_path" gorm:"type:text"`
-	LastError   string     `json:"last_error" gorm:"type:text"`
-	RetryCount  int        `json:"retry_count"`
-	VerifyCount int        `json:"verify_count"`
-	RetryAt     *time.Time `json:"retry_at" gorm:"index;index:idx_webdav_writeback_queue,priority:2"`
-	CompletedAt *time.Time `json:"completed_at" gorm:"index;index:idx_webdav_writeback_completed,priority:2"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	ID               uint       `json:"id" gorm:"primaryKey"`
+	PathKey          string     `json:"path_key" gorm:"size:64;uniqueIndex"`
+	ParentKey        string     `json:"parent_key" gorm:"size:64;index"`
+	Path             string     `json:"path" gorm:"type:text"`
+	Parent           string     `json:"parent" gorm:"type:text"`
+	Name             string     `json:"name" gorm:"size:1024"`
+	IsDir            bool       `json:"is_dir" gorm:"index"`
+	Size             int64      `json:"size"`
+	ModTime          time.Time  `json:"mod_time"`
+	CreateTime       time.Time  `json:"create_time"`
+	ETag             string     `json:"etag" gorm:"size:160"`
+	Generation       uint64     `json:"generation"`
+	State            string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1"`
+	SpoolPath        string     `json:"spool_path" gorm:"type:text"`
+	PayloadSHA1      string     `json:"payload_sha1" gorm:"size:40"`
+	RemoteObjectID   string     `json:"remote_object_id" gorm:"size:255"`
+	RemoteSHA1       string     `json:"remote_sha1" gorm:"size:40"`
+	RemoteGeneration uint64     `json:"remote_generation"`
+	RemoteVerifiedAt *time.Time `json:"remote_verified_at"`
+	MimeType         string     `json:"mime_type" gorm:"size:255"`
+	CleanupPath      string     `json:"cleanup_path" gorm:"type:text"`
+	LastError        string     `json:"last_error" gorm:"type:text"`
+	RetryCount       int        `json:"retry_count"`
+	VerifyCount      int        `json:"verify_count"`
+	RetryAt          *time.Time `json:"retry_at" gorm:"index;index:idx_webdav_writeback_queue,priority:2"`
+	CompletedAt      *time.Time `json:"completed_at" gorm:"index;index:idx_webdav_writeback_completed,priority:2"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }

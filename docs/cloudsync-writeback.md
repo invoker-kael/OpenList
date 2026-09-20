@@ -200,6 +200,10 @@ Canonical `GET`/`HEAD` conditional requests are evaluated before any 115 request
 
 Cloud Sync change detection is intentionally content-first. The opaque encrypted payload size plus SHA-1 identifies content; canonical generation identifies the visible version. Provider mtime is never allowed to manufacture a new generation. A duplicate PUT with the same size/SHA-1 is coalesced, while same-size content with a different SHA-1 creates a new generation and is uploaded. 115 is treated as the durable backing store and post-upload verification source, not as the authority for front-end change detection.
 
+Successful provider verification is persisted with the canonical row as `remote_object_id`, `remote_sha1`, `remote_generation` and `remote_verified_at`. For 115 Open, the object id is the verified 115 file id and the provider SHA-1 is captured only after the exact generation passes the size/SHA-1 gate. The evidence is generation-scoped, so stale provider identity from an older canonical generation is never authoritative for a newer PUT.
+
+If 115 visibility is slower than the configured verification window, a verifying generation is eventually re-queued. Before uploading the payload again, retry workers now perform one fresh remote verification. If the correct size/SHA-1 has appeared in 115 during the backoff, the generation is completed from that evidence without sending the same encrypted payload a second time. This specifically reduces late-visibility duplicate uploads while retaining the same integrity gate.
+
 `PROPPATCH` is also canonical-aware, so a just-written object does not become temporarily unpatchable merely because the backing provider has not exposed it yet.
 
 ## 115 Open driver hardening
