@@ -10,6 +10,62 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/writeback"
 )
 
+func TestWritebackPutLocksShareSamePathRetry(t *testing.T) {
+	h := &Handler{LockSystem: NewMemLS()}
+	req, err := http.NewRequest(http.MethodPut, "http://example.test/large.bin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	releaseFirst, status, err := h.confirmWritebackPutLocks(req, "/large.bin")
+	if err != nil || status != 0 {
+		t.Fatalf("first write-back PUT lock: status=%d err=%v", status, err)
+	}
+	releaseRetry, status, err := h.confirmWritebackPutLocks(req, "/large.bin")
+	if err != nil || status != 0 {
+		t.Fatalf("overlapping same-path retry should share the PUT lease: status=%d err=%v", status, err)
+	}
+
+	if _, status, err := h.lock(time.Now(), "/large.bin"); err != ErrLocked || status != StatusLocked {
+		t.Fatalf("shared PUT lease must still exclude other WebDAV mutations: status=%d err=%v", status, err)
+	}
+
+	releaseFirst()
+	if _, status, err := h.lock(time.Now(), "/large.bin"); err != ErrLocked || status != StatusLocked {
+		t.Fatalf("lease must remain held until the last overlapping PUT finishes: status=%d err=%v", status, err)
+	}
+
+	releaseRetry()
+	token, status, err := h.lock(time.Now(), "/large.bin")
+	if err != nil || status != 0 {
+		t.Fatalf("temporary lock was not released after final PUT: status=%d err=%v", status, err)
+	}
+	if err := h.LockSystem.Unlock(time.Now(), token); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWritebackPutLocksStillRespectExistingLock(t *testing.T) {
+	h := &Handler{LockSystem: NewMemLS()}
+	token, err := h.LockSystem.Create(time.Now(), LockDetails{
+		Root:      "/large.bin",
+		Duration:  infiniteTimeout,
+		ZeroDepth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.LockSystem.Unlock(time.Now(), token)
+
+	req, err := http.NewRequest(http.MethodPut, "http://example.test/large.bin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, status, err := h.confirmWritebackPutLocks(req, "/large.bin"); err != ErrLocked || status != StatusLocked {
+		t.Fatalf("real WebDAV lock must still block an unconditional write-back PUT: status=%d err=%v", status, err)
+	}
+}
+
 func TestPutPreconditions(t *testing.T) {
 	tests := []struct {
 		name              string

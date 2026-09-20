@@ -93,6 +93,7 @@ The write-back layer intentionally favors source correctness over avoiding dupli
 - Delete completion is also eventually-consistency aware: MySQL tombstones remain authoritative until two refreshed provider views agree that the name is absent.
 - Duplicate provider writes can occur after a crash. For one-way encrypted backup this is preferable to silently accepting the wrong generation.
 - Client-level retries of the exact same encrypted payload are coalesced while the durable spool is still present, reducing duplicate provider traffic without weakening remote-loss recovery.
+- Overlapping unconditional PUT retries for the exact same WebDAV path share one temporary WebDAV lock lease in write-back mode. The underlying lock remains held until the last overlapping request exits, so DELETE/MOVE/explicit LOCK semantics remain protected without turning a long-file retry into `423 Locked`. Requests with an explicit `If` lock condition keep the standard lock path.
 
 
 ### Remote-loss reconciliation

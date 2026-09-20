@@ -15,6 +15,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -33,6 +34,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+type writebackPutLockLease struct {
+	refs    int
+	release func()
+}
+
 type Handler struct {
 	// Prefix is the URL path prefix to strip from WebDAV resource paths.
 	Prefix string
@@ -41,6 +47,9 @@ type Handler struct {
 	// Logger is an optional error logger. If non-nil, it will be called
 	// for all HTTP requests.
 	Logger func(*http.Request, error)
+
+	writebackPutLockMu sync.Mutex
+	writebackPutLocks  map[string]*writebackPutLockLease
 }
 
 func (h *Handler) stripPrefix(p string) (string, int, error) {
@@ -192,6 +201,67 @@ func (h *Handler) confirmLocks(r *http.Request, src, dst string) (release func()
 	// We follow the spec even though the cond_put_corrupt_token test case from
 	// the litmus test warns on seeing a 412 instead of a 423 (Locked).
 	return nil, http.StatusPreconditionFailed, ErrLocked
+}
+
+func (h *Handler) writebackPutLockRelease(key string, lease *writebackPutLockLease) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			h.writebackPutLockMu.Lock()
+			defer h.writebackPutLockMu.Unlock()
+			current := h.writebackPutLocks[key]
+			if current != lease || lease.refs <= 0 {
+				return
+			}
+			lease.refs--
+			if lease.refs == 0 {
+				// Keep the registry mutex held until the underlying temporary
+				// WebDAV lock is released. A same-path retry therefore either
+				// joins this lease or acquires the next lease; it cannot fall
+				// into the tiny gap that used to return a spurious 423.
+				lease.release()
+				delete(h.writebackPutLocks, key)
+			}
+		})
+	}
+}
+
+// confirmWritebackPutLocks preserves the normal WebDAV temporary lock against
+// DELETE/MOVE/LOCK while allowing overlapping unconditional PUTs for the exact
+// same path to share that lock. Synology Cloud Sync can retry a long upload
+// before the first request finishes; treating that retry as a second temporary
+// lock turns a recoverable retry into 423 Locked.
+//
+// Requests carrying an explicit If header retain the standard WebDAV lock
+// confirmation path and are never joined implicitly.
+func (h *Handler) confirmWritebackPutLocks(r *http.Request, src string) (release func(), status int, err error) {
+	if r.Header.Get("If") != "" {
+		return h.confirmLocks(r, src, "")
+	}
+
+	key := slashClean(src)
+	h.writebackPutLockMu.Lock()
+	if h.writebackPutLocks == nil {
+		h.writebackPutLocks = make(map[string]*writebackPutLockLease)
+	}
+	if lease := h.writebackPutLocks[key]; lease != nil {
+		lease.refs++
+		h.writebackPutLockMu.Unlock()
+		return h.writebackPutLockRelease(key, lease), 0, nil
+	}
+
+	// Serialize lease creation with the registry mutex. Otherwise two first
+	// arrivals can both observe no lease: one acquires the LockSystem token and
+	// the other receives 423 before the winner has published the shared lease.
+	underlyingRelease, status, err := h.confirmLocks(r, src, "")
+	if err != nil {
+		h.writebackPutLockMu.Unlock()
+		return nil, status, err
+	}
+	lease := &writebackPutLockLease{refs: 1, release: underlyingRelease}
+	h.writebackPutLocks[key] = lease
+	h.writebackPutLockMu.Unlock()
+	return h.writebackPutLockRelease(key, lease), 0, nil
 }
 
 func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) (status int, err error) {
@@ -452,7 +522,12 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	if reqPath == "" {
 		return http.StatusMethodNotAllowed, nil
 	}
-	release, status, err := h.confirmLocks(r, reqPath, "")
+	var release func()
+	if writeback.Enabled() {
+		release, status, err = h.confirmWritebackPutLocks(r, reqPath)
+	} else {
+		release, status, err = h.confirmLocks(r, reqPath, "")
+	}
 	if err != nil {
 		return status, err
 	}
