@@ -1,12 +1,14 @@
 package writeback
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
 func TestPathKeyIsStableAndMySQLIndexSafe(t *testing.T) {
@@ -328,6 +330,27 @@ func TestPendingDirectoryMoveLocalAuthority(t *testing.T) {
 	rows[0].CompletedAt = nil
 	if pendingDirectoryMoveLocallyAuthoritative(&rows[0], rows, now) {
 		t.Fatal("completed directory without completion evidence must not use local fast MOVE")
+	}
+}
+
+func TestCopyToSpoolComputesPayloadSHA1(t *testing.T) {
+	payload := "cloud-sync-encrypted-payload"
+	f, err := os.CreateTemp(t.TempDir(), "spool-*.data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	size, sha1sum, err := copyToSpool(f, strings.NewReader(payload), int64(len(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != int64(len(payload)) {
+		t.Fatalf("spooled size = %d, want %d", size, len(payload))
+	}
+	want := utils.HashData(utils.SHA1, []byte(payload))
+	if sha1sum != want {
+		t.Fatalf("payload sha1 = %q, want %q", sha1sum, want)
 	}
 }
 

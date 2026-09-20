@@ -348,26 +348,27 @@ func reserveIncomingBytes(expected int64) (func(), error) {
 	}, nil
 }
 
-func copyToSpool(dst *os.File, src io.Reader, expected int64) (int64, error) {
-
+func copyToSpool(dst *os.File, src io.Reader, expected int64) (int64, string, error) {
 	buf := make([]byte, 4*utils.MB)
+	payloadHasher := utils.SHA1.NewFunc()
+	writer := io.MultiWriter(dst, payloadHasher)
 	var total int64
 	var sinceCheck int64
 	for {
 		n, readErr := src.Read(buf)
 		if n > 0 {
-			wn, writeErr := dst.Write(buf[:n])
+			wn, writeErr := writer.Write(buf[:n])
 			total += int64(wn)
 			sinceCheck += int64(wn)
 			if writeErr != nil {
-				return total, writeErr
+				return total, "", writeErr
 			}
 			if wn != n {
-				return total, io.ErrShortWrite
+				return total, "", io.ErrShortWrite
 			}
 			if sinceCheck >= 64*utils.MB {
 				if err := checkFreeSpace(0); err != nil {
-					return total, err
+					return total, "", err
 				}
 				sinceCheck = 0
 			}
@@ -376,13 +377,13 @@ func copyToSpool(dst *os.File, src io.Reader, expected int64) (int64, error) {
 			if errors.Is(readErr, io.EOF) {
 				break
 			}
-			return total, readErr
+			return total, "", readErr
 		}
 	}
 	if expected >= 0 && total != expected {
-		return total, fmt.Errorf("incomplete WebDAV PUT: expected %d bytes, received %d", expected, total)
+		return total, "", fmt.Errorf("incomplete WebDAV PUT: expected %d bytes, received %d", expected, total)
 	}
-	return total, nil
+	return total, hex.EncodeToString(payloadHasher.Sum(nil)), nil
 }
 
 func syncDir(dir string) {
@@ -426,7 +427,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		}
 	}()
 
-	actualSize, err := copyToSpool(tmp, body, expected)
+	actualSize, payloadSHA1, err := copyToSpool(tmp, body, expected)
 	if err != nil {
 		return nil, false, err
 	}
@@ -485,6 +486,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		row.ETag = canonicalETag(key, row.Generation, actualSize)
 		row.State = StateQueued
 		row.SpoolPath = finalName
+		row.PayloadSHA1 = payloadSHA1
 		row.MimeType = mime
 		row.CleanupPath = ""
 		row.LastError = ""
@@ -565,6 +567,7 @@ func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*m
 		row.ETag = canonicalETag(key, row.Generation, 0)
 		row.State = StateQueued
 		row.SpoolPath = ""
+		row.PayloadSHA1 = ""
 		row.MimeType = ""
 		row.CleanupPath = ""
 		row.LastError = ""
@@ -690,6 +693,7 @@ func tombstoneMovedSource(row *model.WebDAVWritebackObject, now time.Time) {
 	row.Generation++
 	row.State = StateDeleted
 	row.SpoolPath = ""
+	row.PayloadSHA1 = ""
 	row.CleanupPath = ""
 	row.LastError = ""
 	row.RetryCount = 0
@@ -813,6 +817,7 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 			} else {
 				destinationRow.SpoolPath = sourceRow.SpoolPath
 			}
+			destinationRow.PayloadSHA1 = sourceRow.PayloadSHA1
 			destinationRow.MimeType = sourceRow.MimeType
 			destinationRow.CleanupPath = ""
 			destinationRow.LastError = ""
@@ -943,6 +948,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		dstRow.ETag = canonicalETag(dstKey, dstRow.Generation, lockedSrc.Size)
 		dstRow.State = StateQueued
 		dstRow.SpoolPath = lockedSrc.SpoolPath
+		dstRow.PayloadSHA1 = lockedSrc.PayloadSHA1
 		dstRow.MimeType = lockedSrc.MimeType
 		dstRow.CleanupPath = ""
 		dstRow.LastError = ""
@@ -1043,6 +1049,7 @@ func CopyPending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		dstRow.ETag = canonicalETag(dstKey, dstRow.Generation, lockedSrc.Size)
 		dstRow.State = StateQueued
 		dstRow.SpoolPath = lockedSrc.SpoolPath
+		dstRow.PayloadSHA1 = lockedSrc.PayloadSHA1
 		dstRow.MimeType = lockedSrc.MimeType
 		dstRow.CleanupPath = ""
 		dstRow.LastError = ""
@@ -1414,6 +1421,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		Size:     row.Size,
 		Modified: row.ModTime,
 		Ctime:    row.CreateTime,
+		HashInfo: utils.NewHashInfo(utils.SHA1, row.PayloadSHA1),
 	}
 	fsStream := &stream.FileStream{
 		Obj:      obj,

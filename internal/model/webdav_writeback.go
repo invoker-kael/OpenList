@@ -22,6 +22,7 @@ type WebDAVWritebackObject struct {
 	Generation  uint64     `json:"generation"`
 	State       string     `json:"state" gorm:"size:24;index"`
 	SpoolPath   string     `json:"spool_path" gorm:"type:text"`
+	PayloadSHA1 string     `json:"payload_sha1" gorm:"size:40"`
 	MimeType    string     `json:"mime_type" gorm:"size:255"`
 	CleanupPath string     `json:"cleanup_path" gorm:"type:text"`
 	LastError   string     `json:"last_error" gorm:"type:text"`

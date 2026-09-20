@@ -117,6 +117,8 @@ PROPFIND file / parent immediately
 
 The WebDAV-visible result is committed locally before any slow 115/OpenList provider upload is required to finish. Cloud Sync therefore sees the newest canonical type, encrypted payload size, modification time and generation ETag throughout the provider consistency window.
 
+While the encrypted PUT body is written to the durable spool, write-back also computes the payload SHA-1 in the same sequential pass and persists it with the generation. The 115 Open worker supplies that hash through the FileStreamer metadata, so `Open115.Put()` can skip its otherwise-required `CacheFullAndHash()` full-file reread. This reduces spool I/O for large encrypted files and makes 115 rapid-upload negotiation start sooner.
+
 The default `cloudsync_settle_millis=2000` delays normal provider dispatch briefly after each PUT. A zero-byte PUT uses the longer `cloudsync_placeholder_millis=10000` window because Synology Cloud Sync can create a zero-length placeholder and send the real encrypted payload in a subsequent request. A later PUT to the same path supersedes the previous generation, avoiding an unnecessary empty-object upload before the real payload.
 
 ### Directory consistency
