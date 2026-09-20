@@ -516,11 +516,17 @@ func MoveTreeMetadata(src, dst string) error {
 	src = utils.FixAndCleanPath(src)
 	dst = utils.FixAndCleanPath(dst)
 	var rows []model.WebDAVWritebackObject
-	if err := db.GetDb().Where("path = ? OR path LIKE ?", src, src+"/%").Find(&rows).Error; err != nil {
+	// LIKE treats '%' and '_' inside src as wildcards. The database query is
+	// only a candidate scan; enforce the real path boundary again in Go before
+	// mutating any row so unusual Cloud Sync names cannot move unrelated state.
+	if err := db.GetDb().Where("path = ? OR path LIKE ?", src, src+"%").Find(&rows).Error; err != nil {
 		return err
 	}
 	for i := range rows {
 		row := &rows[i]
+		if row.Path != src && !strings.HasPrefix(row.Path, src+"/") {
+			continue
+		}
 		suffix := strings.TrimPrefix(row.Path, src)
 		newPath := utils.FixAndCleanPath(dst + suffix)
 		parent := path.Dir(newPath)
@@ -946,10 +952,19 @@ func (m *workerManager) cleanupOrphans() {
 		keep[filepath.Clean(rows[i].SpoolPath)] = struct{}{}
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".data") {
+		if entry.IsDir() {
 			continue
 		}
 		p := filepath.Join(spoolDir, entry.Name())
+		if strings.HasSuffix(entry.Name(), ".part") {
+			// recv-*.part files can only survive a hard process/container crash.
+			// cleanupOrphans runs during startup before new WebDAV PUTs are served.
+			_ = os.Remove(p)
+			continue
+		}
+		if !strings.HasSuffix(entry.Name(), ".data") {
+			continue
+		}
 		if _, ok := keep[filepath.Clean(p)]; !ok {
 			_ = os.Remove(p)
 		}
