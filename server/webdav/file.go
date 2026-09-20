@@ -69,9 +69,7 @@ func resourceExists(ctx context.Context, name string) (bool, error) {
 }
 
 func copyCanUseNative(src, dst string, depth int) bool {
-	return depth == infiniteDepth &&
-		path.Dir(src) != path.Dir(dst) &&
-		path.Base(src) == path.Base(dst)
+	return writeback.ProviderOperationCopyUsesNative(src, dst, depth)
 }
 
 func copyExactFile(ctx context.Context, src, dst string) error {

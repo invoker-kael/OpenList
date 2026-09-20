@@ -737,6 +737,19 @@ func copyMoveProviderSucceeded(status int) bool {
 	return status == http.StatusCreated || status == http.StatusNoContent
 }
 
+func copyMoveProviderDefinitelyNotStarted(status int) bool {
+	switch status {
+	case http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusConflict,
+		http.StatusPreconditionFailed,
+		http.StatusServiceUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
 func retryMetadataReconciliation(ctx context.Context, fn func() error) error {
 	var lastErr error
 	for attempt, delay := range []time.Duration{0, 50 * time.Millisecond, 200 * time.Millisecond} {
@@ -802,6 +815,12 @@ func recoverProviderCopyMove(ctx context.Context, method, src, dst string, depth
 	if recovery == writeback.ProviderOperationNotApplied {
 		if !confirmed {
 			return http.StatusServiceUnavailable, true, nil
+		}
+		if op.State == writeback.ProviderOperationFailed && strings.EqualFold(method, writeback.ProviderOperationCopy) {
+			cleaned, cleanupErr := writeback.CleanupFailedProviderCopy(ctx, op)
+			if cleanupErr != nil || !cleaned {
+				return http.StatusServiceUnavailable, true, cleanupErr
+			}
 		}
 		if finishErr := writeback.FinishProviderOperation(op.ID); finishErr != nil {
 			return http.StatusServiceUnavailable, true, finishErr
@@ -968,6 +987,20 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 			}
 		}
 		copyStatus, copyErr := copyFiles(ctx, src, dst, overwrite, depth)
+		if writeback.Enabled() && providerOp != nil && !copyMoveProviderSucceeded(copyStatus) {
+			switch {
+			case copyMoveProviderDefinitelyNotStarted(copyStatus):
+				if finishErr := writeback.FinishProviderOperation(providerOp.ID); finishErr != nil {
+					log.Warnf("provider COPY did not start but intent cleanup failed for %s -> %s: %v", src, dst, finishErr)
+				}
+			case copyErr != nil:
+				if markErr := writeback.MarkProviderOperationFailed(providerOp.ID, copyErr); markErr != nil {
+					log.Warnf("provider COPY failed but intent failure marker failed for %s -> %s: %v", src, dst, markErr)
+				} else {
+					providerOp.State = writeback.ProviderOperationFailed
+				}
+			}
+		}
 		if copyErr == nil && writeback.Enabled() && copyMoveProviderSucceeded(copyStatus) {
 			if providerOp != nil {
 				if markErr := writeback.MarkProviderOperationApplied(providerOp.ID); markErr != nil {
@@ -1077,6 +1110,11 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 		}
 	}
 	moveStatus, moveErr := moveFiles(ctx, src, dst, overwrite)
+	if writeback.Enabled() && providerOp != nil && !copyMoveProviderSucceeded(moveStatus) && copyMoveProviderDefinitelyNotStarted(moveStatus) {
+		if finishErr := writeback.FinishProviderOperation(providerOp.ID); finishErr != nil {
+			log.Warnf("provider MOVE did not start but intent cleanup failed for %s -> %s: %v", src, dst, finishErr)
+		}
+	}
 	if moveErr == nil && writeback.Enabled() && copyMoveProviderSucceeded(moveStatus) {
 		if providerOp != nil {
 			if markErr := writeback.MarkProviderOperationApplied(providerOp.ID); markErr != nil {

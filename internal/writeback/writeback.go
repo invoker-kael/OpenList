@@ -157,6 +157,7 @@ const (
 	ProviderOperationPrepared = "prepared"
 	ProviderOperationStarted  = "started"
 	ProviderOperationApplied  = "applied"
+	ProviderOperationFailed   = "failed"
 )
 
 type ProviderOperationRecovery uint8
@@ -320,9 +321,40 @@ func providerOperationTreeDepth(method string, depth int) int {
 	return depth
 }
 
-func providerDirectoryTreeFingerprint(ctx context.Context, root string, depth int) (string, int, error) {
+// ProviderOperationCopyUsesNative mirrors the provider COPY branch used by
+// WebDAV. Keeping the predicate here prevents recovery evidence from being
+// captured from a different source view than the mutation that will run.
+func ProviderOperationCopyUsesNative(src, dst string, depth int) bool {
+	return depth < 0 &&
+		path.Dir(src) != path.Dir(dst) &&
+		path.Base(src) == path.Base(dst)
+}
+
+func providerOperationTreeObjects(ctx context.Context, current string, overlay bool) ([]model.Obj, error) {
+	objs, err := fs.List(ctx, current, &fs.ListArgs{Refresh: true, NoLog: true})
+	if !overlay {
+		return objs, err
+	}
+
+	remoteReliable := err == nil
+	overlaid, hasWriteback, overlayErr := OverlayList(current, objs, remoteReliable)
+	if overlayErr != nil {
+		return nil, overlayErr
+	}
+	canonicalParent := false
+	if canonical, found, deleted, canonicalErr := Canonical(current); canonicalErr != nil {
+		return nil, canonicalErr
+	} else if found && !deleted && canonical != nil && canonical.IsDir() {
+		canonicalParent = true
+	}
+	if remoteReliable || hasWriteback || canonicalParent {
+		return overlaid, nil
+	}
+	return nil, err
+}
+
+func providerDirectoryTreeFingerprint(ctx context.Context, root string, depth int, overlay bool) (string, int, error) {
 	root = utils.FixAndCleanPath(root)
-	requireHash := providerRequiresPayloadHash(root)
 	hasher := sha256.New()
 	entries := 0
 
@@ -331,7 +363,7 @@ func providerDirectoryTreeFingerprint(ctx context.Context, root string, depth in
 		if remaining == 0 {
 			return nil
 		}
-		objs, err := fs.List(ctx, current, &fs.ListArgs{Refresh: true, NoLog: true})
+		objs, err := providerOperationTreeObjects(ctx, current, overlay)
 		if err != nil {
 			return err
 		}
@@ -342,6 +374,7 @@ func providerDirectoryTreeFingerprint(ctx context.Context, root string, depth in
 			if obj == nil {
 				continue
 			}
+			fullPath := path.Join(current, obj.GetName())
 			rel := path.Join(relative, obj.GetName())
 			if obj.IsDir() {
 				_, _ = fmt.Fprintf(hasher, "D\x00%s\n", rel)
@@ -350,14 +383,14 @@ func providerDirectoryTreeFingerprint(ctx context.Context, root string, depth in
 				if remaining > 0 {
 					next--
 				}
-				if err := walk(path.Join(current, obj.GetName()), rel, next); err != nil {
+				if err := walk(fullPath, rel, next); err != nil {
 					return err
 				}
 				continue
 			}
 			sha1sum := strings.ToLower(obj.GetHash().GetHash(utils.SHA1))
-			if requireHash && sha1sum == "" {
-				return fmt.Errorf("provider directory fingerprint missing SHA1 for %s", path.Join(current, obj.GetName()))
+			if providerRequiresPayloadHash(fullPath) && sha1sum == "" {
+				return fmt.Errorf("provider directory fingerprint missing SHA1 for %s", fullPath)
 			}
 			_, _ = fmt.Fprintf(hasher, "F\x00%s\x00%d\x00%s\n", rel, obj.GetSize(), sha1sum)
 			entries++
@@ -384,7 +417,7 @@ func providerDirectoryDestinationMatches(ctx context.Context, op *model.WebDAVPr
 	if op.SourceTreeSHA256 == "" {
 		return providerOperationRemoteMatch, nil
 	}
-	fingerprint, entries, err := providerDirectoryTreeFingerprint(ctx, op.DestinationPath, providerOperationTreeDepth(op.Method, op.Depth))
+	fingerprint, entries, err := providerDirectoryTreeFingerprint(ctx, op.DestinationPath, providerOperationTreeDepth(op.Method, op.Depth), false)
 	if err != nil {
 		return providerOperationRemoteInconclusive, err
 	}
@@ -452,7 +485,14 @@ func PrepareProviderOperation(ctx context.Context, method, src, dst string, dept
 	}
 
 	if op.SourceIsDir {
-		fingerprint, entries, err := providerDirectoryTreeFingerprint(ctx, src, providerOperationTreeDepth(method, depth))
+		op.SourceTreeOverlay = strings.EqualFold(method, ProviderOperationCopy) &&
+			!ProviderOperationCopyUsesNative(src, dst, depth)
+		fingerprint, entries, err := providerDirectoryTreeFingerprint(
+			ctx,
+			src,
+			providerOperationTreeDepth(method, depth),
+			op.SourceTreeOverlay,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -518,6 +558,32 @@ func MarkProviderOperationApplied(id uint) error {
 	res := db.GetDb().Model(&model.WebDAVProviderOperation{}).
 		Where("id = ? AND state IN ?", id, []string{ProviderOperationStarted, ProviderOperationApplied}).
 		Updates(map[string]any{"state": ProviderOperationApplied, "applied_at": &now})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return errors.New("provider operation intent was not started")
+	}
+	return nil
+}
+
+func MarkProviderOperationFailed(id uint, failure error) error {
+	if id == 0 {
+		return errors.New("provider operation intent is missing")
+	}
+	now := time.Now()
+	lastError := "provider COPY failed after mutation started"
+	if failure != nil {
+		lastError = failure.Error()
+	}
+	res := db.GetDb().Model(&model.WebDAVProviderOperation{}).
+		Where("id = ? AND state IN ?", id, []string{ProviderOperationStarted, ProviderOperationFailed}).
+		Updates(map[string]any{
+			"state":           ProviderOperationFailed,
+			"last_error":      lastError,
+			"last_checked_at": &now,
+			"applied_at":      nil,
+		})
 	if res.Error != nil {
 		return res.Error
 	}
@@ -661,6 +727,16 @@ func providerOperationRecoveryDecision(method, state string, dstState, srcState 
 				return ProviderOperationRecovered
 			}
 			return ProviderOperationInconclusive
+		}
+		if state == ProviderOperationFailed {
+			switch dstState {
+			case providerOperationRemoteMatch:
+				return ProviderOperationRecovered
+			case providerOperationRemoteAbsent, providerOperationRemoteMismatch:
+				return ProviderOperationNotApplied
+			default:
+				return ProviderOperationInconclusive
+			}
 		}
 		if sourceIsDir {
 			if dstState == providerOperationRemoteAbsent {
@@ -2769,6 +2845,53 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 	return nil
 }
 
+func providerOperationPathAbsent(ctx context.Context, p string) (bool, error) {
+	remote, getErr := fs.Get(ctx, p, &fs.GetArgs{NoLog: true})
+	if getErr == nil && remote != nil {
+		return false, nil
+	}
+	if getErr != nil && !errs.IsObjectNotFound(getErr) {
+		return false, getErr
+	}
+	objs, listErr := fs.List(ctx, path.Dir(p), &fs.ListArgs{Refresh: true, NoLog: true})
+	if listErr != nil {
+		if errs.IsObjectNotFound(listErr) {
+			return true, nil
+		}
+		return false, listErr
+	}
+	return exactRemoteByName(objs, path.Base(p)) == nil, nil
+}
+
+// CleanupFailedProviderCopy removes a partial COPY destination before the same
+// durable intent is retired. COPY keeps the source intact, so a clean retry is
+// safer than leaving a mismatched directory permanently fenced.
+func CleanupFailedProviderCopy(ctx context.Context, op *model.WebDAVProviderOperation) (bool, error) {
+	if op == nil ||
+		!strings.EqualFold(op.Method, ProviderOperationCopy) ||
+		op.State != ProviderOperationFailed {
+		return false, nil
+	}
+	if err := fs.Remove(ctx, op.DestinationPath); err != nil && !errs.IsObjectNotFound(err) {
+		return false, err
+	}
+	absent, err := providerOperationPathAbsent(ctx, op.DestinationPath)
+	if err != nil || !absent {
+		return absent, err
+	}
+	if !providerRequiresPayloadHash(op.DestinationPath) {
+		return true, nil
+	}
+	timer := time.NewTimer(providerOperationConfirmationDelay())
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-timer.C:
+	}
+	return providerOperationPathAbsent(ctx, op.DestinationPath)
+}
+
 const (
 	providerOperationPreparedAbandonAfter = 30 * time.Second
 	providerOperationMaintenanceEvery     = 5 * time.Second
@@ -2851,9 +2974,19 @@ func (m *workerManager) maintainProviderOperations() {
 			if !confirmed {
 				continue
 			}
+			if op.State == ProviderOperationFailed && strings.EqualFold(op.Method, ProviderOperationCopy) {
+				cleaned, cleanupErr := CleanupFailedProviderCopy(m.ctx, op)
+				if cleanupErr != nil {
+					recordProviderOperationError(op.ID, cleanupErr)
+					continue
+				}
+				if !cleaned {
+					continue
+				}
+			}
 			// Two separated provider observations agree that the started
-			// mutation did not take effect. Retire the stale fence so a later
-			// client request can safely prepare a new operation.
+			// mutation did not take effect, or a known-failed COPY destination
+			// was explicitly cleaned. Retire the fence for a clean retry.
 			if err := FinishProviderOperation(op.ID); err != nil {
 				recordProviderOperationError(op.ID, err)
 			} else {

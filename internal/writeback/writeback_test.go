@@ -14,6 +14,42 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
+func TestProviderOperationCopyUsesNative(t *testing.T) {
+	if !ProviderOperationCopyUsesNative("/a/album", "/b/album", -1) {
+		t.Fatal("recursive same-name cross-directory COPY should use native provider COPY")
+	}
+	if ProviderOperationCopyUsesNative("/a/album", "/b/renamed", -1) {
+		t.Fatal("renamed COPY must use exact overlay-aware traversal")
+	}
+	if ProviderOperationCopyUsesNative("/a/album", "/b/album", 0) {
+		t.Fatal("Depth:0 COPY must not use recursive provider COPY")
+	}
+	if ProviderOperationCopyUsesNative("/a/album", "/a/album", -1) {
+		t.Fatal("same-directory path is not a native cross-directory COPY")
+	}
+}
+
+func TestFailedProviderCopyRecoveryDecision(t *testing.T) {
+	if got := providerOperationRecoveryDecision(
+		ProviderOperationCopy,
+		ProviderOperationFailed,
+		providerOperationRemoteMismatch,
+		providerOperationRemoteInconclusive,
+		true,
+	); got != ProviderOperationNotApplied {
+		t.Fatalf("failed partial directory COPY = %v, want retryable not-applied", got)
+	}
+	if got := providerOperationRecoveryDecision(
+		ProviderOperationCopy,
+		ProviderOperationFailed,
+		providerOperationRemoteMatch,
+		providerOperationRemoteInconclusive,
+		true,
+	); got != ProviderOperationRecovered {
+		t.Fatalf("failed COPY with complete destination = %v, want recovered", got)
+	}
+}
+
 func TestProviderOperationTreeDepth(t *testing.T) {
 	if got := providerOperationTreeDepth(ProviderOperationMove, 0); got != -1 {
 		t.Fatalf("MOVE tree depth = %d, want infinity", got)

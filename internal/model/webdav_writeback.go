@@ -57,6 +57,7 @@ type WebDAVProviderOperation struct {
 	SourceSHA1         string     `json:"source_sha1" gorm:"size:40"`
 	SourceTreeSHA256   string     `json:"source_tree_sha256" gorm:"size:64"`
 	SourceTreeEntries  int        `json:"source_tree_entries"`
+	SourceTreeOverlay  bool       `json:"source_tree_overlay"`
 	SourceModTime      time.Time  `json:"source_mod_time"`
 	SourceCreateTime   time.Time  `json:"source_create_time"`
 	Overwrite          bool       `json:"overwrite"`

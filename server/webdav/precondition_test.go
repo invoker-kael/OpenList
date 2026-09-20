@@ -211,6 +211,25 @@ func TestCanonicalReadRequestDropsRangeOnIfRangeMismatch(t *testing.T) {
 	}
 }
 
+func TestCopyMoveProviderDefinitelyNotStarted(t *testing.T) {
+	for _, status := range []int{
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusConflict,
+		http.StatusPreconditionFailed,
+		http.StatusServiceUnavailable,
+	} {
+		if !copyMoveProviderDefinitelyNotStarted(status) {
+			t.Fatalf("status %d should prove provider mutation did not start", status)
+		}
+	}
+	for _, status := range []int{http.StatusCreated, http.StatusNoContent, http.StatusInternalServerError} {
+		if copyMoveProviderDefinitelyNotStarted(status) {
+			t.Fatalf("status %d must remain success/ambiguous", status)
+		}
+	}
+}
+
 func TestProviderConsistencyConfirmationDelay(t *testing.T) {
 	tests := []struct {
 		name     string
