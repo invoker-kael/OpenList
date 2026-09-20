@@ -251,8 +251,11 @@ func isReceiving(p string) bool {
 	return receivingPaths[key] > 0
 }
 
-func cloudSyncSettleDelay() time.Duration {
+func cloudSyncSettleDelay(size int64) time.Duration {
 	ms := conf.Conf.WebDAVWriteback.CloudSyncSettleMillis
+	if size == 0 {
+		ms = max(ms, conf.Conf.WebDAVWriteback.CloudSyncPlaceholderMillis)
+	}
 	if ms < 0 {
 		ms = 0
 	}
@@ -403,7 +406,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	var oldSpool string
 	var saved model.WebDAVWritebackObject
 	created := false
-	settleAt := time.Now().Add(cloudSyncSettleDelay())
+	settleAt := time.Now().Add(cloudSyncSettleDelay(actualSize))
 
 	err = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var row model.WebDAVWritebackObject
