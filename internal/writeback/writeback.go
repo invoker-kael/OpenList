@@ -83,6 +83,7 @@ func toObject(row *model.WebDAVWritebackObject) model.Obj {
 			Size:     row.Size,
 			Modified: row.ModTime,
 			Ctime:    row.CreateTime,
+			IsFolder: row.IsDir,
 		},
 		etag: row.ETag,
 	}
@@ -115,9 +116,18 @@ func Canonical(p string) (obj model.Obj, found bool, deleted bool, err error) {
 
 func shouldDropCanonicalAfterRemoteList(row *model.WebDAVWritebackObject, remoteReliable, remotePresent bool) bool {
 	return remoteReliable &&
+		!row.IsDir &&
 		!remotePresent &&
 		row.State == StateCompleted &&
 		row.SpoolPath == ""
+}
+
+func directoryShadowExpired(row *model.WebDAVWritebackObject, now time.Time) bool {
+	if !row.IsDir || row.State != StateCompleted || row.CompletedAt == nil {
+		return false
+	}
+	grace := max(1, conf.Conf.WebDAVWriteback.DirectoryGraceSeconds)
+	return !now.Before(row.CompletedAt.Add(time.Duration(grace) * time.Second))
 }
 
 // OverlayList replaces remote objects with their canonical WebDAV metadata and
@@ -147,13 +157,36 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 		}
 		byName[name] = obj
 	}
+	now := time.Now()
 	for i := range rows {
 		row := &rows[i]
 		if row.State == StateDeleted {
 			delete(byName, row.Name)
 			continue
 		}
-		_, remotePresent := byName[row.Name]
+		remoteObj, remotePresent := byName[row.Name]
+		if row.IsDir {
+			remoteDirPresent := remotePresent && remoteObj.IsDir()
+			if remoteReliable && row.State == StateCompleted && remoteDirPresent {
+				res := db.GetDb().
+					Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateCompleted).
+					Delete(&model.WebDAVWritebackObject{})
+				if res.Error != nil {
+					return nil, false, res.Error
+				}
+				continue
+			}
+			if remoteReliable && !remoteDirPresent && directoryShadowExpired(row, now) {
+				res := db.GetDb().
+					Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateCompleted).
+					Delete(&model.WebDAVWritebackObject{})
+				if res.Error != nil {
+					return nil, false, res.Error
+				}
+				delete(byName, row.Name)
+				continue
+			}
+		}
 		if shouldDropCanonicalAfterRemoteList(row, remoteReliable, remotePresent) {
 			res := db.GetDb().
 				Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
@@ -386,6 +419,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		row.Path = p
 		row.Parent = parent
 		row.Name = path.Base(p)
+		row.IsDir = false
 		row.Size = actualSize
 		row.ModTime = modTime
 		row.CreateTime = createTime
@@ -419,6 +453,79 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		if _, active := activeSpools.Load(oldSpool); !active {
 			removeSpoolIfUnreferenced(oldSpool)
 		}
+	}
+	wake()
+	return &saved, created, nil
+}
+
+// CommitDir makes a WebDAV collection immediately visible to Cloud Sync and
+// persists directory creation so provider-side path visibility can catch up in
+// the background.
+func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*model.WebDAVWritebackObject, bool, error) {
+	if !Enabled() {
+		return nil, false, errors.New("WebDAV write-back is disabled")
+	}
+	p = utils.FixAndCleanPath(p)
+	if modTime.IsZero() {
+		modTime = time.Now()
+	}
+	if createTime.IsZero() {
+		createTime = modTime
+	}
+	parent := path.Dir(p)
+	key := pathKey(p)
+	now := time.Now()
+	var saved model.WebDAVWritebackObject
+	created := false
+
+	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row model.WebDAVWritebackObject
+		findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", key).First(&row).Error
+		if findErr != nil && !errors.Is(findErr, gorm.ErrRecordNotFound) {
+			return findErr
+		}
+		if findErr == nil {
+			if row.State != StateDeleted && !row.IsDir {
+				return ErrDestinationExists
+			}
+			row.Generation++
+		} else {
+			created = true
+			row.Generation = 1
+		}
+
+		row.PathKey = key
+		row.ParentKey = pathKey(parent)
+		row.Path = p
+		row.Parent = parent
+		row.Name = path.Base(p)
+		row.IsDir = true
+		row.Size = 0
+		row.ModTime = modTime
+		row.CreateTime = createTime
+		row.ETag = canonicalETag(key, row.Generation, 0)
+		row.State = StateQueued
+		row.SpoolPath = ""
+		row.MimeType = ""
+		row.CleanupPath = ""
+		row.LastError = ""
+		row.RetryCount = 0
+		row.VerifyCount = 0
+		row.RetryAt = &now
+		row.CompletedAt = nil
+
+		if row.ID == 0 {
+			if err := tx.Create(&row).Error; err != nil {
+				return err
+			}
+		} else if err := tx.Save(&row).Error; err != nil {
+			return err
+		}
+		saved = row
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
 	}
 	wake()
 	return &saved, created, nil
@@ -506,6 +613,7 @@ func MovePending(src, dst string, overwrite bool) (bool, error) {
 			dstRow.Path = dst
 			dstRow.Parent = path.Dir(dst)
 			dstRow.Name = path.Base(dst)
+			dstRow.IsDir = lockedSrc.IsDir
 			dstRow.Size = lockedSrc.Size
 			dstRow.ModTime = lockedSrc.ModTime
 			dstRow.CreateTime = lockedSrc.CreateTime
@@ -733,7 +841,7 @@ func (m *workerManager) dispatch() {
 	var rows []model.WebDAVWritebackObject
 	err := db.GetDb().
 		Where("state IN ? AND (retry_at IS NULL OR retry_at <= ?)", []string{StateQueued, StateFailed, StateVerifying, StateDeleted}, now).
-		Order("updated_at asc").
+		Order("is_dir desc, updated_at asc").
 		Limit(max(8, conf.Conf.WebDAVWriteback.Workers*4)).
 		Find(&rows).Error
 	if err != nil {
@@ -778,7 +886,11 @@ func (m *workerManager) process(id uint) {
 	case StateVerifying:
 		m.processVerify(&row)
 	case StateQueued, StateFailed:
-		m.processUpload(&row)
+		if row.IsDir {
+			m.processMkdir(&row)
+		} else {
+			m.processUpload(&row)
+		}
 	}
 }
 
@@ -835,7 +947,11 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 	err = fs.PutDirectly(m.ctx, row.Parent, fsStream, true)
 	if err != nil {
-		m.fail(row, err)
+		if errs.IsNotFoundError(err) {
+			m.failAfter(row, err, 2*time.Second)
+		} else {
+			m.fail(row, err)
+		}
 		return
 	}
 
@@ -861,6 +977,46 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		return
 	}
 	m.processVerify(row)
+}
+
+func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND is_dir = ? AND state IN ?", row.ID, row.Generation, true, []string{StateQueued, StateFailed}).
+		Updates(map[string]any{"state": StateUploading, "retry_at": nil, "last_error": ""})
+	if res.Error != nil || res.RowsAffected == 0 {
+		return
+	}
+
+	err := fs.MakeDir(m.ctx, row.Path)
+	if err != nil {
+		if existing, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true}); getErr == nil && existing.IsDir() {
+			err = nil
+		}
+	}
+	if err != nil {
+		m.failAfter(row, err, 2*time.Second)
+		return
+	}
+
+	now := time.Now()
+	res = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND is_dir = ?", row.ID, row.Generation, true).
+		Updates(map[string]any{
+			"state":        StateCompleted,
+			"completed_at": &now,
+			"retry_at":     nil,
+			"last_error":   "",
+			"retry_count":  0,
+		})
+	if res.Error != nil || res.RowsAffected == 0 {
+		return
+	}
+	if row.CleanupPath != "" && row.CleanupPath != row.Path {
+		_ = fs.Remove(m.ctx, row.CleanupPath)
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ?", row.ID, row.Generation).
+			Update("cleanup_path", "").Error
+	}
 }
 
 func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
@@ -952,8 +1108,8 @@ func retryDelay(retry int) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-func (m *workerManager) fail(row *model.WebDAVWritebackObject, err error) {
-	next := time.Now().Add(retryDelay(row.RetryCount))
+func (m *workerManager) failAfter(row *model.WebDAVWritebackObject, err error, delay time.Duration) {
+	next := time.Now().Add(delay)
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ?", row.ID, row.Generation).
 		Updates(map[string]any{
@@ -962,6 +1118,10 @@ func (m *workerManager) fail(row *model.WebDAVWritebackObject, err error) {
 			"retry_count": row.RetryCount + 1,
 			"last_error":  err.Error(),
 		}).Error
+}
+
+func (m *workerManager) fail(row *model.WebDAVWritebackObject, err error) {
+	m.failAfter(row, err, retryDelay(row.RetryCount))
 }
 
 func (m *workerManager) failDeleted(row *model.WebDAVWritebackObject, err error) {
