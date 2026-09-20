@@ -8,24 +8,24 @@ import "time"
 // PathKey and ParentKey are SHA-256 hex strings. Keeping hashes in indexes
 // avoids MySQL utf8mb4 index length limits for long WebDAV paths.
 type WebDAVWritebackObject struct {
-	ID               uint       `json:"id" gorm:"primaryKey"`
-	PathKey          string     `json:"path_key" gorm:"size:64;uniqueIndex"`
-	ParentKey        string     `json:"parent_key" gorm:"size:64;index"`
-	Path             string     `json:"path" gorm:"type:text"`
-	Parent           string     `json:"parent" gorm:"type:text"`
-	Name             string     `json:"name" gorm:"size:1024"`
-	IsDir            bool       `json:"is_dir" gorm:"index"`
-	Size             int64      `json:"size"`
-	ModTime          time.Time  `json:"mod_time"`
-	CreateTime       time.Time  `json:"create_time"`
-	ETag             string     `json:"etag" gorm:"size:160"`
-	Generation       uint64     `json:"generation"`
+	ID         uint      `json:"id" gorm:"primaryKey"`
+	PathKey    string    `json:"path_key" gorm:"size:64;uniqueIndex"`
+	ParentKey  string    `json:"parent_key" gorm:"size:64;index"`
+	Path       string    `json:"path" gorm:"type:text"`
+	Parent     string    `json:"parent" gorm:"type:text"`
+	Name       string    `json:"name" gorm:"size:1024"`
+	IsDir      bool      `json:"is_dir" gorm:"index"`
+	Size       int64     `json:"size"`
+	ModTime    time.Time `json:"mod_time"`
+	CreateTime time.Time `json:"create_time"`
+	ETag       string    `json:"etag" gorm:"size:160"`
+	Generation uint64    `json:"generation"`
 	// CanonicalState is the client-visible lifecycle. State below is retained as
 	// the provider-replication lifecycle so ACKed WebDAV identity cannot flap as
 	// the backing provider moves through queued/uploading/verifying/failed.
-	CanonicalState	string	`json:"canonical_state" gorm:"size:16"`
-	DurableAt	*time.Time	`json:"durable_at"`
-	State	string	`json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1"`
+	CanonicalState   string     `json:"canonical_state" gorm:"size:16"`
+	DurableAt        *time.Time `json:"durable_at"`
+	State            string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1"`
 	SpoolPath        string     `json:"spool_path" gorm:"type:text"`
 	PayloadSHA1      string     `json:"payload_sha1" gorm:"size:40"`
 	RemoteObjectID   string     `json:"remote_object_id" gorm:"size:255"`
@@ -49,17 +49,17 @@ type WebDAVWritebackObject struct {
 // independent from the canonical object preserves ordering across restart,
 // multiple OpenList instances, and later canonical-row reconciliation.
 type WebDAVWritebackReceiveFence struct {
-	ID                    uint      `json:"id" gorm:"primaryKey"`
-	PathKey               string    `json:"path_key" gorm:"size:64;uniqueIndex"`
-	Path                  string    `json:"path" gorm:"type:text"`
+	ID                    uint       `json:"id" gorm:"primaryKey"`
+	PathKey               string     `json:"path_key" gorm:"size:64;uniqueIndex"`
+	Path                  string     `json:"path" gorm:"type:text"`
 	NextSequence          uint64     `json:"next_sequence"`
 	LastCommittedSequence uint64     `json:"last_committed_sequence"`
-	ActiveReceivers	int	`json:"active_receivers"`
-	LatestExpectedSize	int64	`json:"latest_expected_size"`
-	LatestStartedAt	*time.Time	`json:"latest_started_at"`
-	ReceiveLeaseUntil	*time.Time	`json:"receive_lease_until"`
+	ActiveReceivers       int        `json:"active_receivers"`
+	LatestExpectedSize    int64      `json:"latest_expected_size"`
+	LatestStartedAt       *time.Time `json:"latest_started_at"`
+	ReceiveLeaseUntil     *time.Time `json:"receive_lease_until"`
 	CreatedAt             time.Time  `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
 }
 
 // WebDAVProviderOperation is a durable intent around synchronous provider

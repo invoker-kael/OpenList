@@ -42,8 +42,8 @@ const (
 	CanonicalStateDeleted  = "deleted"
 	CanonicalStateLockNull = "lock_null"
 
-	receiveLeaseDuration    = 15 * time.Minute
-	receiveHeartbeatEvery   = time.Minute
+	receiveLeaseDuration  = 15 * time.Minute
+	receiveHeartbeatEvery = time.Minute
 )
 
 var ErrCanonicalChanged = errors.New("canonical WebDAV state changed while staging provider delete")
@@ -112,7 +112,6 @@ func markCanonicalLockNull(row *model.WebDAVWritebackObject) {
 		row.DurableAt = nil
 	}
 }
-
 
 func pathKey(p string) string {
 	sum := sha256.Sum256([]byte(utils.FixAndCleanPath(p)))
@@ -2783,20 +2782,20 @@ func DeleteTree(p string) (bool, error) {
 		if !hasExact && matchedDescendant {
 			key := pathKey(p)
 			row := model.WebDAVWritebackObject{
-				PathKey:    key,
-				ParentKey:  pathKey(path.Dir(p)),
-				Path:       p,
-				Parent:     path.Dir(p),
-				Name:       path.Base(p),
-				IsDir:      true,
-				Size:       0,
-				ModTime:    now,
-				CreateTime: now,
-				ETag:       canonicalETag(key, 1, 0),
-				Generation:	1,
-				CanonicalState:	CanonicalStateDeleted,
-				State:		StateDeleted,
-				RetryAt:	&now,
+				PathKey:        key,
+				ParentKey:      pathKey(path.Dir(p)),
+				Path:           p,
+				Parent:         path.Dir(p),
+				Name:           path.Base(p),
+				IsDir:          true,
+				Size:           0,
+				ModTime:        now,
+				CreateTime:     now,
+				ETag:           canonicalETag(key, 1, 0),
+				Generation:     1,
+				CanonicalState: CanonicalStateDeleted,
+				State:          StateDeleted,
+				RetryAt:        &now,
 			}
 			if err := tx.Create(&row).Error; err != nil {
 				return err
@@ -3164,24 +3163,24 @@ func copyPendingDirectory(src, dst string, recursive bool) (handled bool, overwr
 			}
 
 			row := model.WebDAVWritebackObject{
-				PathKey:     pathKey(newPath),
-				ParentKey:   pathKey(newParent),
-				Path:        newPath,
-				Parent:      newParent,
-				Name:        path.Base(newPath),
-				IsDir:       sourceRow.IsDir,
-				Size:        sourceRow.Size,
-				ModTime:     sourceRow.ModTime,
-				CreateTime:  sourceRow.CreateTime,
-				ETag:        canonicalETag(pathKey(newPath), 1, sourceRow.Size),
-				Generation:	1,
-				CanonicalState:	CanonicalStateAcked,
-				DurableAt:	&now,
-				State:		StateQueued,
-				SpoolPath:   spoolPath,
-				PayloadSHA1: payloadSHA1,
-				MimeType:    sourceRow.MimeType,
-				RetryAt:     &retryAt,
+				PathKey:        pathKey(newPath),
+				ParentKey:      pathKey(newParent),
+				Path:           newPath,
+				Parent:         newParent,
+				Name:           path.Base(newPath),
+				IsDir:          sourceRow.IsDir,
+				Size:           sourceRow.Size,
+				ModTime:        sourceRow.ModTime,
+				CreateTime:     sourceRow.CreateTime,
+				ETag:           canonicalETag(pathKey(newPath), 1, sourceRow.Size),
+				Generation:     1,
+				CanonicalState: CanonicalStateAcked,
+				DurableAt:      &now,
+				State:          StateQueued,
+				SpoolPath:      spoolPath,
+				PayloadSHA1:    payloadSHA1,
+				MimeType:       sourceRow.MimeType,
+				RetryAt:        &retryAt,
 			}
 			if err := tx.Create(&row).Error; err != nil {
 				return err
@@ -3558,20 +3557,20 @@ func providerMoveSourceTombstone(src string, source model.Obj, now time.Time) mo
 	}
 	key := pathKey(src)
 	return model.WebDAVWritebackObject{
-		PathKey:    key,
-		ParentKey:  pathKey(path.Dir(src)),
-		Path:       src,
-		Parent:     path.Dir(src),
-		Name:       path.Base(src),
-		IsDir:      isDir,
-		Size:       size,
-		ModTime:    modTime,
-		CreateTime: createTime,
-		ETag:       canonicalETag(key, 1, size),
-		Generation:	1,
-		CanonicalState:	CanonicalStateDeleted,
-		State:		StateDeleted,
-		RetryAt:	&now,
+		PathKey:        key,
+		ParentKey:      pathKey(path.Dir(src)),
+		Path:           src,
+		Parent:         path.Dir(src),
+		Name:           path.Base(src),
+		IsDir:          isDir,
+		Size:           size,
+		ModTime:        modTime,
+		CreateTime:     createTime,
+		ETag:           canonicalETag(key, 1, size),
+		Generation:     1,
+		CanonicalState: CanonicalStateDeleted,
+		State:          StateDeleted,
+		RetryAt:        &now,
 	}
 }
 
