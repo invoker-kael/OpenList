@@ -131,11 +131,21 @@ func walkFS(ctx context.Context, depth int, name string, info model.Obj, walkFn 
 	// Read directory names.
 	objs, err := fs.List(context.WithValue(ctx, conf.MetaKey, meta), name, &fs.ListArgs{})
 	if writeback.Enabled() {
-		overlaid, hasWriteback, overlayErr := writeback.OverlayList(name, objs, err == nil)
+		remoteReliable := err == nil
+		overlaid, hasWriteback, overlayErr := writeback.OverlayList(name, objs, remoteReliable)
 		if overlayErr != nil {
 			return walkFn(name, info, overlayErr)
 		}
-		if err == nil || hasWriteback {
+		canonicalParent := false
+		if canonical, found, deleted, canonicalErr := writeback.Canonical(name); canonicalErr != nil {
+			return walkFn(name, info, canonicalErr)
+		} else if found && !deleted && canonical != nil && canonical.IsDir() {
+			canonicalParent = true
+		}
+		// A just-created canonical directory is a valid empty collection even
+		// before an eventually-consistent provider can list it. This is needed
+		// for Cloud Sync's immediate MKCOL -> PROPFIND directory scan.
+		if remoteReliable || hasWriteback || canonicalParent {
 			objs = overlaid
 			err = nil
 		}
