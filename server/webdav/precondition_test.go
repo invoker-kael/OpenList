@@ -209,7 +209,6 @@ func TestCanonicalReadRequestDropsRangeOnIfRangeMismatch(t *testing.T) {
 	}
 }
 
-
 func TestProviderConsistencyConfirmationDelay(t *testing.T) {
 	tests := []struct {
 		name     string

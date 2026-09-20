@@ -128,6 +128,21 @@ func canReverifyCompletedDuplicatePut(row *model.WebDAVWritebackObject, size int
 	return canonicalSHA1 != "" && strings.EqualFold(canonicalSHA1, payloadSHA1)
 }
 
+func applyDuplicatePutMetadata(row *model.WebDAVWritebackObject, modTime, createTime time.Time, mime string) {
+	if row == nil {
+		return
+	}
+	if !modTime.IsZero() {
+		row.ModTime = modTime
+	}
+	if !createTime.IsZero() {
+		row.CreateTime = createTime
+	}
+	if mime != "" {
+		row.MimeType = mime
+	}
+}
+
 var ErrDestinationExists = errors.New("write-back destination already exists")
 
 func removeSpoolIfUnreferenced(spoolPath string) {
@@ -581,14 +596,24 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			if canCoalesceDuplicatePut(&row, actualSize, payloadSHA1) {
 				if _, statErr := os.Stat(row.SpoolPath); statErr == nil {
 					duplicate = true
+					applyDuplicatePutMetadata(&row, modTime, createTime, mime)
+					updates := map[string]any{
+						"mod_time":    row.ModTime,
+						"create_time": row.CreateTime,
+						"mime_type":   row.MimeType,
+					}
 					if row.State == StateQueued || row.State == StateFailed {
 						now := time.Now()
 						row.RetryAt = &now
 						row.LastError = ""
-						if err := tx.Save(&row).Error; err != nil {
-							return err
-						}
+						updates["retry_at"] = &now
+						updates["last_error"] = ""
 						wakeDuplicate = true
+					}
+					if err := tx.Model(&model.WebDAVWritebackObject{}).
+						Where("id = ? AND generation = ?", row.ID, row.Generation).
+						Updates(updates).Error; err != nil {
+						return err
 					}
 					saved = row
 					return nil
@@ -596,10 +621,10 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			}
 			if canReverifyCompletedDuplicatePut(&row, actualSize, payloadSHA1) {
 				now := time.Now()
+				applyDuplicatePutMetadata(&row, modTime, createTime, mime)
 				row.State = StateVerifying
 				row.SpoolPath = finalName
 				row.PayloadSHA1 = payloadSHA1
-				row.MimeType = mime
 				row.CleanupPath = ""
 				row.LastError = ""
 				row.RetryCount = 0

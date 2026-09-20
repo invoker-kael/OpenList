@@ -932,3 +932,32 @@ func TestCanReverifyCompletedDuplicatePut(t *testing.T) {
 		t.Fatal("stale remote evidence must not coalesce a newer canonical generation")
 	}
 }
+
+
+func TestApplyDuplicatePutMetadataKeepsContentGenerationStable(t *testing.T) {
+	oldMod := time.Date(2026, time.September, 20, 1, 0, 0, 0, time.UTC)
+	oldCreate := oldMod.Add(-time.Hour)
+	newMod := oldMod.Add(2 * time.Hour)
+	newCreate := oldCreate.Add(30 * time.Minute)
+	row := &model.WebDAVWritebackObject{
+		Generation: 7,
+		ETag:       canonicalETag(pathKey("/encrypted/file.bin"), 7, 4096),
+		ModTime:    oldMod,
+		CreateTime: oldCreate,
+		MimeType:   "application/octet-stream",
+	}
+
+	oldGeneration := row.Generation
+	oldETag := row.ETag
+	applyDuplicatePutMetadata(row, newMod, newCreate, "application/x-cloudsync")
+
+	if !row.ModTime.Equal(newMod) || !row.CreateTime.Equal(newCreate) {
+		t.Fatalf("duplicate PUT metadata = %v/%v, want %v/%v", row.ModTime, row.CreateTime, newMod, newCreate)
+	}
+	if row.MimeType != "application/x-cloudsync" {
+		t.Fatalf("duplicate PUT mime = %q", row.MimeType)
+	}
+	if row.Generation != oldGeneration || row.ETag != oldETag {
+		t.Fatal("metadata-only duplicate PUT must not manufacture a new content generation or ETag")
+	}
+}
