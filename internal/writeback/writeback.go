@@ -1584,7 +1584,7 @@ func refreshCompletedRemoteVerification(row *model.WebDAVWritebackObject, remote
 	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
 		Updates(map[string]any{
-			"verify_count":        0,
+			"verify_count":       0,
 			"retry_at":           nil,
 			"last_error":         "",
 			"remote_object_id":   evidence.objectID,
