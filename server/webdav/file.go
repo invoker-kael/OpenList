@@ -20,6 +20,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/writeback"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
 )
 
@@ -120,6 +121,69 @@ func copyExactTree(ctx context.Context, src, dst string, srcObj model.Obj, depth
 	})
 }
 
+func providerResourceAbsent(ctx context.Context, name string) (bool, error) {
+	remote, getErr := fs.Get(ctx, name, &fs.GetArgs{NoLog: true})
+	if getErr == nil && remote != nil {
+		return false, nil
+	}
+	if getErr != nil && !errs.IsObjectNotFound(getErr) {
+		return false, getErr
+	}
+	parent := path.Dir(name)
+	objs, listErr := fs.List(ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	if listErr != nil {
+		if errs.IsObjectNotFound(listErr) {
+			return true, nil
+		}
+		return false, listErr
+	}
+	targetName := path.Base(name)
+	for _, obj := range objs {
+		if obj.GetName() == targetName {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func moveNeedsStaging(src, dst string) bool {
+	return path.Dir(src) != path.Dir(dst) && path.Base(src) != path.Base(dst)
+}
+
+func rollbackStagedMove(ctx context.Context, stagedPath, srcDir, srcName, tempName string) {
+	if path.Dir(stagedPath) != srcDir {
+		if _, err := fs.Move(context.WithValue(ctx, conf.NoTaskKey, struct{}{}), stagedPath, srcDir); err != nil {
+			return
+		}
+		stagedPath = path.Join(srcDir, tempName)
+	}
+	_ = fs.Rename(ctx, stagedPath, srcName)
+}
+
+func moveAcrossDirsExact(ctx context.Context, src, dst string) error {
+	srcDir := path.Dir(src)
+	dstDir := path.Dir(dst)
+	srcName := path.Base(src)
+	dstName := path.Base(dst)
+	tempName := ".openlist-webdav-move-" + uuid.NewString()
+
+	if err := fs.Rename(ctx, src, tempName); err != nil {
+		return err
+	}
+	tempSrc := path.Join(srcDir, tempName)
+	if _, err := fs.Move(context.WithValue(ctx, conf.NoTaskKey, struct{}{}), tempSrc, dstDir); err != nil {
+		rollbackStagedMove(ctx, tempSrc, srcDir, srcName, tempName)
+		return err
+	}
+
+	movedTemp := path.Join(dstDir, tempName)
+	if err := fs.Rename(ctx, movedTemp, dstName); err != nil {
+		rollbackStagedMove(ctx, movedTemp, srcDir, srcName, tempName)
+		return err
+	}
+	return nil
+}
+
 // moveFiles moves files and/or directories from src to dst.
 // Individual item permission checks are skipped for performance reasons.
 //
@@ -147,6 +211,7 @@ func moveFiles(ctx context.Context, src, dst string, overwrite bool) (status int
 	if !common.CanWrite(user, srcMeta, srcDir) || !common.CanWrite(user, dstMeta, dstDir) {
 		return http.StatusForbidden, nil
 	}
+
 	dstExists, err := resourceExists(ctx, dst)
 	if err != nil {
 		return http.StatusInternalServerError, err
@@ -154,16 +219,30 @@ func moveFiles(ctx context.Context, src, dst string, overwrite bool) (status int
 	if dstExists && !overwrite {
 		return http.StatusPreconditionFailed, nil
 	}
-	if srcDir == dstDir {
-		err = fs.Rename(ctx, src, dstName)
-	} else {
-		_, err = fs.Move(context.WithValue(ctx, conf.NoTaskKey, struct{}{}), src, dstDir)
-		if err != nil {
+	if dstExists {
+		if err := fs.Remove(ctx, dst); err != nil {
 			return http.StatusInternalServerError, err
 		}
-		if srcName != dstName {
-			err = fs.Rename(ctx, path.Join(dstDir, srcName), dstName)
+		absent, verifyErr := providerResourceAbsent(ctx, dst)
+		if verifyErr != nil {
+			return http.StatusInternalServerError, verifyErr
 		}
+		if !absent {
+			// Do not move the source until the provider has stopped exposing
+			// the overwritten destination. On 115 this prevents a rename from
+			// silently producing duplicate same-name objects in the consistency
+			// window.
+			return http.StatusServiceUnavailable, nil
+		}
+	}
+
+	switch {
+	case srcDir == dstDir:
+		err = fs.Rename(ctx, src, dstName)
+	case moveNeedsStaging(src, dst):
+		err = moveAcrossDirsExact(ctx, src, dst)
+	default:
+		_, err = fs.Move(context.WithValue(ctx, conf.NoTaskKey, struct{}{}), src, dstDir)
 	}
 	if err != nil {
 		return http.StatusInternalServerError, err

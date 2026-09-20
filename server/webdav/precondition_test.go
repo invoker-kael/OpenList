@@ -55,3 +55,23 @@ func TestCopyCanUseNative(t *testing.T) {
 	}
 }
 
+func TestMoveNeedsStaging(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		dst  string
+		want bool
+	}{
+		{name: "cross directory rename", src: "/a/foo.bin", dst: "/b/bar.bin", want: true},
+		{name: "cross directory same name", src: "/a/foo.bin", dst: "/b/foo.bin", want: false},
+		{name: "same directory rename", src: "/a/foo.bin", dst: "/a/bar.bin", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := moveNeedsStaging(tt.src, tt.dst); got != tt.want {
+				t.Fatalf("moveNeedsStaging(%q, %q) = %v, want %v", tt.src, tt.dst, got, tt.want)
+			}
+		})
+	}
+}
+
