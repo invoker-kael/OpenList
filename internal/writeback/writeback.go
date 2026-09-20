@@ -509,7 +509,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	}
 
 	if oldSpool != "" && oldSpool != finalName {
-		if _, active := activeSpools.Load(oldSpool); !active {
+		if !spoolIsActive(oldSpool) {
 			removeSpoolIfUnreferenced(oldSpool)
 		}
 	}
@@ -789,7 +789,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		return true, overwritten, err
 	}
 	if oldDestinationSpool != "" {
-		if _, active := activeSpools.Load(oldDestinationSpool); !active {
+		if !spoolIsActive(oldDestinationSpool) {
 			removeSpoolIfUnreferenced(oldDestinationSpool)
 		}
 	}
@@ -883,7 +883,7 @@ func CopyPending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		return true, overwritten, err
 	}
 	if oldDestinationSpool != "" && oldDestinationSpool != srcRow.SpoolPath {
-		if _, active := activeSpools.Load(oldDestinationSpool); !active {
+		if !spoolIsActive(oldDestinationSpool) {
 			removeSpoolIfUnreferenced(oldDestinationSpool)
 		}
 	}
@@ -937,10 +937,32 @@ func MoveTreeMetadata(src, dst string) error {
 }
 
 var (
-	managerMu    sync.Mutex
-	manager      *workerManager
-	activeSpools sync.Map
+	managerMu      sync.Mutex
+	manager        *workerManager
+	activeSpoolMu  sync.Mutex
+	activeSpoolRef = make(map[string]int)
 )
+
+func markSpoolActive(spoolPath string) func() {
+	activeSpoolMu.Lock()
+	activeSpoolRef[spoolPath]++
+	activeSpoolMu.Unlock()
+	return func() {
+		activeSpoolMu.Lock()
+		if activeSpoolRef[spoolPath] <= 1 {
+			delete(activeSpoolRef, spoolPath)
+		} else {
+			activeSpoolRef[spoolPath]--
+		}
+		activeSpoolMu.Unlock()
+	}
+}
+
+func spoolIsActive(spoolPath string) bool {
+	activeSpoolMu.Lock()
+	defer activeSpoolMu.Unlock()
+	return activeSpoolRef[spoolPath] > 0
+}
 
 type workerManager struct {
 	ctx      context.Context
@@ -1177,9 +1199,9 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		m.fail(row, err)
 		return
 	}
-	activeSpools.Store(row.SpoolPath, struct{}{})
+	releaseActiveSpool := markSpoolActive(row.SpoolPath)
 	defer func() {
-		activeSpools.Delete(row.SpoolPath)
+		releaseActiveSpool()
 		_ = f.Close()
 	}()
 
@@ -1475,7 +1497,7 @@ func (m *workerManager) cleanupCompleted() {
 	}
 	for i := range rows {
 		row := &rows[i]
-		if _, active := activeSpools.Load(row.SpoolPath); active {
+		if spoolIsActive(row.SpoolPath) {
 			continue
 		}
 		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
