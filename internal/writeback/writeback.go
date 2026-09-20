@@ -383,7 +383,7 @@ func providerOperationTreeObjects(ctx context.Context, current string, overlay b
 	}
 
 	remoteReliable := err == nil
-	overlaid, hasWriteback, overlayErr := OverlayList(current, objs, remoteReliable)
+	overlaid, hasWriteback, overlayErr := OverlayList(ctx, current, objs, remoteReliable)
 	if overlayErr != nil {
 		return nil, overlayErr
 	}
