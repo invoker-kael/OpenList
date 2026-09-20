@@ -448,7 +448,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 		mimeType = utils.GetMimeType(reqPath)
 	}
 	if writeback.Enabled() {
-		row, wbErr := writeback.Commit(ctx, reqPath, r.Body, size, obj.Modified, obj.Ctime, mimeType)
+		row, created, wbErr := writeback.Commit(ctx, reqPath, r.Body, size, obj.Modified, obj.Ctime, mimeType)
 		if wbErr != nil {
 			if strings.Contains(wbErr.Error(), "free space") {
 				return StatusInsufficientStorage, wbErr
@@ -456,7 +456,10 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 			return http.StatusInternalServerError, wbErr
 		}
 		w.Header().Set("Etag", row.ETag)
-		return http.StatusCreated, nil
+		if created {
+			return http.StatusCreated, nil
+		}
+		return http.StatusNoContent, nil
 	}
 	fsStream := &stream.FileStream{
 		Obj:      &obj,
