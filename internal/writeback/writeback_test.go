@@ -109,3 +109,21 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 		t.Fatal("pending upload must remain visible even before provider listing catches up")
 	}
 }
+
+
+func TestReceivingPathReferenceCount(t *testing.T) {
+	p := "/encrypted/placeholder.bin"
+	release1 := beginReceiving(p)
+	release2 := beginReceiving(p)
+	if !isReceiving(p) {
+		t.Fatal("path should be marked receiving while PUTs are active")
+	}
+	release1()
+	if !isReceiving(p) {
+		t.Fatal("path should stay receiving until all overlapping PUTs finish")
+	}
+	release2()
+	if isReceiving(p) {
+		t.Fatal("path should stop receiving after the final PUT finishes")
+	}
+}
