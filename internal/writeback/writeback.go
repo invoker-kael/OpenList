@@ -186,7 +186,40 @@ func reserveBytes() uint64 {
 var (
 	spaceMu          sync.Mutex
 	reservedIncoming uint64
+	receivingMu      sync.Mutex
+	receivingPaths   = make(map[string]int)
 )
+
+func beginReceiving(p string) func() {
+	key := pathKey(p)
+	receivingMu.Lock()
+	receivingPaths[key]++
+	receivingMu.Unlock()
+	return func() {
+		receivingMu.Lock()
+		if receivingPaths[key] <= 1 {
+			delete(receivingPaths, key)
+		} else {
+			receivingPaths[key]--
+		}
+		receivingMu.Unlock()
+	}
+}
+
+func isReceiving(p string) bool {
+	key := pathKey(p)
+	receivingMu.Lock()
+	defer receivingMu.Unlock()
+	return receivingPaths[key] > 0
+}
+
+func cloudSyncSettleDelay() time.Duration {
+	ms := conf.Conf.WebDAVWriteback.CloudSyncSettleMillis
+	if ms < 0 {
+		ms = 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 func checkFreeSpace(extra uint64) error {
 	usage, err := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
@@ -273,25 +306,27 @@ func syncDir(dir string) {
 
 // Commit receives the complete opaque WebDAV object into the local spool and
 // only then commits a new canonical generation into MySQL.
-func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTime, createTime time.Time, mime string) (*model.WebDAVWritebackObject, error) {
+func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTime, createTime time.Time, mime string) (*model.WebDAVWritebackObject, bool, error) {
 	if !Enabled() {
-		return nil, errors.New("WebDAV write-back is disabled")
+		return nil, false, errors.New("WebDAV write-back is disabled")
 	}
 	p = utils.FixAndCleanPath(p)
+	releaseReceiving := beginReceiving(p)
+	defer releaseReceiving()
 	spoolDir := conf.Conf.WebDAVWriteback.SpoolDir
 	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	releaseReservation, err := reserveIncomingBytes(expected)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer releaseReservation()
 
 	tmp, err := os.CreateTemp(spoolDir, "recv-*.part")
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	tmpName := tmp.Name()
 	committed := false
@@ -304,17 +339,17 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 
 	actualSize, err := copyToSpool(tmp, body, expected)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := tmp.Sync(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := tmp.Close(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	finalName := filepath.Join(spoolDir, uuid.NewString()+".data")
 	if err := os.Rename(tmpName, finalName); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	syncDir(spoolDir)
 	committed = true
@@ -329,6 +364,8 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	key := pathKey(p)
 	var oldSpool string
 	var saved model.WebDAVWritebackObject
+	created := false
+	settleAt := time.Now().Add(cloudSyncSettleDelay())
 
 	err = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var row model.WebDAVWritebackObject
@@ -340,6 +377,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			oldSpool = row.SpoolPath
 			row.Generation++
 		} else {
+			created = true
 			row.Generation = 1
 		}
 
@@ -359,7 +397,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		row.LastError = ""
 		row.RetryCount = 0
 		row.VerifyCount = 0
-		row.RetryAt = nil
+		row.RetryAt = &settleAt
 		row.CompletedAt = nil
 
 		if row.ID == 0 {
@@ -374,7 +412,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	})
 	if err != nil {
 		_ = os.Remove(finalName)
-		return nil, err
+		return nil, false, err
 	}
 
 	if oldSpool != "" && oldSpool != finalName {
@@ -383,7 +421,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		}
 	}
 	wake()
-	return &saved, nil
+	return &saved, created, nil
 }
 
 func OpenLocal(p string) (*os.File, *model.WebDAVWritebackObject, error) {
@@ -755,6 +793,13 @@ func shouldRemoveStaleRemote(uploadedPath string, current *model.WebDAVWriteback
 }
 
 func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
+	if isReceiving(row.Path) {
+		next := time.Now().Add(time.Second)
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
+			Update("retry_at", &next).Error
+		return
+	}
 	if row.SpoolPath == "" {
 		m.fail(row, errors.New("spool payload is missing"))
 		return
