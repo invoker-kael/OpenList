@@ -409,6 +409,26 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 	if !common.CanWrite(user, parentMeta, parentPath) {
 		return http.StatusForbidden, errs.PermissionDenied
 	}
+	if writeback.Enabled() {
+		// Provider-only objects do not have a canonical row yet. Seed a
+		// canonical-only placeholder and immediately tombstone it so the stable
+		// WebDAV view hides the object before an eventually-consistent provider
+		// can expose the old name again. The normal write-back delete worker then
+		// owns provider removal and the two-pass absence verification.
+		if _, _, wbErr := writeback.CommitLockNull(ctx, reqPath, time.Now(), -1); wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
+		handled, wbErr := writeback.DeleteTree(reqPath)
+		if wbErr != nil {
+			_ = writeback.ReleaseLockNull(ctx, reqPath)
+			return http.StatusInternalServerError, wbErr
+		}
+		if !handled {
+			_ = writeback.ReleaseLockNull(ctx, reqPath)
+			return http.StatusInternalServerError, errors.New("failed to stage WebDAV delete tombstone")
+		}
+		return http.StatusNoContent, nil
+	}
 	if err := fs.Remove(ctx, reqPath); err != nil {
 		return http.StatusMethodNotAllowed, err
 	}
