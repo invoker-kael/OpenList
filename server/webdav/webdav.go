@@ -509,13 +509,68 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 		return http.StatusUnsupportedMediaType, nil
 	}
 
-	// RFC 4918 9.3.1
-	//405 (Method Not Allowed) - MKCOL can only be executed on an unmapped URL
+	// RFC 4918 9.3.1: MKCOL can only create an unmapped URL. In write-back
+	// mode the canonical shadow is authoritative while the provider catches up.
+	if writeback.Enabled() {
+		fi, found, deleted, wbErr := writeback.Canonical(reqPath)
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
+		if found && !deleted && fi != nil {
+			return http.StatusMethodNotAllowed, nil
+		}
+		if !found {
+			if _, getErr := fs.Get(ctx, reqPath, &fs.GetArgs{}); getErr == nil {
+				return http.StatusMethodNotAllowed, nil
+			} else if !errs.IsObjectNotFound(getErr) {
+				return http.StatusMethodNotAllowed, getErr
+			}
+		}
+
+		parentPath := path.Dir(reqPath)
+		parentOK := false
+		parentObj, parentFound, parentDeleted, wbErr := writeback.Canonical(parentPath)
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
+		if parentFound && !parentDeleted && parentObj != nil {
+			parentOK = parentObj.IsDir()
+		} else if !parentFound {
+			parentObj, getErr := fs.Get(ctx, parentPath, &fs.GetArgs{})
+			if getErr == nil {
+				parentOK = parentObj.IsDir()
+			} else if !errs.IsObjectNotFound(getErr) {
+				return http.StatusMethodNotAllowed, getErr
+			}
+		}
+		if !parentOK {
+			return http.StatusConflict, errs.ObjectNotFound
+		}
+
+		parentMeta, metaErr := op.GetNearestMeta(parentPath)
+		if metaErr != nil && !errors.Is(errors.Cause(metaErr), errs.MetaNotFound) {
+			return http.StatusInternalServerError, metaErr
+		}
+		if !user.CanWriteContent() && !common.CanWriteContentBypassUserPerms(parentMeta, parentPath) {
+			return http.StatusForbidden, errs.PermissionDenied
+		}
+		if !common.CanWrite(user, parentMeta, parentPath) {
+			return http.StatusForbidden, errs.PermissionDenied
+		}
+		_, _, wbErr = writeback.CommitDir(ctx, reqPath, time.Now(), time.Now())
+		if errors.Is(wbErr, writeback.ErrDestinationExists) {
+			return http.StatusMethodNotAllowed, wbErr
+		}
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
+		return http.StatusCreated, nil
+	}
+
+	// Standard synchronous OpenList WebDAV behavior when write-back is disabled.
 	if _, err := fs.Get(ctx, reqPath, &fs.GetArgs{}); err == nil {
 		return http.StatusMethodNotAllowed, err
 	}
-	// RFC 4918 9.3.1
-	// 409 (Conflict) The server MUST NOT create those intermediate collections automatically.
 	parentPath := path.Dir(reqPath)
 	if _, err := fs.Get(ctx, parentPath, &fs.GetArgs{}); err != nil {
 		if errs.IsObjectNotFound(err) {
