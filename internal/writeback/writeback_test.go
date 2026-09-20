@@ -949,7 +949,7 @@ func TestApplyDuplicatePutMetadataKeepsContentGenerationStable(t *testing.T) {
 
 	oldGeneration := row.Generation
 	oldETag := row.ETag
-	applyDuplicatePutMetadata(row, newMod, newCreate, "application/x-cloudsync")
+	applyDuplicatePutMetadata(row, newMod, newCreate, "application/x-cloudsync", true, true)
 
 	if !row.ModTime.Equal(newMod) || !row.CreateTime.Equal(newCreate) {
 		t.Fatalf("duplicate PUT metadata = %v/%v, want %v/%v", row.ModTime, row.CreateTime, newMod, newCreate)
@@ -959,5 +959,33 @@ func TestApplyDuplicatePutMetadataKeepsContentGenerationStable(t *testing.T) {
 	}
 	if row.Generation != oldGeneration || row.ETag != oldETag {
 		t.Fatal("metadata-only duplicate PUT must not manufacture a new content generation or ETag")
+	}
+}
+
+
+func TestApplyDuplicatePutMetadataPreservesOmittedTimes(t *testing.T) {
+	oldMod := time.Date(2026, time.September, 20, 1, 0, 0, 0, time.UTC)
+	oldCreate := oldMod.Add(-time.Hour)
+	row := &model.WebDAVWritebackObject{
+		Generation: 9,
+		ModTime:    oldMod,
+		CreateTime: oldCreate,
+		MimeType:   "application/octet-stream",
+	}
+
+	applyDuplicatePutMetadata(
+		row,
+		oldMod.Add(4*time.Hour),
+		oldCreate.Add(4*time.Hour),
+		"application/x-cloudsync",
+		false,
+		false,
+	)
+
+	if !row.ModTime.Equal(oldMod) || !row.CreateTime.Equal(oldCreate) {
+		t.Fatalf("omitted duplicate timestamps changed canonical times to %v/%v", row.ModTime, row.CreateTime)
+	}
+	if row.MimeType != "application/x-cloudsync" {
+		t.Fatalf("mime metadata should still converge, got %q", row.MimeType)
 	}
 }

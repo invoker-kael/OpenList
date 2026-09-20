@@ -1,6 +1,8 @@
 package webdav
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -227,5 +229,37 @@ func TestProviderConsistencyConfirmationDelay(t *testing.T) {
 				t.Fatalf("providerConsistencyConfirmationDelay(%q, %d) = %v, want %v", tt.storage, tt.interval, got, tt.want)
 			}
 		})
+	}
+}
+
+
+func TestRetryMetadataReconciliation(t *testing.T) {
+	attempts := 0
+	err := retryMetadataReconciliation(context.Background(), func() error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("transient mysql error")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryMetadataReconciliation() error = %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("retryMetadataReconciliation() attempts = %d, want 3", attempts)
+	}
+}
+
+func TestRetryMetadataReconciliationStopsAfterSuccess(t *testing.T) {
+	attempts := 0
+	err := retryMetadataReconciliation(context.Background(), func() error {
+		attempts++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryMetadataReconciliation() error = %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("retryMetadataReconciliation() attempts = %d, want 1", attempts)
 	}
 }

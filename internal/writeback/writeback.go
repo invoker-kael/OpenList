@@ -128,14 +128,14 @@ func canReverifyCompletedDuplicatePut(row *model.WebDAVWritebackObject, size int
 	return canonicalSHA1 != "" && strings.EqualFold(canonicalSHA1, payloadSHA1)
 }
 
-func applyDuplicatePutMetadata(row *model.WebDAVWritebackObject, modTime, createTime time.Time, mime string) {
+func applyDuplicatePutMetadata(row *model.WebDAVWritebackObject, modTime, createTime time.Time, mime string, modTimeProvided, createTimeProvided bool) {
 	if row == nil {
 		return
 	}
-	if !modTime.IsZero() {
+	if modTimeProvided {
 		row.ModTime = modTime
 	}
-	if !createTime.IsZero() {
+	if createTimeProvided {
 		row.CreateTime = createTime
 	}
 	if mime != "" {
@@ -528,6 +528,8 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		return nil, false, errors.New("WebDAV write-back is disabled")
 	}
 	p = utils.FixAndCleanPath(p)
+	modTimeProvided := !modTime.IsZero()
+	createTimeProvided := !createTime.IsZero()
 	releaseReceiving := beginReceiving(p)
 	defer releaseReceiving()
 	spoolDir := conf.Conf.WebDAVWriteback.SpoolDir
@@ -596,7 +598,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			if canCoalesceDuplicatePut(&row, actualSize, payloadSHA1) {
 				if _, statErr := os.Stat(row.SpoolPath); statErr == nil {
 					duplicate = true
-					applyDuplicatePutMetadata(&row, modTime, createTime, mime)
+					applyDuplicatePutMetadata(&row, modTime, createTime, mime, modTimeProvided, createTimeProvided)
 					updates := map[string]any{
 						"mod_time":    row.ModTime,
 						"create_time": row.CreateTime,
@@ -621,7 +623,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			}
 			if canReverifyCompletedDuplicatePut(&row, actualSize, payloadSHA1) {
 				now := time.Now()
-				applyDuplicatePutMetadata(&row, modTime, createTime, mime)
+				applyDuplicatePutMetadata(&row, modTime, createTime, mime, modTimeProvided, createTimeProvided)
 				row.State = StateVerifying
 				row.SpoolPath = finalName
 				row.PayloadSHA1 = payloadSHA1
@@ -2474,7 +2476,7 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 	if nextCount >= attempts {
 		next := time.Now().Add(retryDelay(row.RetryCount + 1))
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-			Where("id = ? AND generation = ?", row.ID, row.Generation).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
 			Updates(map[string]any{
 				"state":        StateQueued,
 				"retry_at":     &next,
@@ -2491,14 +2493,15 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		msg = err.Error()
 	} else if remote != nil {
 		remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
-		if row.PayloadSHA1 != "" && remoteSHA1 != "" && !strings.EqualFold(remoteSHA1, row.PayloadSHA1) {
-			msg = fmt.Sprintf("remote sha1 %s does not match canonical sha1 %s", remoteSHA1, row.PayloadSHA1)
+		expectedSHA1 := canonicalContentSHA1(row)
+		if expectedSHA1 != "" && remoteSHA1 != "" && !strings.EqualFold(remoteSHA1, expectedSHA1) {
+			msg = fmt.Sprintf("remote sha1 %s does not match canonical sha1 %s", remoteSHA1, expectedSHA1)
 		} else {
 			msg = fmt.Sprintf("remote size %d does not match canonical size %d", remote.GetSize(), row.Size)
 		}
 	}
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("id = ? AND generation = ?", row.ID, row.Generation).
+		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
 		Updates(map[string]any{
 			"state":        StateVerifying,
 			"retry_at":     &next,

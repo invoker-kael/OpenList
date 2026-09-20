@@ -681,6 +681,27 @@ func copyMoveProviderSucceeded(status int) bool {
 	return status == http.StatusCreated || status == http.StatusNoContent
 }
 
+func retryMetadataReconciliation(ctx context.Context, fn func() error) error {
+	var lastErr error
+	for attempt, delay := range []time.Duration{0, 50 * time.Millisecond, 200 * time.Millisecond} {
+		if attempt > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		if err := fn(); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
 func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status int, err error) {
 	hdr := r.Header.Get("Destination")
 	if hdr == "" {
@@ -786,7 +807,9 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 		}
 		copyStatus, copyErr := copyFiles(ctx, src, dst, overwrite, depth)
 		if copyErr == nil && writeback.Enabled() && copyMoveProviderSucceeded(copyStatus) {
-			if wbErr := writeback.CopyTreeMetadata(src, dst, sourceRoot); wbErr != nil {
+			if wbErr := retryMetadataReconciliation(ctx, func() error {
+				return writeback.CopyTreeMetadata(src, dst, sourceRoot)
+			}); wbErr != nil {
 				return http.StatusInternalServerError, wbErr
 			}
 		}
@@ -861,7 +884,9 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 	}
 	moveStatus, moveErr := moveFiles(ctx, src, dst, overwrite)
 	if moveErr == nil && writeback.Enabled() && copyMoveProviderSucceeded(moveStatus) {
-		if wbErr := writeback.MoveTreeMetadata(src, dst, sourceRoot); wbErr != nil {
+		if wbErr := retryMetadataReconciliation(ctx, func() error {
+			return writeback.MoveTreeMetadata(src, dst, sourceRoot)
+		}); wbErr != nil {
 			return http.StatusInternalServerError, wbErr
 		}
 	}
