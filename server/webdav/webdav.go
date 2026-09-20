@@ -729,18 +729,34 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 		}
 		overwrite := r.Header.Get("Overwrite") != "F"
 		if writeback.Enabled() {
-			handled, overwritten, wbErr := writeback.CopyPending(src, dst, overwrite)
-			if errors.Is(wbErr, writeback.ErrDestinationExists) {
-				return http.StatusPreconditionFailed, wbErr
+			dstExists, existsErr := resourceExists(ctx, dst)
+			if existsErr != nil {
+				return http.StatusInternalServerError, existsErr
 			}
+			if dstExists && !overwrite {
+				return http.StatusPreconditionFailed, nil
+			}
+			_, dstTracked, _, wbErr := writeback.Canonical(dst)
 			if wbErr != nil {
 				return http.StatusInternalServerError, wbErr
 			}
-			if handled {
-				if overwritten {
-					return http.StatusNoContent, nil
+			// A provider-only destination must use the provider path so overwrite
+			// semantics are applied to the real remote object. Canonical/tombstoned
+			// destinations can stay entirely inside the write-back transaction.
+			if !dstExists || dstTracked {
+				handled, overwritten, wbErr := writeback.CopyPending(src, dst, overwrite)
+				if errors.Is(wbErr, writeback.ErrDestinationExists) {
+					return http.StatusPreconditionFailed, wbErr
 				}
-				return http.StatusCreated, nil
+				if wbErr != nil {
+					return http.StatusInternalServerError, wbErr
+				}
+				if handled {
+					if dstExists || overwritten {
+						return http.StatusNoContent, nil
+					}
+					return http.StatusCreated, nil
+				}
 			}
 		}
 		return copyFiles(ctx, src, dst, overwrite)
@@ -754,18 +770,31 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 
 	overwrite := r.Header.Get("Overwrite") != "F"
 	if writeback.Enabled() {
-		handled, overwritten, wbErr := writeback.MovePending(src, dst, overwrite)
-		if errors.Is(wbErr, writeback.ErrDestinationExists) {
-			return http.StatusPreconditionFailed, wbErr
+		dstExists, existsErr := resourceExists(ctx, dst)
+		if existsErr != nil {
+			return http.StatusInternalServerError, existsErr
 		}
+		if dstExists && !overwrite {
+			return http.StatusPreconditionFailed, nil
+		}
+		_, dstTracked, _, wbErr := writeback.Canonical(dst)
 		if wbErr != nil {
 			return http.StatusInternalServerError, wbErr
 		}
-		if handled {
-			if overwritten {
-				return http.StatusNoContent, nil
+		if !dstExists || dstTracked {
+			handled, overwritten, wbErr := writeback.MovePending(src, dst, overwrite)
+			if errors.Is(wbErr, writeback.ErrDestinationExists) {
+				return http.StatusPreconditionFailed, wbErr
 			}
-			return http.StatusCreated, nil
+			if wbErr != nil {
+				return http.StatusInternalServerError, wbErr
+			}
+			if handled {
+				if dstExists || overwritten {
+					return http.StatusNoContent, nil
+				}
+				return http.StatusCreated, nil
+			}
 		}
 	}
 

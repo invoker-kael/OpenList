@@ -278,3 +278,56 @@ func TestCanonicalParentBlocksChild(t *testing.T) {
 	}
 }
 
+func TestPendingDirectoryMoveLocalAuthority(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{
+		WebDAVWriteback: conf.WebDAVWritebackConfig{DirectoryGraceSeconds: 60},
+	}
+	defer func() { conf.Conf = oldConf }()
+
+	now := time.Now()
+	root := model.WebDAVWritebackObject{
+		Path:  "/encrypted/album",
+		IsDir: true,
+		State: StateQueued,
+	}
+	rows := []model.WebDAVWritebackObject{root}
+	for i := 0; i < 20; i++ {
+		rows = append(rows, model.WebDAVWritebackObject{
+			Path:      "/encrypted/album/file",
+			State:     StateQueued,
+			SpoolPath: "/spool/file.data",
+		})
+	}
+	if !pendingDirectoryMoveLocallyAuthoritative(&rows[0], rows, now) {
+		t.Fatal("queued directory with 20 locally spooled files should be movable without provider visibility")
+	}
+
+	rows[10].SpoolPath = ""
+	if pendingDirectoryMoveLocallyAuthoritative(&rows[0], rows, now) {
+		t.Fatal("one live file without a spool must force provider fallback")
+	}
+	rows[10].State = StateDeleted
+	if !pendingDirectoryMoveLocallyAuthoritative(&rows[0], rows, now) {
+		t.Fatal("deleted descendants do not need a payload for a pending directory move")
+	}
+
+	completed := now.Add(-30 * time.Second)
+	rows[0].State = StateCompleted
+	rows[0].CompletedAt = &completed
+	if !pendingDirectoryMoveLocallyAuthoritative(&rows[0], rows, now) {
+		t.Fatal("completed directory inside consistency grace should remain locally authoritative")
+	}
+
+	completed = now.Add(-61 * time.Second)
+	rows[0].CompletedAt = &completed
+	if pendingDirectoryMoveLocallyAuthoritative(&rows[0], rows, now) {
+		t.Fatal("old completed directory should fall back to provider MOVE")
+	}
+
+	rows[0].CompletedAt = nil
+	if pendingDirectoryMoveLocallyAuthoritative(&rows[0], rows, now) {
+		t.Fatal("completed directory without completion evidence must not use local fast MOVE")
+	}
+}
+

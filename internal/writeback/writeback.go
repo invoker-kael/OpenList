@@ -698,6 +698,172 @@ func tombstoneMovedSource(row *model.WebDAVWritebackObject, now time.Time) {
 	row.CompletedAt = nil
 }
 
+func pendingDirectoryMoveLocallyAuthoritative(root *model.WebDAVWritebackObject, rows []model.WebDAVWritebackObject, now time.Time) bool {
+	if root == nil || !root.IsDir || root.State == StateDeleted {
+		return false
+	}
+	if root.State == StateCompleted {
+		if root.CompletedAt == nil || directoryShadowExpired(root, now) {
+			return false
+		}
+	}
+	for i := range rows {
+		row := &rows[i]
+		if row.State == StateDeleted || row.IsDir {
+			continue
+		}
+		if row.SpoolPath == "" {
+			return false
+		}
+	}
+	return true
+}
+
+var errPendingDirectoryMoveFallback = errors.New("pending directory move requires provider fallback")
+
+func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwritten bool, err error) {
+	if isPathOrDescendant(dst, src) {
+		return false, false, nil
+	}
+
+	now := time.Now()
+	var oldDestinationSpools []string
+	err = db.GetDb().Transaction(func(tx *gorm.DB) error {
+		// Lock both subtrees in one deterministic ID order. This avoids the
+		// classic A->B / B->A pattern where two MOVE transactions lock their
+		// source first and deadlock while trying to lock the other's target.
+		var candidates []model.WebDAVWritebackObject
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("path = ? OR path LIKE ? OR path = ? OR path LIKE ?", src, src+"%", dst, dst+"%").
+			Order("id asc").
+			Find(&candidates).Error; err != nil {
+			return err
+		}
+
+		sourceRows := make([]model.WebDAVWritebackObject, 0, len(candidates))
+		destinationRows := make([]model.WebDAVWritebackObject, 0, len(candidates))
+		rootIndex := -1
+		for i := range candidates {
+			row := candidates[i]
+			if isPathOrDescendant(row.Path, src) {
+				if row.Path == src {
+					rootIndex = len(sourceRows)
+				}
+				sourceRows = append(sourceRows, row)
+			}
+			if isPathOrDescendant(row.Path, dst) {
+				destinationRows = append(destinationRows, row)
+			}
+		}
+		if rootIndex < 0 || !pendingDirectoryMoveLocallyAuthoritative(&sourceRows[rootIndex], sourceRows, now) {
+			return errPendingDirectoryMoveFallback
+		}
+
+		destinationByPath := make(map[string]int, len(destinationRows))
+		for i := range destinationRows {
+			row := &destinationRows[i]
+			if row.State != StateDeleted {
+				if !overwrite {
+					return ErrDestinationExists
+				}
+				// Overwriting an already-live directory tree is intentionally
+				// delegated to the provider; locally merging two trees would
+				// make WebDAV overwrite semantics ambiguous.
+				return errPendingDirectoryMoveFallback
+			}
+			destinationByPath[utils.FixAndCleanPath(row.Path)] = i
+		}
+
+		for i := range sourceRows {
+			sourceRow := &sourceRows[i]
+			if sourceRow.State == StateDeleted {
+				continue
+			}
+			suffix := strings.TrimPrefix(sourceRow.Path, src)
+			newPath := utils.FixAndCleanPath(dst + suffix)
+			newParent := path.Dir(newPath)
+
+			var destinationRow model.WebDAVWritebackObject
+			if idx, ok := destinationByPath[newPath]; ok {
+				destinationRow = destinationRows[idx]
+				if destinationRow.ID == sourceRow.ID {
+					return errPendingDirectoryMoveFallback
+				}
+				if destinationRow.SpoolPath != "" && destinationRow.SpoolPath != sourceRow.SpoolPath {
+					oldDestinationSpools = append(oldDestinationSpools, destinationRow.SpoolPath)
+				}
+				destinationRow.Generation++
+			} else {
+				destinationRow.Generation = 1
+			}
+
+			destinationRow.PathKey = pathKey(newPath)
+			destinationRow.ParentKey = pathKey(newParent)
+			destinationRow.Path = newPath
+			destinationRow.Parent = newParent
+			destinationRow.Name = path.Base(newPath)
+			destinationRow.IsDir = sourceRow.IsDir
+			destinationRow.Size = sourceRow.Size
+			destinationRow.ModTime = sourceRow.ModTime
+			destinationRow.CreateTime = sourceRow.CreateTime
+			destinationRow.ETag = canonicalETag(destinationRow.PathKey, destinationRow.Generation, sourceRow.Size)
+			destinationRow.State = StateQueued
+			if sourceRow.IsDir {
+				destinationRow.SpoolPath = ""
+			} else {
+				destinationRow.SpoolPath = sourceRow.SpoolPath
+			}
+			destinationRow.MimeType = sourceRow.MimeType
+			destinationRow.CleanupPath = ""
+			destinationRow.LastError = ""
+			destinationRow.RetryCount = 0
+			destinationRow.VerifyCount = 0
+			destinationRow.CompletedAt = nil
+			retryAt := now
+			if !sourceRow.IsDir {
+				retryAt = now.Add(cloudSyncSettleDelay(sourceRow.Size))
+			}
+			destinationRow.RetryAt = &retryAt
+
+			if destinationRow.ID == 0 {
+				if err := tx.Create(&destinationRow).Error; err != nil {
+					return err
+				}
+			} else if err := tx.Save(&destinationRow).Error; err != nil {
+				return err
+			}
+		}
+
+		for i := range sourceRows {
+			sourceRow := &sourceRows[i]
+			if sourceRow.State == StateDeleted {
+				continue
+			}
+			tombstoneMovedSource(sourceRow, now)
+			if err := tx.Save(sourceRow).Error; err != nil {
+				return err
+			}
+		}
+		handled = true
+		return nil
+	})
+	if errors.Is(err, errPendingDirectoryMoveFallback) {
+		return false, false, nil
+	}
+	if err != nil {
+		return true, overwritten, err
+	}
+	for _, spoolPath := range oldDestinationSpools {
+		if spoolPath != "" && !spoolIsActive(spoolPath) {
+			removeSpoolIfUnreferenced(spoolPath)
+		}
+	}
+	if handled {
+		wake()
+	}
+	return handled, overwritten, nil
+}
+
 // MovePending handles an exact pending file move without waiting for provider
 // visibility. The source always becomes an immediate tombstone, even when the
 // destination did not previously exist. This prevents a provider-visible old
@@ -720,7 +886,13 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		}
 		return false, false, err
 	}
-	if srcRow.IsDir || srcRow.State == StateDeleted || srcRow.SpoolPath == "" {
+	if srcRow.State == StateDeleted {
+		return false, false, nil
+	}
+	if srcRow.IsDir {
+		return movePendingDirectory(src, dst, overwrite)
+	}
+	if srcRow.SpoolPath == "" {
 		return false, false, nil
 	}
 

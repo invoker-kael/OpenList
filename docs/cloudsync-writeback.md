@@ -147,10 +147,13 @@ The background upload verifier does not trust a single 115 object lookup by itse
 Cloud Sync can issue WebDAV operations before an asynchronously uploaded 115 object is directly visible. Write-back therefore treats the local canonical state as authoritative for these operations as well:
 
 - `MOVE` can relocate a file directly from the durable spool while it is queued, uploading, verifying, or recently completed with its cache still present.
+- A just-created/pending directory tree can also MOVE before 115 exposes it, provided every live file in that canonical subtree still has a durable local spool payload. A 20-file burst therefore moves as one canonical tree instead of waiting for per-file provider visibility.
+- An older completed directory, or any subtree with a live file whose spool has already been released, deliberately falls back to the provider MOVE path rather than guessing that the local tree is complete.
 - A pending `MOVE` always leaves an immediate canonical tombstone at the source path, so an already-visible 115 object cannot reappear in Cloud Sync while the destination upload is still pending.
 - The moved destination reuses the normal Cloud Sync settle window before provider dispatch, reducing churn when Cloud Sync performs rapid temp-name/final-name sequences.
 - `COPY` can create a second canonical generation from the same immutable spool payload without waiting for 115 to expose the source file.
 - A destination overwrite returns HTTP 204; a new destination returns HTTP 201; `Overwrite: F` returns HTTP 412 when the destination already exists.
+- COPY/MOVE preflight provider-only destinations too. A target that exists on 115 but has no canonical row is not treated as a new local target; overwrite is delegated to the provider path.
 - Shared COPY spool payloads are reference-counted in MySQL before physical cleanup, and active readers use an in-process reference count so one worker cannot make another worker's payload appear idle.
 - `DELETE` tombstones the whole tracked subtree. If descendants are tracked but the parent row is not, a synthetic directory tombstone is created so the provider-side tree is still removed.
 - A PUT below a canonical deleted/non-directory parent is rejected with HTTP 409 rather than creating an orphaned child generation.
