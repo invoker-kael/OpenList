@@ -1059,11 +1059,27 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request) (statu
 	if !common.CanWrite(user, meta, reqPath) {
 		return http.StatusForbidden, errs.PermissionDenied
 	}
-	if _, err := fs.Get(ctx, reqPath, &fs.GetArgs{}); err != nil {
-		if errs.IsObjectNotFound(err) {
-			return http.StatusNotFound, err
+	if writeback.Enabled() {
+		_, found, deleted, wbErr := writeback.Canonical(reqPath)
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
 		}
-		return http.StatusMethodNotAllowed, err
+		if deleted {
+			return http.StatusNotFound, errs.ObjectNotFound
+		}
+		if !found {
+			if _, getErr := fs.Get(ctx, reqPath, &fs.GetArgs{}); getErr != nil {
+				if errs.IsObjectNotFound(getErr) {
+					return http.StatusNotFound, getErr
+				}
+				return http.StatusMethodNotAllowed, getErr
+			}
+		}
+	} else if _, getErr := fs.Get(ctx, reqPath, &fs.GetArgs{}); getErr != nil {
+		if errs.IsObjectNotFound(getErr) {
+			return http.StatusNotFound, getErr
+		}
+		return http.StatusMethodNotAllowed, getErr
 	}
 	patches, status, err := readProppatch(r.Body)
 	if err != nil {
