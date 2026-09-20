@@ -1,6 +1,7 @@
 package writeback
 
 import (
+	"reflect"
 	"errors"
 	"os"
 	"strings"
@@ -685,6 +686,28 @@ func TestCollectConfirmedTombstoneSubtree(t *testing.T) {
 	staleRoot.Generation = 6
 	if _, _, valid := collectConfirmedTombstoneSubtree(&staleRoot, rows); valid {
 		t.Fatal("superseded root generation must not bulk-delete descendants")
+	}
+}
+
+func TestWritebackCompositeIndexes(t *testing.T) {
+	typ := reflect.TypeOf(model.WebDAVWritebackObject{})
+	checks := map[string]string{
+		"State":       "idx_webdav_writeback_queue",
+		"RetryAt":     "idx_webdav_writeback_queue",
+		"CompletedAt": "idx_webdav_writeback_completed",
+	}
+	for fieldName, indexName := range checks {
+		field, ok := typ.FieldByName(fieldName)
+		if !ok {
+			t.Fatalf("missing model field %s", fieldName)
+		}
+		if !strings.Contains(field.Tag.Get("gorm"), indexName) {
+			t.Fatalf("%s gorm tag %q does not include %s", fieldName, field.Tag.Get("gorm"), indexName)
+		}
+	}
+	stateField, _ := typ.FieldByName("State")
+	if !strings.Contains(stateField.Tag.Get("gorm"), "idx_webdav_writeback_completed") {
+		t.Fatal("State must lead the completed-cache composite index")
 	}
 }
 

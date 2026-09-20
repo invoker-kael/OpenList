@@ -38,6 +38,8 @@ The write-back queue and canonical metadata use the normal OpenList GORM databas
 
 Paths are stored as text, while SHA-256 path keys are indexed. This avoids MySQL `utf8mb4` index-length problems for long WebDAV paths.
 
+The queue table also has composite indexes on `(state, retry_at)` for the two-second worker dispatch scan and `(state, completed_at)` for completed-spool cleanup. They are declared in the GORM model, so the normal OpenList MySQL `AutoMigrate` path creates them automatically on upgrade; no separate SQLite database or manual migration is required.
+
 ## Configuration
 
 Default configuration in this fork:
