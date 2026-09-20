@@ -123,7 +123,7 @@ The default `cloudsync_settle_millis=2000` delays normal provider dispatch brief
 
 Cloud Sync walks WebDAV as a directory-listing provider and can create a directory and immediately operate below it. With write-back enabled, MKCOL creates a canonical directory shadow first and the backing storage mkdir runs asynchronously.
 
-Directories are dispatched before files. If a child upload reaches the provider before its parent becomes visible, object-not-found failures use a short retry instead of the normal long exponential backoff. A completed directory shadow is kept for `directory_grace_seconds` (60 seconds by default) unless a reliable provider listing confirms that the real directory is already visible.
+Directories are dispatched before files. A child directory/file whose canonical parent is still pending waits locally instead of racing the provider. After the parent mkdir API succeeds, any residual provider-visibility gap is handled with short retries. A completed directory shadow remains authoritative for the full `directory_grace_seconds` window (60 seconds by default), even if a parent listing starts showing the directory earlier, so an inconsistent single-path lookup cannot make the directory disappear from Cloud Sync.
 
 ### Encrypted one-way jobs
 
@@ -135,3 +135,8 @@ This is specifically intended for one-way NAS -> WebDAV/OpenList -> cloud jobs. 
 ### Conditional retries
 
 PUT honors `If-Match` and `If-None-Match` and returns HTTP 412 when the entity-tag condition fails. To keep the normal Cloud Sync upload path fast, OpenList only performs a backing-provider lookup for this check when one of those headers is actually present. Canonical write-back metadata is used first whenever available.
+
+
+### 115 verification fallback
+
+The background upload verifier does not trust a single 115 object lookup by itself. If the object lookup is missing or returns incomplete/wrong size metadata, the worker force-refreshes the parent directory and accepts an exact-name, exact-size file match. This prevents 115's post-upload metadata consistency window from turning a successful provider upload into an unnecessary duplicate retry.
