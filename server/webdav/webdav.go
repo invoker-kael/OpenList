@@ -352,7 +352,7 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 	}
 	// TODO: return MultiStatus where appropriate.
 	if writeback.Enabled() {
-		handled, wbErr := writeback.Delete(reqPath)
+		handled, wbErr := writeback.DeleteTree(reqPath)
 		if wbErr != nil {
 			return http.StatusInternalServerError, wbErr
 		}
@@ -442,6 +442,15 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	}
 	if !common.CanWrite(user, parentMeta, parentPath) {
 		return http.StatusForbidden, errs.PermissionDenied
+	}
+	if writeback.Enabled() {
+		parentObj, parentFound, parentDeleted, wbErr := writeback.Canonical(parentPath)
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
+		if parentFound && (parentDeleted || parentObj == nil || !parentObj.IsDir()) {
+			return http.StatusConflict, errs.ObjectNotFound
+		}
 	}
 
 	// Cloud Sync normally relies on the immediate PROPFIND result, but WebDAV
@@ -709,7 +718,23 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 				return http.StatusBadRequest, errInvalidDepth
 			}
 		}
-		return copyFiles(ctx, src, dst, r.Header.Get("Overwrite") != "F")
+		overwrite := r.Header.Get("Overwrite") != "F"
+		if writeback.Enabled() {
+			handled, overwritten, wbErr := writeback.CopyPending(src, dst, overwrite)
+			if errors.Is(wbErr, writeback.ErrDestinationExists) {
+				return http.StatusPreconditionFailed, wbErr
+			}
+			if wbErr != nil {
+				return http.StatusInternalServerError, wbErr
+			}
+			if handled {
+				if overwritten {
+					return http.StatusNoContent, nil
+				}
+				return http.StatusCreated, nil
+			}
+		}
+		return copyFiles(ctx, src, dst, overwrite)
 	}
 
 	release, status, err := h.confirmLocks(r, src, dst)
@@ -720,7 +745,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 
 	overwrite := r.Header.Get("Overwrite") != "F"
 	if writeback.Enabled() {
-		handled, wbErr := writeback.MovePending(src, dst, overwrite)
+		handled, overwritten, wbErr := writeback.MovePending(src, dst, overwrite)
 		if errors.Is(wbErr, writeback.ErrDestinationExists) {
 			return http.StatusPreconditionFailed, wbErr
 		}
@@ -728,6 +753,9 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 			return http.StatusInternalServerError, wbErr
 		}
 		if handled {
+			if overwritten {
+				return http.StatusNoContent, nil
+			}
 			return http.StatusCreated, nil
 		}
 	}
