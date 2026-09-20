@@ -499,3 +499,37 @@ func TestRemoteMatchesCanonical(t *testing.T) {
 	}
 }
 
+func TestCanCoalesceDuplicatePut(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	base := &model.WebDAVWritebackObject{
+		Size:        1024,
+		State:       StateQueued,
+		SpoolPath:   "/spool/current.data",
+		PayloadSHA1: sha,
+	}
+	if !canCoalesceDuplicatePut(base, 1024, strings.ToUpper(sha)) {
+		t.Fatal("identical durable payload should coalesce")
+	}
+
+	noSpool := *base
+	noSpool.SpoolPath = ""
+	if canCoalesceDuplicatePut(&noSpool, 1024, sha) {
+		t.Fatal("completed metadata without a durable spool must accept a new PUT for recovery")
+	}
+
+	deleted := *base
+	deleted.State = StateDeleted
+	if canCoalesceDuplicatePut(&deleted, 1024, sha) {
+		t.Fatal("deleted generation must not absorb a recreate PUT")
+	}
+
+	wrongHash := *base
+	if canCoalesceDuplicatePut(&wrongHash, 1024, strings.Repeat("b", 40)) {
+		t.Fatal("different encrypted payload must create a new generation")
+	}
+
+	if canCoalesceDuplicatePut(base, 2048, sha) {
+		t.Fatal("different payload size must create a new generation")
+	}
+}
+

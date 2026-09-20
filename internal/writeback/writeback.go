@@ -65,6 +65,17 @@ func canonicalETag(key string, generation uint64, size int64) string {
 	return fmt.Sprintf("\"olwb-%s-%d-%x\"", key[:16], generation, uint64(size))
 }
 
+func canCoalesceDuplicatePut(row *model.WebDAVWritebackObject, size int64, payloadSHA1 string) bool {
+	return row != nil &&
+		!row.IsDir &&
+		row.State != StateDeleted &&
+		row.SpoolPath != "" &&
+		row.Size == size &&
+		row.PayloadSHA1 != "" &&
+		payloadSHA1 != "" &&
+		strings.EqualFold(row.PayloadSHA1, payloadSHA1)
+}
+
 var ErrDestinationExists = errors.New("write-back destination already exists")
 
 func removeSpoolIfUnreferenced(spoolPath string) {
@@ -464,6 +475,8 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	var oldSpool string
 	var saved model.WebDAVWritebackObject
 	created := false
+	duplicate := false
+	wakeDuplicate := false
 	settleAt := time.Now().Add(cloudSyncSettleDelay(actualSize))
 
 	err = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -473,6 +486,22 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			return findErr
 		}
 		if findErr == nil {
+			if canCoalesceDuplicatePut(&row, actualSize, payloadSHA1) {
+				if _, statErr := os.Stat(row.SpoolPath); statErr == nil {
+					duplicate = true
+					if row.State == StateQueued || row.State == StateFailed {
+						now := time.Now()
+						row.RetryAt = &now
+						row.LastError = ""
+						if err := tx.Save(&row).Error; err != nil {
+							return err
+						}
+						wakeDuplicate = true
+					}
+					saved = row
+					return nil
+				}
+			}
 			oldSpool = row.SpoolPath
 			if row.State == StateDeleted {
 				created = true
@@ -517,6 +546,14 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	if err != nil {
 		_ = os.Remove(finalName)
 		return nil, false, err
+	}
+	if duplicate {
+		_ = os.Remove(finalName)
+		syncDir(spoolDir)
+		if wakeDuplicate {
+			wake()
+		}
+		return &saved, false, nil
 	}
 
 	if oldSpool != "" && oldSpool != finalName {

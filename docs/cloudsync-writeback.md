@@ -89,6 +89,7 @@ The write-back layer intentionally favors source correctness over avoiding dupli
 - During normal post-upload verification, 115 SHA-1 is compared with the persisted encrypted payload SHA-1 whenever available; size equality alone is not enough to complete the generation.
 - A superseded upload to the same path is never followed by an eager delete, preventing an old worker from erasing the path while a newer generation is waiting.
 - Duplicate provider writes can occur after a crash. For one-way encrypted backup this is preferable to silently accepting the wrong generation.
+- Client-level retries of the exact same encrypted payload are coalesced while the durable spool is still present, reducing duplicate provider traffic without weakening remote-loss recovery.
 
 
 ### Remote-loss reconciliation
@@ -121,6 +122,8 @@ The WebDAV-visible result is committed locally before any slow 115/OpenList prov
 While the encrypted PUT body is written to the durable spool, write-back also computes the payload SHA-1 in the same sequential pass and persists it with the generation. The 115 Open worker supplies that hash through the FileStreamer metadata, so `Open115.Put()` can skip its otherwise-required `CacheFullAndHash()` full-file reread. This reduces spool I/O for large encrypted files and makes 115 rapid-upload negotiation start sooner.
 
 The default `cloudsync_settle_millis=2000` delays normal provider dispatch briefly after each PUT. A zero-byte PUT uses the longer `cloudsync_placeholder_millis=10000` window because Synology Cloud Sync can create a zero-length placeholder and send the real encrypted payload in a subsequent request. A later PUT to the same path supersedes the previous generation, avoiding an unnecessary empty-object upload before the real payload.
+
+An exact duplicate PUT is idempotently coalesced when the current generation still has its durable local spool and the encrypted payload size/SHA-1 are identical. The new request body is fully received and fsynced first, but its temporary generation is discarded instead of incrementing the canonical ETag or causing another 115 upload. If the old spool has already been released, the PUT is **not** coalesced; it is accepted as a new generation so a genuine remote-loss recovery can restore the provider object.
 
 ### Directory consistency
 
