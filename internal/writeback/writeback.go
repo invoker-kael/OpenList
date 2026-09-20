@@ -1933,6 +1933,7 @@ func (m *workerManager) dispatch() {
 	now := time.Now()
 	var rows []model.WebDAVWritebackObject
 	err := db.GetDb().
+		Select("id").
 		Where("state IN ? AND (retry_at IS NULL OR retry_at <= ?)", []string{StateQueued, StateFailed, StateVerifying, StateDeleted}, now).
 		Order("is_dir desc, updated_at asc").
 		Limit(max(8, conf.Conf.WebDAVWriteback.Workers*4)).
@@ -2523,6 +2524,7 @@ func (m *workerManager) cleanupCompleted() {
 	cutoff := time.Now().Add(-time.Duration(ttl) * time.Minute)
 	var rows []model.WebDAVWritebackObject
 	if err := db.GetDb().
+		Select("id", "generation", "spool_path", "completed_at").
 		Where("state = ? AND spool_path <> '' AND completed_at IS NOT NULL AND completed_at <= ?", StateCompleted, cutoff).
 		Limit(100).
 		Find(&rows).Error; err != nil {
