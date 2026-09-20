@@ -423,8 +423,8 @@ func TestPendingDirectoryCopyLocalAuthority(t *testing.T) {
 		},
 	}
 
-	if !pendingDirectoryCopyLocallyAuthoritative(&rows[0], rows, now, false) {
-		t.Fatal("Depth: 0 directory COPY only needs the canonical collection itself")
+	if pendingDirectoryCopyLocallyAuthoritative(&rows[0], rows, now, false) {
+		t.Fatal("expired completed collection must reconcile provider before even a Depth: 0 COPY")
 	}
 	if pendingDirectoryCopyLocallyAuthoritative(&rows[0], rows, now, true) {
 		t.Fatal("recursive directory COPY must fall back when a live file has no local spool")
@@ -436,6 +436,29 @@ func TestPendingDirectoryCopyLocalAuthority(t *testing.T) {
 	rows[1].SpoolPath = "/spool/file.data"
 	if !pendingDirectoryCopyLocallyAuthoritative(&rows[0], rows, now, true) {
 		t.Fatal("recursive pending directory with all live payloads spooled should use the local fast path")
+	}
+}
+
+func TestSetProviderCompletedRoot(t *testing.T) {
+	now := time.Now()
+	source := &model.Object{
+		Name:     "source.bin",
+		Size:     1234,
+		Modified: now.Add(-time.Hour),
+		Ctime:    now.Add(-2 * time.Hour),
+		HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("a", 40)),
+	}
+	row := &model.WebDAVWritebackObject{Generation: 7, State: StateQueued, SpoolPath: "/old.data"}
+	setProviderCompletedRoot(row, "/dst/renamed.bin", source, now)
+
+	if row.Generation != 8 || row.Path != "/dst/renamed.bin" || row.Name != "renamed.bin" {
+		t.Fatalf("unexpected provider root identity: generation=%d path=%q name=%q", row.Generation, row.Path, row.Name)
+	}
+	if row.State != StateCompleted || row.SpoolPath != "" || row.CompletedAt == nil || !row.CompletedAt.Equal(now) {
+		t.Fatal("provider root was not converted to a fresh completed canonical shadow")
+	}
+	if row.PayloadSHA1 != strings.Repeat("a", 40) {
+		t.Fatalf("provider root sha1 = %q", row.PayloadSHA1)
 	}
 }
 

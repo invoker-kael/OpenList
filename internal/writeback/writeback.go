@@ -882,6 +882,11 @@ func pendingDirectoryCopyLocallyAuthoritative(root *model.WebDAVWritebackObject,
 	if root == nil || !root.IsDir || root.State == StateDeleted {
 		return false
 	}
+	if root.State == StateCompleted {
+		if root.CompletedAt == nil || directoryShadowExpired(root, now) {
+			return false
+		}
+	}
 	if !recursive {
 		return true
 	}
@@ -1215,6 +1220,39 @@ func providerOverwriteQuiescent(rows []model.WebDAVWritebackObject) bool {
 	return true
 }
 
+func setProviderCompletedRoot(row *model.WebDAVWritebackObject, dst string, source model.Obj, now time.Time) {
+	dst = utils.FixAndCleanPath(dst)
+	if row.Generation == 0 {
+		row.Generation = 1
+	} else {
+		row.Generation++
+	}
+	row.PathKey = pathKey(dst)
+	row.ParentKey = pathKey(path.Dir(dst))
+	row.Path = dst
+	row.Parent = path.Dir(dst)
+	row.Name = path.Base(dst)
+	row.IsDir = source.IsDir()
+	row.Size = source.GetSize()
+	row.ModTime = source.ModTime()
+	row.CreateTime = source.CreateTime()
+	row.ETag = canonicalETag(row.PathKey, row.Generation, row.Size)
+	row.State = StateCompleted
+	row.SpoolPath = ""
+	row.PayloadSHA1 = source.GetHash().GetHash(utils.SHA1)
+	if row.IsDir {
+		row.MimeType = ""
+	} else {
+		row.MimeType = utils.GetMimeType(dst)
+	}
+	row.CleanupPath = ""
+	row.LastError = ""
+	row.RetryCount = 0
+	row.VerifyCount = 0
+	row.RetryAt = nil
+	row.CompletedAt = &now
+}
+
 // ProviderOverwriteReady checks whether a provider COPY/MOVE may safely replace
 // a tracked destination. It intentionally does not mutate canonical state:
 // provider failure must leave the old stable WebDAV view intact.
@@ -1250,7 +1288,7 @@ func ProviderOverwriteReady(p string) (tracked bool, busy bool, err error) {
 // succeeded, so a failed provider operation never destroys the old destination
 // shadow. Pending source generations stay queued with their shared immutable
 // spool and therefore still converge to the newest Cloud Sync payload.
-func CopyTreeMetadata(src, dst string) error {
+func CopyTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 	if !Enabled() {
 		return nil
 	}
@@ -1286,6 +1324,38 @@ func CopyTreeMetadata(src, dst string) error {
 			}
 		}
 		if len(sourceRows) == 0 {
+			if sourceRoot == nil {
+				return nil
+			}
+			var root model.WebDAVWritebackObject
+			rootFound := false
+			for i := range destinationRows {
+				if destinationRows[i].Path == dst {
+					root = destinationRows[i]
+					rootFound = true
+					break
+				}
+			}
+			setProviderCompletedRoot(&root, dst, sourceRoot, now)
+			if rootFound {
+				if err := tx.Save(&root).Error; err != nil {
+					return err
+				}
+			} else if err := tx.Create(&root).Error; err != nil {
+				return err
+			}
+			for i := range destinationRows {
+				row := &destinationRows[i]
+				if row.Path == dst {
+					continue
+				}
+				if row.SpoolPath != "" {
+					staleSpools = append(staleSpools, row.SpoolPath)
+				}
+				if err := tx.Delete(&model.WebDAVWritebackObject{}, row.ID).Error; err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 
@@ -1357,6 +1427,33 @@ func CopyTreeMetadata(src, dst string) error {
 			}
 		}
 
+		hasSourceRoot := false
+		for i := range sourceRows {
+			if sourceRows[i].Path == src {
+				hasSourceRoot = true
+				break
+			}
+		}
+		if !hasSourceRoot && sourceRoot != nil {
+			newPath := dst
+			var root model.WebDAVWritebackObject
+			if idx, ok := destinationByPath[newPath]; ok {
+				root = destinationRows[idx]
+				usedDestination[root.ID] = struct{}{}
+				if root.SpoolPath != "" {
+					staleSpools = append(staleSpools, root.SpoolPath)
+				}
+			}
+			setProviderCompletedRoot(&root, newPath, sourceRoot, now)
+			if root.ID == 0 {
+				if err := tx.Create(&root).Error; err != nil {
+					return err
+				}
+			} else if err := tx.Save(&root).Error; err != nil {
+				return err
+			}
+		}
+
 		for i := range destinationRows {
 			destinationRow := &destinationRows[i]
 			if _, ok := usedDestination[destinationRow.ID]; ok {
@@ -1389,7 +1486,7 @@ func CopyTreeMetadata(src, dst string) error {
 
 // MoveTreeMetadata follows a successful remote MOVE and keeps canonical
 // metadata aligned with the new path. Pending descendants are re-queued.
-func MoveTreeMetadata(src, dst string) error {
+func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 	if !Enabled() {
 		return nil
 	}
@@ -1425,6 +1522,38 @@ func MoveTreeMetadata(src, dst string) error {
 			}
 		}
 		if len(sourceRows) == 0 {
+			if sourceRoot == nil {
+				return nil
+			}
+			var root model.WebDAVWritebackObject
+			rootFound := false
+			for i := range destinationRows {
+				if destinationRows[i].Path == dst {
+					root = destinationRows[i]
+					rootFound = true
+					break
+				}
+			}
+			setProviderCompletedRoot(&root, dst, sourceRoot, now)
+			if rootFound {
+				if err := tx.Save(&root).Error; err != nil {
+					return err
+				}
+			} else if err := tx.Create(&root).Error; err != nil {
+				return err
+			}
+			for i := range destinationRows {
+				row := &destinationRows[i]
+				if row.Path == dst {
+					continue
+				}
+				if row.SpoolPath != "" {
+					staleSpools = append(staleSpools, row.SpoolPath)
+				}
+				if err := tx.Delete(&model.WebDAVWritebackObject{}, row.ID).Error; err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 

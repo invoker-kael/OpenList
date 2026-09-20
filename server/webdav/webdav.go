@@ -756,9 +756,19 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 			}
 		}
 
+		var sourceRoot model.Obj
+		if writeback.Enabled() {
+			sourceRoot, err = resourceObject(ctx, src)
+			if err != nil {
+				if errs.IsObjectNotFound(err) {
+					return http.StatusNotFound, err
+				}
+				return http.StatusInternalServerError, err
+			}
+		}
 		copyStatus, copyErr := copyFiles(ctx, src, dst, overwrite, depth)
 		if copyErr == nil && writeback.Enabled() {
-			if wbErr := writeback.CopyTreeMetadata(src, dst); wbErr != nil {
+			if wbErr := writeback.CopyTreeMetadata(src, dst, sourceRoot); wbErr != nil {
 				return http.StatusInternalServerError, wbErr
 			}
 		}
@@ -818,9 +828,19 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 		}
 	}
 
+	var sourceRoot model.Obj
+	if writeback.Enabled() {
+		sourceRoot, err = resourceObject(ctx, src)
+		if err != nil {
+			if errs.IsObjectNotFound(err) {
+				return http.StatusNotFound, err
+			}
+			return http.StatusInternalServerError, err
+		}
+	}
 	moveStatus, moveErr := moveFiles(ctx, src, dst, overwrite)
 	if moveErr == nil && writeback.Enabled() {
-		if wbErr := writeback.MoveTreeMetadata(src, dst); wbErr != nil {
+		if wbErr := writeback.MoveTreeMetadata(src, dst, sourceRoot); wbErr != nil {
 			return http.StatusInternalServerError, wbErr
 		}
 	}
