@@ -180,3 +180,22 @@ func TestDirectoryShadowGrace(t *testing.T) {
 		t.Fatal("pending directory shadow must never expire while creation is queued")
 	}
 }
+
+
+func TestCloudSyncPlaceholderSettleDelay(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{
+		WebDAVWriteback: conf.WebDAVWritebackConfig{
+			CloudSyncSettleMillis:      2000,
+			CloudSyncPlaceholderMillis: 10000,
+		},
+	}
+	defer func() { conf.Conf = oldConf }()
+
+	if got := cloudSyncSettleDelay(1024); got != 2*time.Second {
+		t.Fatalf("non-empty settle delay = %v, want 2s", got)
+	}
+	if got := cloudSyncSettleDelay(0); got != 10*time.Second {
+		t.Fatalf("zero-byte placeholder settle delay = %v, want 10s", got)
+	}
+}
