@@ -219,6 +219,9 @@ func TestIsPathOrDescendant(t *testing.T) {
 		{candidate: "/a_b", root: "/a", want: false},
 		{candidate: "/a%2Fb", root: "/a", want: false},
 		{candidate: "/a/../b", root: "/a", want: false},
+		{candidate: "/", root: "/", want: true},
+		{candidate: "/a", root: "/", want: true},
+		{candidate: "/a/b", root: "/", want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.candidate+" under "+tt.root, func(t *testing.T) {
@@ -708,6 +711,24 @@ func TestWritebackCompositeIndexes(t *testing.T) {
 	stateField, _ := typ.FieldByName("State")
 	if !strings.Contains(stateField.Tag.Get("gorm"), "idx_webdav_writeback_completed") {
 		t.Fatal("State must lead the completed-cache composite index")
+	}
+}
+
+func TestDescendantLikePattern(t *testing.T) {
+	tests := []struct {
+		root string
+		want string
+	}{
+		{root: "/a", want: "/a/%"},
+		{root: "/a_b", want: "/a~_b/%"},
+		{root: "/a%b", want: "/a~%b/%"},
+		{root: "/a~b", want: "/a~~b/%"},
+		{root: "/", want: "/%"},
+	}
+	for _, tt := range tests {
+		if got := descendantLikePattern(tt.root); got != tt.want {
+			t.Fatalf("descendantLikePattern(%q) = %q, want %q", tt.root, got, tt.want)
+		}
 	}
 }
 

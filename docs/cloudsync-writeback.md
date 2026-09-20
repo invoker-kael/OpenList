@@ -38,7 +38,7 @@ The write-back queue and canonical metadata use the normal OpenList GORM databas
 
 Paths are stored as text, while SHA-256 path keys are indexed. This avoids MySQL `utf8mb4` index-length problems for long WebDAV paths.
 
-The queue table also has composite indexes on `(state, retry_at)` for the two-second worker dispatch scan and `(state, completed_at)` for completed-spool cleanup. They are declared in the GORM model, so the normal OpenList MySQL `AutoMigrate` path creates them automatically on upgrade; no separate SQLite database or manual migration is required. The hot dispatch scan selects only `id`, and completed-cache cleanup selects only the four fields it actually consumes, avoiding repeated transfer/allocation of long path, error and spool TEXT columns on large MySQL tables.
+The queue table also has composite indexes on `(state, retry_at)` for the two-second worker dispatch scan and `(state, completed_at)` for completed-spool cleanup. They are declared in the GORM model, so the normal OpenList MySQL `AutoMigrate` path creates them automatically on upgrade; no separate SQLite database or manual migration is required. The hot dispatch scan selects only `id`, and completed-cache cleanup selects only the four fields it actually consumes, avoiding repeated transfer/allocation of long path, error and spool TEXT columns on large MySQL tables. Subtree mutation queries also use an escaped `root/%` LIKE pattern (`~` escape) instead of `root%`, so encrypted names containing `_`/`%` cannot expand into SQL wildcards and sibling prefixes such as `/a` versus `/ab` are excluded before row locking.
 
 ## Configuration
 

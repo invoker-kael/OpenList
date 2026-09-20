@@ -58,7 +58,23 @@ func pathKey(p string) string {
 func isPathOrDescendant(candidate, root string) bool {
 	candidate = utils.FixAndCleanPath(candidate)
 	root = utils.FixAndCleanPath(root)
+	if root == "/" {
+		return strings.HasPrefix(candidate, "/")
+	}
 	return candidate == root || strings.HasPrefix(candidate, root+"/")
+}
+
+func descendantLikePattern(root string) string {
+	root = utils.FixAndCleanPath(root)
+	escaped := strings.NewReplacer(
+		"~", "~~",
+		"%", "~%",
+		"_", "~_",
+	).Replace(root)
+	if root == "/" {
+		return "/%"
+	}
+	return escaped + "/%"
 }
 
 func canonicalETag(key string, generation uint64, size int64) string {
@@ -704,7 +720,7 @@ func DeleteTree(p string) (bool, error) {
 	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var candidates []model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("path = ? OR path LIKE ?", p, p+"%").
+			Where("path = ? OR path LIKE ? ESCAPE '~'", p, descendantLikePattern(p)).
 			Find(&candidates).Error; err != nil {
 			return err
 		}
@@ -823,7 +839,7 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 		// source first and deadlock while trying to lock the other's target.
 		var candidates []model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("path = ? OR path LIKE ? OR path = ? OR path LIKE ?", src, src+"%", dst, dst+"%").
+			Where("path = ? OR path LIKE ? ESCAPE '~' OR path = ? OR path LIKE ? ESCAPE '~'", src, descendantLikePattern(src), dst, descendantLikePattern(dst)).
 			Order("id asc").
 			Find(&candidates).Error; err != nil {
 			return err
@@ -980,7 +996,7 @@ func copyPendingDirectory(src, dst string, recursive bool) (handled bool, overwr
 	err = db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var candidates []model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("path = ? OR path LIKE ? OR path = ? OR path LIKE ?", src, src+"%", dst, dst+"%").
+			Where("path = ? OR path LIKE ? ESCAPE '~' OR path = ? OR path LIKE ? ESCAPE '~'", src, descendantLikePattern(src), dst, descendantLikePattern(dst)).
 			Order("id asc").
 			Find(&candidates).Error; err != nil {
 			return err
@@ -1352,7 +1368,7 @@ func ProviderOverwriteReady(p string) (tracked bool, busy bool, err error) {
 	p = utils.FixAndCleanPath(p)
 	var candidates []model.WebDAVWritebackObject
 	if err := db.GetDb().
-		Where("path = ? OR path LIKE ?", p, p+"%").
+		Where("path = ? OR path LIKE ? ESCAPE '~'", p, descendantLikePattern(p)).
 		Order("id asc").
 		Find(&candidates).Error; err != nil {
 		return false, false, err
@@ -1395,7 +1411,7 @@ func CopyTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var candidates []model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("path = ? OR path LIKE ? OR path = ? OR path LIKE ?", src, src+"%", dst, dst+"%").
+			Where("path = ? OR path LIKE ? ESCAPE '~' OR path = ? OR path LIKE ? ESCAPE '~'", src, descendantLikePattern(src), dst, descendantLikePattern(dst)).
 			Order("id asc").
 			Find(&candidates).Error; err != nil {
 			return err
@@ -1591,7 +1607,7 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var candidates []model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("path = ? OR path LIKE ? OR path = ? OR path LIKE ?", src, src+"%", dst, dst+"%").
+			Where("path = ? OR path LIKE ? ESCAPE '~' OR path = ? OR path LIKE ? ESCAPE '~'", src, descendantLikePattern(src), dst, descendantLikePattern(dst)).
 			Order("id asc").
 			Find(&candidates).Error; err != nil {
 			return err
@@ -2356,7 +2372,7 @@ func deleteConfirmedTombstoneSubtree(root *model.WebDAVWritebackObject) (bool, e
 	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var candidates []model.WebDAVWritebackObject
 		query := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("state = ? AND (path = ? OR path LIKE ?)", StateDeleted, root.Path, root.Path+"%").
+			Where("state = ? AND (path = ? OR path LIKE ? ESCAPE '~')", StateDeleted, root.Path, descendantLikePattern(root.Path)).
 			Order("id asc")
 		if err := query.Find(&candidates).Error; err != nil {
 			return err
