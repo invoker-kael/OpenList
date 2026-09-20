@@ -141,6 +141,12 @@ The encrypted payload is opaque to OpenList. The canonical size is the exact num
 This is specifically intended for one-way NAS -> WebDAV/OpenList -> cloud jobs. Provider-side changes are not treated as authoritative source edits.
 
 
+### LOCK-before-PUT compatibility
+
+When a WebDAV client locks a path that does not exist yet, write-back now exposes an RFC4918-style **lock-null resource** immediately. The placeholder is a canonical zero-byte file visible to PROPFIND/HEAD/GET, but it is never queued to 115 and never consumes a spool payload. A subsequent PUT upgrades the same canonical row into the normal durable upload generation, so LOCK-before-PUT does not create a stray zero-byte cloud object.
+
+Finite lock-null resources expire with their lock timeout. UNLOCK removes an untouched placeholder immediately. Because the current WebDAV lock manager is process-local, all remaining lock-null rows are discarded on OpenList restart before upload recovery begins; a stale lock shadow therefore cannot survive after its token has been lost. LOCK on an unmapped child still requires an existing collection parent and returns 409 when the parent does not exist.
+
 ### Conditional retries
 
 PUT honors `If-Match` and `If-None-Match` and returns HTTP 412 when the entity-tag condition fails. To keep the normal Cloud Sync upload path fast, OpenList only performs a backing-provider lookup for this check when one of those headers is actually present. Canonical write-back metadata is used first whenever available.

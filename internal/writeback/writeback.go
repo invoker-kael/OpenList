@@ -36,6 +36,7 @@ const (
 	StateCompleted = "completed"
 	StateFailed    = "failed"
 	StateDeleted   = "deleted"
+	StateLockNull  = "lock_null"
 )
 
 type CanonicalObject struct {
@@ -1249,6 +1250,128 @@ func Canonical(p string) (obj model.Obj, found bool, deleted bool, err error) {
 		return nil, true, true, nil
 	}
 	return toObject(row), true, false, nil
+}
+
+func lockNullRetryAt(now time.Time, duration time.Duration) *time.Time {
+	if duration < 0 {
+		return nil
+	}
+	expires := now.Add(duration)
+	return &expires
+}
+
+// CommitLockNull creates the RFC4918 lock-null resource for a LOCK on an
+// unmapped path. The placeholder is canonical-only: it is never dispatched to
+// the backing provider and a later PUT upgrades the same row into a normal
+// queued generation.
+func CommitLockNull(ctx context.Context, p string, now time.Time, duration time.Duration) (*model.WebDAVWritebackObject, bool, error) {
+	if !Enabled() {
+		return nil, false, nil
+	}
+	p = utils.FixAndCleanPath(p)
+	if now.IsZero() {
+		now = time.Now()
+	}
+	parent := path.Dir(p)
+	key := pathKey(p)
+	retryAt := lockNullRetryAt(now, duration)
+	created := false
+	var oldSpool string
+	var saved model.WebDAVWritebackObject
+
+	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row model.WebDAVWritebackObject
+		findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", key).First(&row).Error
+		if findErr != nil && !errors.Is(findErr, gorm.ErrRecordNotFound) {
+			return findErr
+		}
+		if findErr == nil {
+			if row.State == StateLockNull {
+				row.RetryAt = retryAt
+				if err := tx.Save(&row).Error; err != nil {
+					return err
+				}
+				saved = row
+				return nil
+			}
+			if row.State != StateDeleted {
+				saved = row
+				return nil
+			}
+			created = true
+			oldSpool = row.SpoolPath
+			row.Generation++
+		} else {
+			created = true
+			row.Generation = 1
+		}
+
+		row.PathKey = key
+		row.ParentKey = pathKey(parent)
+		row.Path = p
+		row.Parent = parent
+		row.Name = path.Base(p)
+		row.IsDir = false
+		row.Size = 0
+		row.ModTime = now
+		row.CreateTime = now
+		row.ETag = canonicalETag(key, row.Generation, 0)
+		row.State = StateLockNull
+		row.SpoolPath = ""
+		row.PayloadSHA1 = ""
+		row.MimeType = ""
+		row.CleanupPath = ""
+		row.LastError = ""
+		row.RetryCount = 0
+		row.VerifyCount = 0
+		row.RetryAt = retryAt
+		row.CompletedAt = nil
+		clearRemoteVerification(&row)
+
+		if row.ID == 0 {
+			if err := tx.Create(&row).Error; err != nil {
+				return err
+			}
+		} else if err := tx.Save(&row).Error; err != nil {
+			return err
+		}
+		saved = row
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if oldSpool != "" && !spoolIsActive(oldSpool) {
+		removeSpoolIfUnreferenced(oldSpool)
+	}
+	return &saved, created, nil
+}
+
+func RefreshLockNull(ctx context.Context, p string, now time.Time, duration time.Duration) error {
+	if !Enabled() {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	retryAt := lockNullRetryAt(now, duration)
+	value := any(nil)
+	if retryAt != nil {
+		value = retryAt
+	}
+	return db.GetDb().WithContext(ctx).
+		Model(&model.WebDAVWritebackObject{}).
+		Where("path_key = ? AND state = ?", pathKey(p), StateLockNull).
+		Update("retry_at", value).Error
+}
+
+func ReleaseLockNull(ctx context.Context, p string) error {
+	if !Enabled() {
+		return nil
+	}
+	return db.GetDb().WithContext(ctx).
+		Where("path_key = ? AND state = ?", pathKey(p), StateLockNull).
+		Delete(&model.WebDAVWritebackObject{}).Error
 }
 
 type remoteContentComparison uint8
@@ -3567,6 +3690,12 @@ func Stop() {
 }
 
 func (m *workerManager) recoverInterrupted() error {
+	// LockSystem is process-local, so lock-null shadows cannot survive a
+	// restart without their corresponding lock token.
+	if err := db.GetDb().Where("state = ?", StateLockNull).Delete(&model.WebDAVWritebackObject{}).Error; err != nil {
+		return err
+	}
+
 	// An UPLOADING file is ambiguous after a process crash: 115 may already
 	// contain the exact encrypted payload even though MySQL never recorded
 	// VERIFYING. Resume files in VERIFYING so the normal size/SHA-1 window runs
@@ -3619,6 +3748,13 @@ func (m *workerManager) scheduler() {
 
 func (m *workerManager) dispatch() {
 	now := time.Now()
+	// Finite lock-null resources expire with the in-memory lock. Infinite locks
+	// have retry_at=NULL and are removed by UNLOCK or startup recovery.
+	if err := db.GetDb().
+		Where("state = ? AND retry_at IS NOT NULL AND retry_at <= ?", StateLockNull, now).
+		Delete(&model.WebDAVWritebackObject{}).Error; err != nil {
+		log.Errorf("write-back lock-null cleanup failed: %v", err)
+	}
 	var rows []model.WebDAVWritebackObject
 	err := db.GetDb().
 		Select("id").

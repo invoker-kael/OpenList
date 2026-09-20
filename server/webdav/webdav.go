@@ -309,6 +309,11 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 			http.ServeContent(w, r, row.Name, row.ModTime, localFile)
 			return 0, nil
 		}
+		if row != nil && row.State == writeback.StateLockNull && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusOK)
+			return 0, nil
+		}
 	}
 	// Let ServeContent determine the Content-Type header.
 	storage, _ := fs.GetStorage(reqPath, &fs.GetStoragesArgs{})
@@ -1190,6 +1195,11 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus 
 			}
 			return http.StatusInternalServerError, err
 		}
+		if writeback.Enabled() {
+			if err := writeback.RefreshLockNull(ctx, ld.Root, now, duration); err != nil {
+				return http.StatusInternalServerError, err
+			}
+		}
 
 	} else {
 		// Section 9.10.3 says that "If no Depth header is submitted on a LOCK request,
@@ -1218,6 +1228,29 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus 
 		if !common.CanWrite(user, meta, reqPath) {
 			return http.StatusForbidden, errs.PermissionDenied
 		}
+		createLockNull := false
+		if writeback.Enabled() {
+			exists, existsErr := resourceExists(ctx, reqPath)
+			if existsErr != nil {
+				return http.StatusInternalServerError, existsErr
+			}
+			if !exists {
+				parentPath := path.Dir(reqPath)
+				if parentPath != reqPath {
+					parentObj, parentErr := resourceObject(ctx, parentPath)
+					if parentErr != nil {
+						if errs.IsObjectNotFound(parentErr) {
+							return http.StatusConflict, parentErr
+						}
+						return http.StatusInternalServerError, parentErr
+					}
+					if !parentObj.IsDir() {
+						return http.StatusConflict, errs.ObjectNotFound
+					}
+				}
+				createLockNull = true
+			}
+		}
 		ld = LockDetails{
 			Root:      reqPath,
 			Duration:  duration,
@@ -1236,6 +1269,13 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus 
 				h.LockSystem.Unlock(now, token)
 			}
 		}()
+		if createLockNull {
+			_, lockNullCreated, wbErr := writeback.CommitLockNull(ctx, reqPath, now, duration)
+			if wbErr != nil {
+				return http.StatusInternalServerError, wbErr
+			}
+			created = lockNullCreated
+		}
 
 		// ??? Why create resource here?
 		//// Create the resource if it didn't previously exist.
@@ -1294,6 +1334,11 @@ func (h *Handler) handleUnlock(w http.ResponseWriter, r *http.Request) (status i
 
 	switch err = h.LockSystem.Unlock(time.Now(), t); err {
 	case nil:
+		if writeback.Enabled() {
+			if wbErr := writeback.ReleaseLockNull(ctx, reqPath); wbErr != nil {
+				log.Warnf("released WebDAV lock but failed to remove lock-null shadow for %s: %v", reqPath, wbErr)
+			}
+		}
 		return http.StatusNoContent, err
 	case ErrForbidden:
 		return http.StatusForbidden, err

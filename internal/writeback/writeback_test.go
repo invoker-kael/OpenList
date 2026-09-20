@@ -559,6 +559,27 @@ func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 	}
 }
 
+func TestLockNullRetryAt(t *testing.T) {
+	now := time.Unix(100, 0)
+	expires := lockNullRetryAt(now, 30*time.Second)
+	if expires == nil || !expires.Equal(now.Add(30*time.Second)) {
+		t.Fatalf("finite lock-null expiry = %v", expires)
+	}
+	if expires := lockNullRetryAt(now, -1); expires != nil {
+		t.Fatalf("infinite lock-null expiry = %v, want nil", expires)
+	}
+}
+
+func TestLockNullCanonicalSurvivesMissingProviderList(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		State:     StateLockNull,
+		SpoolPath: "",
+	}
+	if shouldDropCanonicalAfterRemoteList(row, true, nil, time.Now(), true) {
+		t.Fatal("lock-null resource must remain canonical while the lock is active")
+	}
+}
+
 func TestReceivingPathReferenceCount(t *testing.T) {
 	p := "/encrypted/placeholder.bin"
 	_, release1 := beginReceiving(p)
