@@ -1512,6 +1512,7 @@ func clearCompletedFileDivergence(row *model.WebDAVWritebackObject) error {
 	}
 	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
+		Where("(verify_count <> 0 OR retry_at IS NOT NULL OR last_error <> '')").
 		Updates(map[string]any{
 			"verify_count": 0,
 			"retry_at":     nil,
@@ -1700,7 +1701,10 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 				return nil, false, confirmErr
 			}
 			if confirmed {
-				delete(byName, row.Name)
+				// The canonical row is gone. If the provider still has a changed
+				// object, leave that provider object in this listing; if it is truly
+				// absent, byName already has no entry. Either view is consistent with
+				// the next request and allows Cloud Sync to repair the divergence.
 				continue
 			}
 		}
