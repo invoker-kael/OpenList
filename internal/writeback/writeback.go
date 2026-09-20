@@ -39,6 +39,8 @@ const (
 	StateLockNull  = "lock_null"
 )
 
+var ErrCanonicalChanged = errors.New("canonical WebDAV state changed while staging provider delete")
+
 type CanonicalObject struct {
 	model.Object
 	etag string
@@ -2472,6 +2474,82 @@ func DeleteTree(p string) (bool, error) {
 		wake()
 	}
 	return handled, nil
+}
+
+// StageProviderDelete atomically creates a canonical tombstone for a
+// provider-only object. It is used only after DeleteTree found no tracked
+// canonical state and the provider lookup proved the object exists.
+//
+// The transaction re-checks the whole subtree before inserting the tombstone.
+// If another request committed canonical state in the meantime, the delete is
+// rejected as retryable instead of consuming that newer generation.
+func StageProviderDelete(ctx context.Context, p string, source model.Obj) (bool, error) {
+	if !Enabled() {
+		return false, nil
+	}
+	p = utils.FixAndCleanPath(p)
+	now := time.Now()
+	staged := false
+	alreadyDeleted := false
+
+	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var candidates []model.WebDAVWritebackObject
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("path = ? OR path LIKE ? ESCAPE '~'", p, descendantLikePattern(p)).
+			Order("id asc").
+			Find(&candidates).Error; err != nil {
+			return err
+		}
+
+		matched := 0
+		deleted := 0
+		for i := range candidates {
+			row := &candidates[i]
+			if !isPathOrDescendant(row.Path, p) {
+				continue
+			}
+			matched++
+			if row.State == StateDeleted {
+				deleted++
+				continue
+			}
+			return ErrCanonicalChanged
+		}
+		if matched > 0 {
+			if matched == deleted {
+				alreadyDeleted = true
+				return nil
+			}
+			return ErrCanonicalChanged
+		}
+
+		row := providerMoveSourceTombstone(p, source, now)
+		if err := tx.Create(&row).Error; err != nil {
+			return err
+		}
+		staged = true
+		return nil
+	})
+	if err != nil {
+		// A concurrent creator may win the unique path_key race after the
+		// subtree scan. Translate that database conflict back into canonical
+		// state so callers return a bounded retry instead of deleting blindly.
+		current, lookupErr := getByPath(p)
+		if lookupErr == nil && current != nil {
+			if current.State == StateDeleted {
+				return true, nil
+			}
+			return false, ErrCanonicalChanged
+		}
+		return false, err
+	}
+	if alreadyDeleted {
+		return true, nil
+	}
+	if staged {
+		wake()
+	}
+	return staged, nil
 }
 
 func tombstoneMovedSource(row *model.WebDAVWritebackObject, now time.Time) {

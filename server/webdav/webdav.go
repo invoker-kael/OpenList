@@ -395,7 +395,8 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 	// "godoc os RemoveAll" says that "If the path does not exist, RemoveAll
 	// returns nil (no error)." WebDAV semantics are that it should return a
 	// "404 Not Found". We therefore have to Stat before we RemoveAll.
-	if _, err := fs.Get(ctx, reqPath, &fs.GetArgs{}); err != nil {
+	providerObj, err := fs.Get(ctx, reqPath, &fs.GetArgs{})
+	if err != nil {
 		if errs.IsObjectNotFound(err) {
 			return http.StatusNotFound, err
 		}
@@ -410,21 +411,19 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 		return http.StatusForbidden, errs.PermissionDenied
 	}
 	if writeback.Enabled() {
-		// Provider-only objects do not have a canonical row yet. Seed a
-		// canonical-only placeholder and immediately tombstone it so the stable
-		// WebDAV view hides the object before an eventually-consistent provider
-		// can expose the old name again. The normal write-back delete worker then
-		// owns provider removal and the two-pass absence verification.
-		if _, _, wbErr := writeback.CommitLockNull(ctx, reqPath, time.Now(), -1); wbErr != nil {
-			return http.StatusInternalServerError, wbErr
+		// Provider-only objects still need an immediate canonical tombstone so
+		// an eventually-consistent provider cannot make the deleted name reappear
+		// in the next Cloud Sync PROPFIND. StageProviderDelete performs the
+		// provider-only check and tombstone creation in one MySQL transaction.
+		handled, wbErr := writeback.StageProviderDelete(ctx, reqPath, providerObj)
+		if errors.Is(wbErr, writeback.ErrCanonicalChanged) {
+			w.Header().Set("Retry-After", "2")
+			return http.StatusServiceUnavailable, wbErr
 		}
-		handled, wbErr := writeback.DeleteTree(reqPath)
 		if wbErr != nil {
-			_ = writeback.ReleaseLockNull(ctx, reqPath)
 			return http.StatusInternalServerError, wbErr
 		}
 		if !handled {
-			_ = writeback.ReleaseLockNull(ctx, reqPath)
 			return http.StatusInternalServerError, errors.New("failed to stage WebDAV delete tombstone")
 		}
 		return http.StatusNoContent, nil
