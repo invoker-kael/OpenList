@@ -223,3 +223,58 @@ func TestIsPathOrDescendant(t *testing.T) {
 		})
 	}
 }
+
+func TestTombstoneMovedSource(t *testing.T) {
+	completed := time.Now().Add(-time.Minute)
+	row := &model.WebDAVWritebackObject{
+		Path:        "/encrypted/source.bin",
+		Generation:  3,
+		State:       StateCompleted,
+		SpoolPath:   "/spool/source.data",
+		CleanupPath: "/encrypted/old-source.bin",
+		LastError:   "old error",
+		RetryCount:  4,
+		VerifyCount: 2,
+		CompletedAt: &completed,
+	}
+	now := time.Now()
+	tombstoneMovedSource(row, now)
+
+	if row.Path != "/encrypted/source.bin" {
+		t.Fatalf("move tombstone changed source path to %q", row.Path)
+	}
+	if row.Generation != 4 {
+		t.Fatalf("generation = %d, want 4", row.Generation)
+	}
+	if row.State != StateDeleted {
+		t.Fatalf("state = %q, want %q", row.State, StateDeleted)
+	}
+	if row.SpoolPath != "" || row.CleanupPath != "" {
+		t.Fatalf("tombstone retained local cleanup state: spool=%q cleanup=%q", row.SpoolPath, row.CleanupPath)
+	}
+	if row.RetryAt == nil || !row.RetryAt.Equal(now) {
+		t.Fatal("move tombstone must be immediately eligible for provider cleanup")
+	}
+	if row.CompletedAt != nil || row.RetryCount != 0 || row.VerifyCount != 0 || row.LastError != "" {
+		t.Fatal("move tombstone did not reset completion/retry state")
+	}
+}
+
+func TestCanonicalParentBlocksChild(t *testing.T) {
+	if canonicalParentBlocksChild(nil) {
+		t.Fatal("missing canonical parent should defer to provider lookup")
+	}
+	if canonicalParentBlocksChild(&model.WebDAVWritebackObject{IsDir: true, State: StateQueued}) {
+		t.Fatal("pending canonical directory should wait, not be treated as invalid")
+	}
+	if canonicalParentBlocksChild(&model.WebDAVWritebackObject{IsDir: true, State: StateCompleted}) {
+		t.Fatal("completed canonical directory should allow child dispatch")
+	}
+	if !canonicalParentBlocksChild(&model.WebDAVWritebackObject{IsDir: true, State: StateDeleted}) {
+		t.Fatal("deleted canonical parent must block child dispatch")
+	}
+	if !canonicalParentBlocksChild(&model.WebDAVWritebackObject{IsDir: false, State: StateCompleted}) {
+		t.Fatal("canonical file parent must block child dispatch")
+	}
+}
+

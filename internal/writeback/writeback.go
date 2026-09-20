@@ -686,14 +686,32 @@ func DeleteTree(p string) (bool, error) {
 }
 
 
+func tombstoneMovedSource(row *model.WebDAVWritebackObject, now time.Time) {
+	row.Generation++
+	row.State = StateDeleted
+	row.SpoolPath = ""
+	row.CleanupPath = ""
+	row.LastError = ""
+	row.RetryCount = 0
+	row.VerifyCount = 0
+	row.RetryAt = &now
+	row.CompletedAt = nil
+}
+
 // MovePending handles an exact pending file move without waiting for provider
-// visibility. overwritten reports whether the canonical destination existed so
-// WebDAV can return 204 instead of 201.
+// visibility. The source always becomes an immediate tombstone, even when the
+// destination did not previously exist. This prevents a provider-visible old
+// path from leaking back into Cloud Sync while the destination upload catches
+// up asynchronously. overwritten reports whether the canonical destination
+// existed so WebDAV can return 204 instead of 201.
 func MovePending(src, dst string, overwrite bool) (handled bool, overwritten bool, err error) {
 	src = utils.FixAndCleanPath(src)
 	dst = utils.FixAndCleanPath(dst)
 	srcKey := pathKey(src)
 	dstKey := pathKey(dst)
+	if srcKey == dstKey {
+		return false, false, nil
+	}
 
 	var srcRow model.WebDAVWritebackObject
 	if err := db.GetDb().Where("path_key = ?", srcKey).First(&srcRow).Error; err != nil {
@@ -708,6 +726,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 
 	var oldDestinationSpool string
 	now := time.Now()
+	settleAt := now.Add(cloudSyncSettleDelay(srcRow.Size))
 	err = db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var lockedSrc model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).First(&lockedSrc).Error; err != nil {
@@ -722,7 +741,10 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		if dstErr != nil && !errors.Is(dstErr, gorm.ErrRecordNotFound) {
 			return dstErr
 		}
-		if dstErr == nil && dstRow.ID != lockedSrc.ID {
+		if dstErr == nil {
+			if dstRow.ID == lockedSrc.ID {
+				return gorm.ErrRecordNotFound
+			}
 			destinationExists := dstRow.State != StateDeleted
 			if destinationExists && !overwrite {
 				return ErrDestinationExists
@@ -733,53 +755,39 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 			overwritten = destinationExists
 			oldDestinationSpool = dstRow.SpoolPath
 			dstRow.Generation++
-			dstRow.ParentKey = pathKey(path.Dir(dst))
-			dstRow.Path = dst
-			dstRow.Parent = path.Dir(dst)
-			dstRow.Name = path.Base(dst)
-			dstRow.IsDir = false
-			dstRow.Size = lockedSrc.Size
-			dstRow.ModTime = lockedSrc.ModTime
-			dstRow.CreateTime = lockedSrc.CreateTime
-			dstRow.ETag = canonicalETag(dstKey, dstRow.Generation, lockedSrc.Size)
-			dstRow.State = StateQueued
-			dstRow.SpoolPath = lockedSrc.SpoolPath
-			dstRow.MimeType = lockedSrc.MimeType
-			dstRow.CleanupPath = ""
-			dstRow.LastError = ""
-			dstRow.RetryCount = 0
-			dstRow.VerifyCount = 0
-			dstRow.RetryAt = &now
-			dstRow.CompletedAt = nil
-			if err := tx.Save(&dstRow).Error; err != nil {
-				return err
-			}
-
-			lockedSrc.Generation++
-			lockedSrc.State = StateDeleted
-			lockedSrc.SpoolPath = ""
-			lockedSrc.LastError = ""
-			lockedSrc.RetryCount = 0
-			lockedSrc.VerifyCount = 0
-			lockedSrc.RetryAt = &now
-			lockedSrc.CompletedAt = nil
-			return tx.Save(&lockedSrc).Error
+		} else {
+			dstRow.Generation = 1
 		}
 
-		lockedSrc.PathKey = dstKey
-		lockedSrc.ParentKey = pathKey(path.Dir(dst))
-		lockedSrc.Path = dst
-		lockedSrc.Parent = path.Dir(dst)
-		lockedSrc.Name = path.Base(dst)
-		lockedSrc.Generation++
-		lockedSrc.ETag = canonicalETag(dstKey, lockedSrc.Generation, lockedSrc.Size)
-		lockedSrc.State = StateQueued
-		lockedSrc.CleanupPath = src
-		lockedSrc.RetryAt = &now
-		lockedSrc.LastError = ""
-		lockedSrc.RetryCount = 0
-		lockedSrc.VerifyCount = 0
-		lockedSrc.CompletedAt = nil
+		dstRow.PathKey = dstKey
+		dstRow.ParentKey = pathKey(path.Dir(dst))
+		dstRow.Path = dst
+		dstRow.Parent = path.Dir(dst)
+		dstRow.Name = path.Base(dst)
+		dstRow.IsDir = false
+		dstRow.Size = lockedSrc.Size
+		dstRow.ModTime = lockedSrc.ModTime
+		dstRow.CreateTime = lockedSrc.CreateTime
+		dstRow.ETag = canonicalETag(dstKey, dstRow.Generation, lockedSrc.Size)
+		dstRow.State = StateQueued
+		dstRow.SpoolPath = lockedSrc.SpoolPath
+		dstRow.MimeType = lockedSrc.MimeType
+		dstRow.CleanupPath = ""
+		dstRow.LastError = ""
+		dstRow.RetryCount = 0
+		dstRow.VerifyCount = 0
+		dstRow.RetryAt = &settleAt
+		dstRow.CompletedAt = nil
+
+		if dstRow.ID == 0 {
+			if err := tx.Create(&dstRow).Error; err != nil {
+				return err
+			}
+		} else if err := tx.Save(&dstRow).Error; err != nil {
+			return err
+		}
+
+		tombstoneMovedSource(&lockedSrc, now)
 		return tx.Save(&lockedSrc).Error
 	})
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -788,7 +796,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 	if err != nil {
 		return true, overwritten, err
 	}
-	if oldDestinationSpool != "" {
+	if oldDestinationSpool != "" && oldDestinationSpool != srcRow.SpoolPath {
 		if !spoolIsActive(oldDestinationSpool) {
 			removeSpoolIfUnreferenced(oldDestinationSpool)
 		}
@@ -1135,12 +1143,29 @@ func (m *workerManager) process(id uint) {
 	}
 }
 
+func canonicalParentBlocksChild(parent *model.WebDAVWritebackObject) bool {
+	return parent != nil && (!parent.IsDir || parent.State == StateDeleted)
+}
+
 func (m *workerManager) waitForCanonicalParent(row *model.WebDAVWritebackObject) (bool, error) {
 	parent, err := getByPath(row.Parent)
 	if err != nil {
 		return false, err
 	}
-	if parent == nil || !parent.IsDir || parent.State == StateCompleted {
+	if parent == nil {
+		return false, nil
+	}
+	if canonicalParentBlocksChild(parent) {
+		next := time.Now().Add(2 * time.Second)
+		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
+			Updates(map[string]any{
+				"retry_at":   &next,
+				"last_error": "waiting because canonical parent is deleted or is not a directory",
+			})
+		return true, res.Error
+	}
+	if parent.State == StateCompleted {
 		return false, nil
 	}
 	next := time.Now().Add(time.Second)
