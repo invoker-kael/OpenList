@@ -75,3 +75,22 @@ func TestMoveNeedsStaging(t *testing.T) {
 	}
 }
 
+func TestCopyMoveProviderSucceeded(t *testing.T) {
+	for _, status := range []int{http.StatusCreated, http.StatusNoContent} {
+		if !copyMoveProviderSucceeded(status) {
+			t.Fatalf("status %d should permit canonical reconciliation", status)
+		}
+	}
+	for _, status := range []int{
+		http.StatusForbidden,
+		http.StatusPreconditionFailed,
+		http.StatusConflict,
+		http.StatusServiceUnavailable,
+		http.StatusInternalServerError,
+	} {
+		if copyMoveProviderSucceeded(status) {
+			t.Fatalf("status %d must not mutate canonical COPY/MOVE metadata", status)
+		}
+	}
+}
+

@@ -663,6 +663,10 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 	return http.StatusCreated, nil
 }
 
+func copyMoveProviderSucceeded(status int) bool {
+	return status == http.StatusCreated || status == http.StatusNoContent
+}
+
 func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status int, err error) {
 	hdr := r.Header.Get("Destination")
 	if hdr == "" {
@@ -767,10 +771,13 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 			}
 		}
 		copyStatus, copyErr := copyFiles(ctx, src, dst, overwrite, depth)
-		if copyErr == nil && writeback.Enabled() {
+		if copyErr == nil && writeback.Enabled() && copyMoveProviderSucceeded(copyStatus) {
 			if wbErr := writeback.CopyTreeMetadata(src, dst, sourceRoot); wbErr != nil {
 				return http.StatusInternalServerError, wbErr
 			}
+		}
+		if copyStatus == http.StatusServiceUnavailable {
+			w.Header().Set("Retry-After", "2")
 		}
 		if copyErr == nil && dstExisted && copyStatus == http.StatusCreated {
 			copyStatus = http.StatusNoContent
@@ -839,10 +846,13 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 		}
 	}
 	moveStatus, moveErr := moveFiles(ctx, src, dst, overwrite)
-	if moveErr == nil && writeback.Enabled() {
+	if moveErr == nil && writeback.Enabled() && copyMoveProviderSucceeded(moveStatus) {
 		if wbErr := writeback.MoveTreeMetadata(src, dst, sourceRoot); wbErr != nil {
 			return http.StatusInternalServerError, wbErr
 		}
+	}
+	if moveStatus == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "2")
 	}
 	if moveErr == nil && dstExisted && moveStatus == http.StatusCreated {
 		moveStatus = http.StatusNoContent
