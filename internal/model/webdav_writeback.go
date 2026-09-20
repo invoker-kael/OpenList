@@ -20,7 +20,12 @@ type WebDAVWritebackObject struct {
 	CreateTime       time.Time  `json:"create_time"`
 	ETag             string     `json:"etag" gorm:"size:160"`
 	Generation       uint64     `json:"generation"`
-	State            string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1"`
+	// CanonicalState is the client-visible lifecycle. State below is retained as
+	// the provider-replication lifecycle so ACKed WebDAV identity cannot flap as
+	// the backing provider moves through queued/uploading/verifying/failed.
+	CanonicalState	string	`json:"canonical_state" gorm:"size:16"`
+	DurableAt	*time.Time	`json:"durable_at"`
+	State	string	`json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1"`
 	SpoolPath        string     `json:"spool_path" gorm:"type:text"`
 	PayloadSHA1      string     `json:"payload_sha1" gorm:"size:40"`
 	RemoteObjectID   string     `json:"remote_object_id" gorm:"size:255"`
@@ -47,9 +52,13 @@ type WebDAVWritebackReceiveFence struct {
 	ID                    uint      `json:"id" gorm:"primaryKey"`
 	PathKey               string    `json:"path_key" gorm:"size:64;uniqueIndex"`
 	Path                  string    `json:"path" gorm:"type:text"`
-	NextSequence          uint64    `json:"next_sequence"`
-	LastCommittedSequence uint64    `json:"last_committed_sequence"`
-	CreatedAt             time.Time `json:"created_at"`
+	NextSequence          uint64     `json:"next_sequence"`
+	LastCommittedSequence uint64     `json:"last_committed_sequence"`
+	ActiveReceivers	int	`json:"active_receivers"`
+	LatestExpectedSize	int64	`json:"latest_expected_size"`
+	LatestStartedAt	*time.Time	`json:"latest_started_at"`
+	ReceiveLeaseUntil	*time.Time	`json:"receive_lease_until"`
+	CreatedAt             time.Time  `json:"created_at"`
 	UpdatedAt             time.Time `json:"updated_at"`
 }
 

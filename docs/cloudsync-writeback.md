@@ -19,16 +19,23 @@ The remote provider's mtime is informational only.
 
 ## State machine
 
+Client-visible canonical state and provider replication state are deliberately separate:
+
 ```text
-PUT
+PUT body
+ -> RECEIVING lease in MySQL
  -> local fsync + atomic rename
+ -> canonical ACKED + DurableAt in MySQL
+ -> HTTP 201/204 to Cloud Sync
+
+provider replication (background only)
  -> QUEUED
  -> UPLOADING
  -> VERIFYING
- -> COMPLETED
+ -> COMPLETED / FAILED+RETRY
 ```
 
-A successful PUT means the payload is durable in the local spool and its metadata is committed to the OpenList database. It does **not** mean the backing cloud has already finished uploading.
+A successful PUT means the complete payload is durable in the local spool and the canonical `ACKED` identity is committed to MySQL. It does **not** mean the backing cloud has already finished uploading. Provider queue transitions and retry failures therefore cannot change the size/mtime/ETag that Cloud Sync sees for that ACKed generation.
 
 After the complete PUT body is fsynced and atomically installed in the spool, the canonical MySQL commit is intentionally detached from HTTP request cancellation. A late Cloud Sync timeout/disconnect can therefore lose the response, but it cannot make OpenList discard an already complete large payload; the next retry observes/coalesces against the durable canonical generation. An incomplete body is never committed. When the request has a declared length and OpenList has received exactly that many bytes, a terminal connection-cancellation error after the final byte is treated as end-of-body rather than as truncation; cancellation before the declared length remains a hard failure.
 
@@ -41,6 +48,8 @@ The write-back queue and canonical metadata use the normal OpenList GORM databas
 Paths are stored as text, while SHA-256 path keys are indexed. This avoids MySQL `utf8mb4` index-length problems for long WebDAV paths.
 
 Same-path PUT publication is also fenced in MySQL. Each WebDAV path has one small receive-fence row with a monotonically increasing start sequence and the last sequence that successfully published canonical state. A PUT receives its sequence before the body is accepted; after the complete payload is durable, canonical publication locks that fence and cannot move behind a newer committed PUT. This replaces process-local ordering as the correctness authority, so overlapping large-file retries converge the same way after restart or across multiple OpenList instances.
+
+The same fence now carries a crash-expiring `RECEIVING` lease and active-receiver count. A long PUT refreshes that lease periodically while streaming. Provider workers consult the durable lease as well as the local fast-path map, so another OpenList instance cannot start uploading an older queued generation while the NAS is still sending a newer large file. A crashed receiver stops blocking automatically when its lease expires. This is coordination only: OpenList never returns success for a partial body.
 
 The same fence is advanced by canonical MKCOL and DELETE mutations. Directory DELETE advances every already-known descendant fence in the same MySQL transaction as the tombstones. Therefore an older PUT that started before a later delete cannot finish late and resurrect the deleted path, including when the PUT and DELETE were handled by different OpenList instances.
 
@@ -75,7 +84,7 @@ For large Cloud Sync jobs, using SSD/NVMe for the spool is recommended. When fre
 
 ## Semantics
 
-- Repeated PROPFIND calls use canonical metadata instead of provider mtime/size. Cloud Sync can immediately re-list a just-written object without seeing the provider's temporary size=0 / missing state.
+- Repeated PROPFIND calls use the ACKed canonical metadata instead of provider mtime/size or replication state. Cloud Sync can immediately re-list a just-written object without seeing the provider's temporary size=0 / missing state.
 - Cloud Sync zero-length placeholder PUTs and the following real PUT are coalesced by a short settle window. The provider worker never starts an older generation while another PUT for the same path is still being received.
 - PUT returns 201 for a newly tracked path and 204 for a later tracked overwrite, while the canonical generation/ETag changes immediately.
 - GET/HEAD use the local payload while it is cached and fall back to the backing provider after cleanup. After the local completed cache has expired, a successful provider directory listing that no longer contains the object removes the stale canonical row so Cloud Sync can see the loss and upload it again.

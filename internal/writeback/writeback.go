@@ -37,6 +37,13 @@ const (
 	StateFailed    = "failed"
 	StateDeleted   = "deleted"
 	StateLockNull  = "lock_null"
+
+	CanonicalStateAcked    = "acked"
+	CanonicalStateDeleted  = "deleted"
+	CanonicalStateLockNull = "lock_null"
+
+	receiveLeaseDuration    = 15 * time.Minute
+	receiveHeartbeatEvery   = time.Minute
 )
 
 var ErrCanonicalChanged = errors.New("canonical WebDAV state changed while staging provider delete")
@@ -53,6 +60,59 @@ func (o *CanonicalObject) ETag(context.Context) (string, error) {
 func Enabled() bool {
 	return conf.Conf != nil && conf.Conf.WebDAVWriteback.Enabled
 }
+
+func canonicalState(row *model.WebDAVWritebackObject) string {
+	if row == nil {
+		return ""
+	}
+	if row.CanonicalState != "" {
+		return row.CanonicalState
+	}
+	// Rows created before the ACK-state split used State for both concerns.
+	// Treat every non-delete/non-lock row as an already accepted canonical
+	// object so upgrades do not make existing Cloud Sync files disappear.
+	switch row.State {
+	case StateDeleted:
+		return CanonicalStateDeleted
+	case StateLockNull:
+		return CanonicalStateLockNull
+	default:
+		return CanonicalStateAcked
+	}
+}
+
+func canonicalDeleted(row *model.WebDAVWritebackObject) bool {
+	return canonicalState(row) == CanonicalStateDeleted
+}
+
+func canonicalAcked(row *model.WebDAVWritebackObject) bool {
+	return canonicalState(row) == CanonicalStateAcked
+}
+
+func markCanonicalAcked(row *model.WebDAVWritebackObject, durableAt time.Time) {
+	if row == nil {
+		return
+	}
+	row.CanonicalState = CanonicalStateAcked
+	if !durableAt.IsZero() {
+		stamp := durableAt
+		row.DurableAt = &stamp
+	}
+}
+
+func markCanonicalDeleted(row *model.WebDAVWritebackObject) {
+	if row != nil {
+		row.CanonicalState = CanonicalStateDeleted
+	}
+}
+
+func markCanonicalLockNull(row *model.WebDAVWritebackObject) {
+	if row != nil {
+		row.CanonicalState = CanonicalStateLockNull
+		row.DurableAt = nil
+	}
+}
+
 
 func pathKey(p string) string {
 	sum := sha256.Sum256([]byte(utils.FixAndCleanPath(p)))
@@ -111,7 +171,7 @@ func canonicalContentSHA1(row *model.WebDAVWritebackObject) string {
 func canCoalesceDuplicatePut(row *model.WebDAVWritebackObject, size int64, payloadSHA1 string) bool {
 	return row != nil &&
 		!row.IsDir &&
-		row.State != StateDeleted &&
+		!canonicalDeleted(row) &&
 		row.SpoolPath != "" &&
 		row.Size == size &&
 		row.PayloadSHA1 != "" &&
@@ -1087,12 +1147,12 @@ func providerOperationSourceSuperseded(op *model.WebDAVProviderOperation) (bool,
 		return false, err
 	}
 	if op.SourceGeneration == 0 {
-		return current != nil && current.State != StateDeleted, nil
+		return current != nil && !canonicalDeleted(current), nil
 	}
 	if current == nil {
 		return true, nil
 	}
-	return current.Generation != op.SourceGeneration || current.State == StateDeleted, nil
+	return current.Generation != op.SourceGeneration || canonicalDeleted(current), nil
 }
 
 func applyProviderOperationDestinationRoot(op *model.WebDAVProviderOperation) error {
@@ -1253,7 +1313,7 @@ func Canonical(p string) (obj model.Obj, found bool, deleted bool, err error) {
 	if err != nil || row == nil {
 		return nil, false, false, err
 	}
-	if row.State == StateDeleted {
+	if canonicalDeleted(row) {
 		return nil, true, true, nil
 	}
 	return toObject(row), true, false, nil
@@ -1301,7 +1361,7 @@ func CommitLockNull(ctx context.Context, p string, now time.Time, duration time.
 				saved = row
 				return nil
 			}
-			if row.State != StateDeleted {
+			if !canonicalDeleted(row) {
 				saved = row
 				return nil
 			}
@@ -1324,6 +1384,7 @@ func CommitLockNull(ctx context.Context, p string, now time.Time, duration time.
 		row.CreateTime = now
 		row.ETag = canonicalETag(key, row.Generation, 0)
 		row.State = StateLockNull
+		markCanonicalLockNull(&row)
 		row.SpoolPath = ""
 		row.PayloadSHA1 = ""
 		row.MimeType = ""
@@ -1774,7 +1835,7 @@ func OverlayList(ctx context.Context, parent string, remote []model.Obj, remoteR
 		if !row.IsDir {
 			requireHash = providerRequiresPayloadHash(row.Path)
 		}
-		if row.State == StateDeleted {
+		if canonicalDeleted(row) {
 			delete(byName, row.Name)
 			continue
 		}
@@ -2074,25 +2135,102 @@ func lockOrCreateReceiveFence(tx *gorm.DB, p string) (*model.WebDAVWritebackRece
 	return &fence, nil
 }
 
-func beginReceiveSequence(ctx context.Context, p string) (uint64, error) {
+func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64, error) {
 	p = utils.FixAndCleanPath(p)
 	var sequence uint64
+	now := time.Now()
+	leaseUntil := now.Add(receiveLeaseDuration)
 	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		fence, err := lockOrCreateReceiveFence(tx, p)
 		if err != nil {
 			return err
 		}
+		if fence.ActiveReceivers > 0 && (fence.ReceiveLeaseUntil == nil || !now.Before(*fence.ReceiveLeaseUntil)) {
+			// A crashed process can leave an active count behind. Once its lease
+			// expires there is no live receiver entitled to keep blocking workers.
+			fence.ActiveReceivers = 0
+		}
 		fence.NextSequence++
+		fence.ActiveReceivers++
 		fence.Path = p
+		fence.LatestExpectedSize = expected
+		fence.LatestStartedAt = &now
+		fence.ReceiveLeaseUntil = &leaseUntil
 		sequence = fence.NextSequence
 		return tx.Model(&model.WebDAVWritebackReceiveFence{}).
 			Where("id = ?", fence.ID).
 			Updates(map[string]any{
-				"path":          p,
-				"next_sequence": sequence,
+				"path":                 p,
+				"next_sequence":        sequence,
+				"active_receivers":     fence.ActiveReceivers,
+				"latest_expected_size": expected,
+				"latest_started_at":    &now,
+				"receive_lease_until":  &leaseUntil,
 			}).Error
 	})
 	return sequence, err
+}
+
+func heartbeatReceiveSequence(ctx context.Context, p string) {
+	leaseUntil := time.Now().Add(receiveLeaseDuration)
+	_ = db.GetDb().WithContext(ctx).
+		Model(&model.WebDAVWritebackReceiveFence{}).
+		Where("path_key = ? AND active_receivers > 0", pathKey(p)).
+		Update("receive_lease_until", &leaseUntil).Error
+}
+
+func endReceiveSequence(ctx context.Context, p string) {
+	_ = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var fence model.WebDAVWritebackReceiveFence
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("path_key = ?", pathKey(p)).
+			First(&fence).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if fence.ActiveReceivers <= 1 {
+			return tx.Model(&model.WebDAVWritebackReceiveFence{}).
+				Where("id = ?", fence.ID).
+				Updates(map[string]any{
+					"active_receivers":    0,
+					"receive_lease_until": nil,
+				}).Error
+		}
+		return tx.Model(&model.WebDAVWritebackReceiveFence{}).
+			Where("id = ?", fence.ID).
+			Update("active_receivers", fence.ActiveReceivers-1).Error
+	})
+}
+
+func durableReceiving(p string, now time.Time) (bool, error) {
+	if isReceiving(p) {
+		return true, nil
+	}
+	var fence model.WebDAVWritebackReceiveFence
+	err := db.GetDb().
+		Select("id", "active_receivers", "receive_lease_until").
+		Where("path_key = ?", pathKey(p)).
+		First(&fence).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if fence.ActiveReceivers <= 0 || fence.ReceiveLeaseUntil == nil {
+		return false, nil
+	}
+	if now.Before(*fence.ReceiveLeaseUntil) {
+		return true, nil
+	}
+	// Expired lease is stale crash residue. Clear it with a guarded update so
+	// another instance that already refreshed the lease is never clobbered.
+	_ = db.GetDb().Model(&model.WebDAVWritebackReceiveFence{}).
+		Where("id = ? AND active_receivers > 0 AND receive_lease_until <= ?", fence.ID, now).
+		Updates(map[string]any{"active_receivers": 0, "receive_lease_until": nil}).Error
+	return false, nil
 }
 
 func lockReceiveFence(tx *gorm.DB, p string) (*model.WebDAVWritebackReceiveFence, error) {
@@ -2205,12 +2343,13 @@ func cloudSyncSettleDelay(size int64) time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
-func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incomingReservation) (int64, string, error) {
+func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incomingReservation, heartbeat ...func()) (int64, string, error) {
 	buf := make([]byte, 4*utils.MB)
 	payloadHasher := utils.SHA1.NewFunc()
 	writer := io.MultiWriter(dst, payloadHasher)
 	var total int64
 	var sinceCheck int64
+	lastHeartbeat := time.Now()
 
 	for {
 		n, readErr := src.Read(buf)
@@ -2225,6 +2364,10 @@ func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incom
 			total += int64(wn)
 			sinceCheck += int64(wn)
 			reservation.consume(uint64(wn))
+			if len(heartbeat) > 0 && heartbeat[0] != nil && time.Since(lastHeartbeat) >= receiveHeartbeatEvery {
+				heartbeat[0]()
+				lastHeartbeat = time.Now()
+			}
 			if writeErr != nil {
 				return total, "", writeErr
 			}
@@ -2282,10 +2425,12 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	createTimeProvided := !createTime.IsZero()
 	_, releaseReceiving := beginReceiving(p)
 	defer releaseReceiving()
-	receiveSequence, err := beginReceiveSequence(ctx, p)
+	receiveSequence, err := beginReceiveSequence(ctx, p, expected)
 	if err != nil {
 		return nil, false, err
 	}
+	receiveCtx := durableCommitContext(ctx)
+	defer endReceiveSequence(receiveCtx, p)
 	spoolDir := conf.Conf.WebDAVWriteback.SpoolDir
 	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
 		return nil, false, err
@@ -2310,9 +2455,14 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		}
 	}()
 
-	actualSize, payloadSHA1, err := copyToSpool(tmp, body, expected, reservation)
+	actualSize, payloadSHA1, err := copyToSpool(tmp, body, expected, reservation, func() {
+		heartbeatReceiveSequence(receiveCtx, p)
+	})
 	if err != nil {
-		return nil, false, err
+		if expected >= 0 {
+			return nil, false, fmt.Errorf("WebDAV PUT receive failed after %d/%d bytes: %w", actualSize, expected, err)
+		}
+		return nil, false, fmt.Errorf("WebDAV PUT receive failed after %d bytes with unknown declared length: %w", actualSize, err)
 	}
 	if err := tmp.Sync(); err != nil {
 		return nil, false, err
@@ -2344,7 +2494,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 
 	// MySQL is the authoritative ordering point for same-path Cloud Sync PUTs.
 	// The path fence survives process restarts and is shared by every instance.
-	commitCtx := durableCommitContext(ctx)
+	commitCtx := receiveCtx
 	superseded := false
 	err = db.GetDb().WithContext(commitCtx).Transaction(func(tx *gorm.DB) error {
 		fence, err := lockReceiveFence(tx, p)
@@ -2394,6 +2544,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			if canReverifyCompletedDuplicatePut(&row, actualSize, payloadSHA1) {
 				now := time.Now()
 				applyDuplicatePutMetadata(&row, modTime, createTime, mime, modTimeProvided, createTimeProvided)
+				markCanonicalAcked(&row, time.Now())
 				row.State = StateVerifying
 				row.SpoolPath = finalName
 				row.PayloadSHA1 = payloadSHA1
@@ -2411,7 +2562,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 				return advanceReceiveFence(tx, fence, receiveSequence)
 			}
 			oldSpool = row.SpoolPath
-			if row.State == StateDeleted {
+			if canonicalDeleted(row) {
 				created = true
 			}
 			row.Generation++
@@ -2430,6 +2581,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		row.ModTime = modTime
 		row.CreateTime = createTime
 		row.ETag = canonicalETag(key, row.Generation, actualSize)
+		markCanonicalAcked(&row, time.Now())
 		row.State = StateQueued
 		row.SpoolPath = finalName
 		row.PayloadSHA1 = payloadSHA1
@@ -2509,7 +2661,7 @@ func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*m
 			return findErr
 		}
 		if findErr == nil {
-			if row.State != StateDeleted && !row.IsDir {
+			if !canonicalDeleted(row) && !row.IsDir {
 				return ErrDestinationExists
 			}
 			row.Generation++
@@ -2528,6 +2680,7 @@ func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*m
 		row.ModTime = modTime
 		row.CreateTime = createTime
 		row.ETag = canonicalETag(key, row.Generation, 0)
+		markCanonicalAcked(&row, now)
 		row.State = StateQueued
 		row.SpoolPath = ""
 		row.PayloadSHA1 = ""
@@ -2559,7 +2712,7 @@ func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*m
 
 func OpenLocal(p string) (*os.File, *model.WebDAVWritebackObject, error) {
 	row, err := getByPath(p)
-	if err != nil || row == nil || row.State == StateDeleted || row.SpoolPath == "" {
+	if err != nil || row == nil || canonicalDeleted(row) || row.SpoolPath == "" {
 		return nil, row, err
 	}
 	f, err := os.Open(row.SpoolPath)
@@ -2604,13 +2757,14 @@ func DeleteTree(p string) (bool, error) {
 			} else {
 				matchedDescendant = true
 			}
-			if row.State == StateDeleted {
+			if canonicalDeleted(row) {
 				continue
 			}
 			if err := tx.Model(&model.WebDAVWritebackObject{}).
 				Where("id = ?", row.ID).
 				Updates(map[string]any{
 					"generation":         gorm.Expr("generation + 1"),
+					"canonical_state":    CanonicalStateDeleted,
 					"state":              StateDeleted,
 					"retry_at":           &now,
 					"last_error":         "",
@@ -2639,9 +2793,10 @@ func DeleteTree(p string) (bool, error) {
 				ModTime:    now,
 				CreateTime: now,
 				ETag:       canonicalETag(key, 1, 0),
-				Generation: 1,
-				State:      StateDeleted,
-				RetryAt:    &now,
+				Generation:	1,
+				CanonicalState:	CanonicalStateDeleted,
+				State:		StateDeleted,
+				RetryAt:	&now,
 			}
 			if err := tx.Create(&row).Error; err != nil {
 				return err
@@ -2695,7 +2850,7 @@ func StageProviderDelete(ctx context.Context, p string, source model.Obj) (bool,
 				continue
 			}
 			matched++
-			if row.State == StateDeleted {
+			if canonicalDeleted(row) {
 				deleted++
 				continue
 			}
@@ -2722,7 +2877,7 @@ func StageProviderDelete(ctx context.Context, p string, source model.Obj) (bool,
 		// state so callers return a bounded retry instead of deleting blindly.
 		current, lookupErr := getByPath(p)
 		if lookupErr == nil && current != nil {
-			if current.State == StateDeleted {
+			if canonicalDeleted(current) {
 				return true, nil
 			}
 			return false, ErrCanonicalChanged
@@ -2740,6 +2895,7 @@ func StageProviderDelete(ctx context.Context, p string, source model.Obj) (bool,
 
 func tombstoneMovedSource(row *model.WebDAVWritebackObject, now time.Time) {
 	row.Generation++
+	markCanonicalDeleted(row)
 	row.State = StateDeleted
 	row.SpoolPath = ""
 	row.PayloadSHA1 = ""
@@ -2753,7 +2909,7 @@ func tombstoneMovedSource(row *model.WebDAVWritebackObject, now time.Time) {
 }
 
 func pendingDirectoryMoveLocallyAuthoritative(root *model.WebDAVWritebackObject, rows []model.WebDAVWritebackObject, now time.Time) bool {
-	if root == nil || !root.IsDir || root.State == StateDeleted {
+	if root == nil || !root.IsDir || canonicalDeleted(root) {
 		return false
 	}
 	if root.State == StateCompleted {
@@ -2763,7 +2919,7 @@ func pendingDirectoryMoveLocallyAuthoritative(root *model.WebDAVWritebackObject,
 	}
 	for i := range rows {
 		row := &rows[i]
-		if row.State == StateDeleted || row.IsDir {
+		if canonicalDeleted(row) || row.IsDir {
 			continue
 		}
 		if row.SpoolPath == "" {
@@ -2819,7 +2975,7 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 		destinationByPath := make(map[string]int, len(destinationRows))
 		for i := range destinationRows {
 			row := &destinationRows[i]
-			if row.State != StateDeleted {
+			if !canonicalDeleted(row) {
 				if !overwrite {
 					return ErrDestinationExists
 				}
@@ -2833,7 +2989,7 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 
 		for i := range sourceRows {
 			sourceRow := &sourceRows[i]
-			if sourceRow.State == StateDeleted {
+			if canonicalDeleted(sourceRow) {
 				continue
 			}
 			suffix := strings.TrimPrefix(sourceRow.Path, src)
@@ -2864,6 +3020,7 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 			destinationRow.ModTime = sourceRow.ModTime
 			destinationRow.CreateTime = sourceRow.CreateTime
 			destinationRow.ETag = canonicalETag(destinationRow.PathKey, destinationRow.Generation, sourceRow.Size)
+			markCanonicalAcked(&destinationRow, now)
 			destinationRow.State = StateQueued
 			if sourceRow.IsDir {
 				destinationRow.SpoolPath = ""
@@ -2895,7 +3052,7 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 
 		for i := range sourceRows {
 			sourceRow := &sourceRows[i]
-			if sourceRow.State == StateDeleted {
+			if canonicalDeleted(sourceRow) {
 				continue
 			}
 			tombstoneMovedSource(sourceRow, now)
@@ -2987,7 +3144,7 @@ func copyPendingDirectory(src, dst string, recursive bool) (handled bool, overwr
 
 		for i := range sourceRows {
 			sourceRow := &sourceRows[i]
-			if sourceRow.State == StateDeleted {
+			if canonicalDeleted(sourceRow) {
 				continue
 			}
 			if !recursive && sourceRow.Path != src {
@@ -3017,8 +3174,10 @@ func copyPendingDirectory(src, dst string, recursive bool) (handled bool, overwr
 				ModTime:     sourceRow.ModTime,
 				CreateTime:  sourceRow.CreateTime,
 				ETag:        canonicalETag(pathKey(newPath), 1, sourceRow.Size),
-				Generation:  1,
-				State:       StateQueued,
+				Generation:	1,
+				CanonicalState:	CanonicalStateAcked,
+				DurableAt:	&now,
+				State:		StateQueued,
 				SpoolPath:   spoolPath,
 				PayloadSHA1: payloadSHA1,
 				MimeType:    sourceRow.MimeType,
@@ -3065,7 +3224,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		}
 		return false, false, err
 	}
-	if srcRow.State == StateDeleted {
+	if canonicalDeleted(&srcRow) {
 		return false, false, nil
 	}
 	if srcRow.IsDir {
@@ -3086,7 +3245,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).First(&lockedSrc).Error; err != nil {
 			return err
 		}
-		if lockedSrc.IsDir || lockedSrc.State == StateDeleted || lockedSrc.SpoolPath == "" {
+		if lockedSrc.IsDir || canonicalDeleted(&lockedSrc) || lockedSrc.SpoolPath == "" {
 			return gorm.ErrRecordNotFound
 		}
 
@@ -3099,7 +3258,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 			if dstRow.ID == lockedSrc.ID {
 				return gorm.ErrRecordNotFound
 			}
-			destinationExists := dstRow.State != StateDeleted
+			destinationExists := !canonicalDeleted(&dstRow)
 			if destinationExists && !overwrite {
 				return ErrDestinationExists
 			}
@@ -3123,6 +3282,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		dstRow.ModTime = lockedSrc.ModTime
 		dstRow.CreateTime = lockedSrc.CreateTime
 		dstRow.ETag = canonicalETag(dstKey, dstRow.Generation, lockedSrc.Size)
+		markCanonicalAcked(&dstRow, now)
 		dstRow.State = StateQueued
 		dstRow.SpoolPath = lockedSrc.SpoolPath
 		dstRow.PayloadSHA1 = lockedSrc.PayloadSHA1
@@ -3178,7 +3338,7 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 		}
 		return false, false, err
 	}
-	if srcRow.State == StateDeleted {
+	if canonicalDeleted(&srcRow) {
 		return false, false, nil
 	}
 	if srcRow.IsDir {
@@ -3198,7 +3358,7 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).First(&lockedSrc).Error; err != nil {
 			return err
 		}
-		if lockedSrc.IsDir || lockedSrc.State == StateDeleted || lockedSrc.SpoolPath == "" {
+		if lockedSrc.IsDir || canonicalDeleted(&lockedSrc) || lockedSrc.SpoolPath == "" {
 			return gorm.ErrRecordNotFound
 		}
 
@@ -3210,7 +3370,7 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 		}
 
 		if dstErr == nil {
-			destinationExists := dstRow.State != StateDeleted
+			destinationExists := !canonicalDeleted(&dstRow)
 			if destinationExists && !overwrite {
 				return ErrDestinationExists
 			}
@@ -3234,6 +3394,7 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 		dstRow.ModTime = lockedSrc.ModTime
 		dstRow.CreateTime = lockedSrc.CreateTime
 		dstRow.ETag = canonicalETag(dstKey, dstRow.Generation, lockedSrc.Size)
+		markCanonicalAcked(&dstRow, time.Now())
 		dstRow.State = StateQueued
 		dstRow.SpoolPath = lockedSrc.SpoolPath
 		dstRow.PayloadSHA1 = lockedSrc.PayloadSHA1
@@ -3278,6 +3439,7 @@ func providerOverwriteQuiescent(rows []model.WebDAVWritebackObject) bool {
 func refreshUnknownProviderOverwrite(row *model.WebDAVWritebackObject, now time.Time) {
 	row.Generation++
 	row.ETag = canonicalETag(pathKey(row.Path), row.Generation, row.Size)
+	markCanonicalAcked(row, now)
 	row.State = StateCompleted
 	row.SpoolPath = ""
 	row.CleanupPath = ""
@@ -3306,6 +3468,7 @@ func setProviderCompletedRoot(row *model.WebDAVWritebackObject, dst string, sour
 	row.ModTime = source.ModTime()
 	row.CreateTime = source.CreateTime()
 	row.ETag = canonicalETag(row.PathKey, row.Generation, row.Size)
+	markCanonicalAcked(row, now)
 	row.State = StateCompleted
 	row.SpoolPath = ""
 	row.PayloadSHA1 = source.GetHash().GetHash(utils.SHA1)
@@ -3343,6 +3506,11 @@ func setMovedDestinationFromSource(row, source *model.WebDAVWritebackObject, dst
 	row.ModTime = source.ModTime
 	row.CreateTime = source.CreateTime
 	row.ETag = canonicalETag(row.PathKey, row.Generation, row.Size)
+	if canonicalDeleted(source) {
+		markCanonicalDeleted(row)
+	} else {
+		markCanonicalAcked(row, now)
+	}
 	row.SpoolPath = source.SpoolPath
 	row.PayloadSHA1 = source.PayloadSHA1
 	row.MimeType = source.MimeType
@@ -3353,7 +3521,7 @@ func setMovedDestinationFromSource(row, source *model.WebDAVWritebackObject, dst
 	clearRemoteVerification(row)
 
 	switch {
-	case source.State == StateDeleted:
+	case canonicalDeleted(source):
 		row.State = StateDeleted
 		row.SpoolPath = ""
 		row.PayloadSHA1 = ""
@@ -3400,9 +3568,10 @@ func providerMoveSourceTombstone(src string, source model.Obj, now time.Time) mo
 		ModTime:    modTime,
 		CreateTime: createTime,
 		ETag:       canonicalETag(key, 1, size),
-		Generation: 1,
-		State:      StateDeleted,
-		RetryAt:    &now,
+		Generation:	1,
+		CanonicalState:	CanonicalStateDeleted,
+		State:		StateDeleted,
+		RetryAt:	&now,
 	}
 }
 
@@ -3550,6 +3719,11 @@ func CopyTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 			destinationRow.ModTime = sourceRow.ModTime
 			destinationRow.CreateTime = sourceRow.CreateTime
 			destinationRow.ETag = canonicalETag(destinationRow.PathKey, destinationRow.Generation, sourceRow.Size)
+			if canonicalDeleted(sourceRow) {
+				markCanonicalDeleted(&destinationRow)
+			} else {
+				markCanonicalAcked(&destinationRow, now)
+			}
 			destinationRow.SpoolPath = sourceRow.SpoolPath
 			destinationRow.PayloadSHA1 = sourceRow.PayloadSHA1
 			destinationRow.MimeType = sourceRow.MimeType
@@ -3559,14 +3733,14 @@ func CopyTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 			destinationRow.VerifyCount = 0
 			clearRemoteVerification(&destinationRow)
 
-			switch sourceRow.State {
-			case StateDeleted:
+			switch {
+			case canonicalDeleted(sourceRow):
 				destinationRow.State = StateDeleted
 				destinationRow.SpoolPath = ""
 				destinationRow.PayloadSHA1 = ""
 				destinationRow.RetryAt = &now
 				destinationRow.CompletedAt = nil
-			case StateCompleted:
+			case sourceRow.State == StateCompleted:
 				destinationRow.State = StateCompleted
 				destinationRow.RetryAt = nil
 				destinationRow.CompletedAt = &now
@@ -4159,6 +4333,30 @@ func Stop() {
 }
 
 func (m *workerManager) recoverInterrupted() error {
+	// Backfill the client-visible lifecycle for rows created before the ACK-state
+	// split. This does not change the existing provider replication State.
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("canonical_state = '' OR canonical_state IS NULL").
+		Where("state = ?", StateDeleted).
+		Update("canonical_state", CanonicalStateDeleted).Error; err != nil {
+		return err
+	}
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("canonical_state = '' OR canonical_state IS NULL").
+		Where("state = ?", StateLockNull).
+		Update("canonical_state", CanonicalStateLockNull).Error; err != nil {
+		return err
+	}
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("canonical_state = '' OR canonical_state IS NULL").
+		Where("state NOT IN ?", []string{StateDeleted, StateLockNull}).
+		Updates(map[string]any{
+			"canonical_state": CanonicalStateAcked,
+			"durable_at":      gorm.Expr("COALESCE(durable_at, created_at)"),
+		}).Error; err != nil {
+		return err
+	}
+
 	// LockSystem is process-local, so lock-null shadows cannot survive a
 	// restart without their corresponding lock token.
 	if err := db.GetDb().Where("state = ?", StateLockNull).Delete(&model.WebDAVWritebackObject{}).Error; err != nil {
@@ -4282,7 +4480,7 @@ func (m *workerManager) process(id uint) {
 }
 
 func canonicalParentBlocksChild(parent *model.WebDAVWritebackObject) bool {
-	return parent != nil && (!parent.IsDir || parent.State == StateDeleted)
+	return parent != nil && (!parent.IsDir || canonicalDeleted(parent))
 }
 
 func (m *workerManager) waitForCanonicalParent(row *model.WebDAVWritebackObject) (bool, error) {
@@ -4336,7 +4534,7 @@ func shouldRemoveStaleRemote(uploadedPath string, current *model.WebDAVWriteback
 	// A newer generation at the same path must win by being uploaded next.
 	// Removing the remote object here would create an avoidable visibility gap
 	// and can race with another worker/process writing the new generation.
-	return current.State == StateDeleted || current.Path != uploadedPath
+	return canonicalDeleted(current) || current.Path != uploadedPath
 }
 
 func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
@@ -4346,7 +4544,15 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	} else if waiting {
 		return
 	}
-	if isReceiving(row.Path) {
+	receiving, receiveErr := durableReceiving(row.Path, time.Now())
+	if receiveErr != nil {
+		next := time.Now().Add(2 * time.Second)
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
+			Updates(map[string]any{"retry_at": &next, "last_error": "waiting for durable receive lease"}).Error
+		return
+	}
+	if receiving {
 		next := time.Now().Add(time.Second)
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
@@ -4409,7 +4615,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	if err := db.GetDb().First(&current, row.ID).Error; err != nil {
 		return
 	}
-	if current.Generation != row.Generation || current.State == StateDeleted || current.Path != row.Path {
+	if current.Generation != row.Generation || canonicalDeleted(&current) || current.Path != row.Path {
 		if shouldRemoveStaleRemote(row.Path, &current) {
 			_ = fs.Remove(m.ctx, row.Path)
 		}
@@ -4793,7 +4999,7 @@ func collectConfirmedTombstoneSubtree(root *model.WebDAVWritebackObject, rows []
 	rootMatched := false
 	for i := range rows {
 		row := &rows[i]
-		if row.State != StateDeleted || !isPathOrDescendant(row.Path, root.Path) {
+		if !canonicalDeleted(row) || !isPathOrDescendant(row.Path, root.Path) {
 			continue
 		}
 		if row.ID == root.ID {
@@ -4859,7 +5065,7 @@ func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 	if err := db.GetDb().First(&current, row.ID).Error; err != nil {
 		return
 	}
-	if current.Generation != row.Generation || current.State != StateDeleted {
+	if current.Generation != row.Generation || !canonicalDeleted(&current) {
 		return
 	}
 
@@ -4876,7 +5082,7 @@ func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 	if err := db.GetDb().First(&current, row.ID).Error; err != nil {
 		return
 	}
-	if current.Generation != row.Generation || current.State != StateDeleted {
+	if current.Generation != row.Generation || !canonicalDeleted(&current) {
 		if current.State == StateCompleted && current.SpoolPath != "" {
 			now := time.Now()
 			res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
@@ -4926,7 +5132,7 @@ func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 	if err := db.GetDb().First(&current, row.ID).Error; err != nil {
 		return
 	}
-	if current.Generation != row.Generation || current.State != StateDeleted {
+	if current.Generation != row.Generation || !canonicalDeleted(&current) {
 		return
 	}
 

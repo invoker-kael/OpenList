@@ -1,6 +1,13 @@
 name: WebDAV Writeback Tests
 
 on:
+  push:
+    branches: ["feature/cloudsync-writeback"]
+    paths:
+      - "internal/writeback/**"
+      - "internal/model/webdav_writeback.go"
+      - "internal/db/db.go"
+      - "server/webdav/**"
   pull_request:
     branches: ["main"]
     paths:

@@ -711,6 +711,40 @@ func TestDirectoryMutationFenceScope(t *testing.T) {
 	}
 }
 
+func TestMarkCanonicalAckedStampsCurrentTakeover(t *testing.T) {
+	old := time.Unix(100, 0)
+	fresh := time.Unix(200, 0)
+	row := &model.WebDAVWritebackObject{CanonicalState: CanonicalStateAcked, DurableAt: &old}
+	markCanonicalAcked(row, fresh)
+	if row.DurableAt == nil || !row.DurableAt.Equal(fresh) {
+		t.Fatalf("durable_at = %v, want %v", row.DurableAt, fresh)
+	}
+}
+
+func TestCanonicalStateSeparatesClientAckFromReplication(t *testing.T) {
+	for _, state := range []string{StateQueued, StateUploading, StateVerifying, StateCompleted, StateFailed} {
+		row := &model.WebDAVWritebackObject{State: state}
+		if !canonicalAcked(row) {
+			t.Fatalf("legacy replication state %q must remain client-visible as ACKed", state)
+		}
+	}
+	if canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: CanonicalStateDeleted, State: StateCompleted}) {
+		t.Fatal("explicit canonical tombstone must win over a completed remote replication state")
+	}
+	if !canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: CanonicalStateAcked, State: StateFailed}) {
+		t.Fatal("remote replication failure must not revoke the client ACK")
+	}
+}
+
+func TestReceiveLeaseConstantsCoverSlowLargePuts(t *testing.T) {
+	if receiveLeaseDuration <= receiveHeartbeatEvery {
+		t.Fatalf("receive lease %v must exceed heartbeat interval %v", receiveLeaseDuration, receiveHeartbeatEvery)
+	}
+	if receiveLeaseDuration < 5*time.Minute {
+		t.Fatalf("receive lease %v is too short for slow large PUTs", receiveLeaseDuration)
+	}
+}
+
 func TestReceiveSequenceSuperseded(t *testing.T) {
 	if receiveSequenceSuperseded(0, 1) {
 		t.Fatal("first receive sequence cannot be superseded")
@@ -736,6 +770,13 @@ func TestReceiveFenceSchemaKeepsPathOrderingDurable(t *testing.T) {
 	last, ok := typ.FieldByName("LastCommittedSequence")
 	if !ok || last.Type.Kind() != reflect.Uint64 {
 		t.Fatal("receive fence LastCommittedSequence must be uint64")
+	}
+	active, ok := typ.FieldByName("ActiveReceivers")
+	if !ok || active.Type.Kind() != reflect.Int {
+		t.Fatal("receive fence ActiveReceivers must persist cross-instance receiving state")
+	}
+	if _, ok := typ.FieldByName("ReceiveLeaseUntil"); !ok {
+		t.Fatal("receive fence must persist a crash-expiring receive lease")
 	}
 }
 
