@@ -1447,10 +1447,38 @@ func TestCloudSyncRemoteVerificationEvidencePolicy(t *testing.T) {
 	}
 }
 
+func TestCompletedRemoteVerificationIntervalSeparatesHealthyProbeCadence(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{
+		WebDAVWriteback: conf.WebDAVWritebackConfig{
+			VerifyIntervalSeconds:       5,
+			CompletedRemoteProbeSeconds: 300,
+		},
+	}
+	defer func() { conf.Conf = oldConf }()
+
+	if got := completedRemoteVerificationInterval(); got != 5*time.Minute {
+		t.Fatalf("completed remote probe interval=%v, want 5m", got)
+	}
+
+	conf.Conf.WebDAVWriteback.CompletedRemoteProbeSeconds = 2
+	if got := completedRemoteVerificationInterval(); got != 5*time.Second {
+		t.Fatalf("completed probe must not run faster than upload verification: %v", got)
+	}
+
+	conf.Conf.WebDAVWriteback.CompletedRemoteProbeSeconds = 0
+	if got := completedRemoteVerificationInterval(); got != 5*time.Minute {
+		t.Fatalf("zero completed probe setting should use the 5m default, got %v", got)
+	}
+}
+
 func TestCompletedRemoteVerificationFresh(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = &conf.Config{
-		WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyIntervalSeconds: 10},
+		WebDAVWriteback: conf.WebDAVWritebackConfig{
+			VerifyIntervalSeconds:       5,
+			CompletedRemoteProbeSeconds: 10,
+		},
 	}
 	defer func() { conf.Conf = oldConf }()
 

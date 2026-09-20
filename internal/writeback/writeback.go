@@ -1645,9 +1645,18 @@ func clearCompletedFileDivergence(row *model.WebDAVWritebackObject) error {
 // apparent mismatch is confirmed through one force-refreshed exact-name parent
 // listing before canonical metadata is dropped.
 func completedRemoteVerificationInterval() time.Duration {
-	seconds := 1
+	// Upload verification is intentionally frequent so a new generation can
+	// converge quickly. Once that generation is COMPLETED and its local spool
+	// has been released, direct Cloud Sync scans should not turn the same short
+	// cadence into continuous provider health checks. Keep healthy completed
+	// probes on a separate, longer cooldown while never probing more frequently
+	// than the upload verification interval.
+	seconds := 5 * 60
 	if conf.Conf != nil {
-		seconds = max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)
+		if configured := conf.Conf.WebDAVWriteback.CompletedRemoteProbeSeconds; configured > 0 {
+			seconds = configured
+		}
+		seconds = max(seconds, max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds))
 	}
 	return time.Duration(seconds) * time.Second
 }
