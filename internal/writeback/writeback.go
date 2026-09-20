@@ -4453,9 +4453,9 @@ func (m *workerManager) recoverInterrupted() error {
 			Updates(map[string]any{
 				"state":             StateQueued,
 				"remote_sync_state": StateQueued,
-				"retry_at":     &now,
-				"verify_count": 0,
-				"last_error":   "re-queued interrupted directory creation",
+				"retry_at":          &now,
+				"verify_count":      0,
+				"last_error":        "re-queued interrupted directory creation",
 			}).Error; err != nil {
 			return err
 		}
@@ -4464,9 +4464,9 @@ func (m *workerManager) recoverInterrupted() error {
 			Updates(map[string]any{
 				"state":             StateVerifying,
 				"remote_sync_state": StateVerifying,
-				"retry_at":     &now,
-				"verify_count": 0,
-				"last_error":   "resuming remote verification after interrupted upload",
+				"retry_at":          &now,
+				"verify_count":      0,
+				"last_error":        "resuming remote verification after interrupted upload",
 			}).Error
 	})
 }
@@ -4720,9 +4720,9 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 			Updates(map[string]any{
 				"state":             StateVerifying,
 				"remote_sync_state": StateVerifying,
-				"retry_at":     &next,
-				"verify_count": 0,
-				"last_error":   fmt.Sprintf("provider upload succeeded but verification state persistence failed: %v", res.Error),
+				"retry_at":          &next,
+				"verify_count":      0,
+				"last_error":        fmt.Sprintf("provider upload succeeded but verification state persistence failed: %v", res.Error),
 			}).Error
 		log.Errorf("write-back failed to enter verifying state for %s: %v", row.Path, res.Error)
 		return
@@ -4762,10 +4762,10 @@ func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
 		Updates(map[string]any{
 			"state":             StateCompleted,
 			"remote_sync_state": StateCompleted,
-			"completed_at": &now,
-			"retry_at":     nil,
-			"last_error":   "",
-			"retry_count":  0,
+			"completed_at":      &now,
+			"retry_at":          nil,
+			"last_error":        "",
+			"retry_count":       0,
 		})
 	if res.Error != nil || res.RowsAffected == 0 {
 		return
@@ -4921,8 +4921,8 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, allowedStates).
 		Updates(map[string]any{
-			"state":             StateCompleted,
-			"remote_sync_state": StateCompleted,
+			"state":              StateCompleted,
+			"remote_sync_state":  StateCompleted,
 			"completed_at":       &now,
 			"retry_at":           nil,
 			"last_error":         "",
@@ -4953,9 +4953,9 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 			Updates(map[string]any{
 				"state":             StateQueued,
 				"remote_sync_state": StateQueued,
-				"retry_at":     &now,
-				"verify_count": 0,
-				"last_error":   "directory verification state repaired to queued",
+				"retry_at":          &now,
+				"verify_count":      0,
+				"last_error":        "directory verification state repaired to queued",
 			}).Error
 		return
 	}
@@ -4982,9 +4982,9 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 			Updates(map[string]any{
 				"state":             StateVerifying,
 				"remote_sync_state": StateVerifying,
-				"retry_at":     &next,
-				"verify_count": row.VerifyCount,
-				"last_error":   msg,
+				"retry_at":          &next,
+				"verify_count":      row.VerifyCount,
+				"last_error":        msg,
 			}).Error
 		return
 	}
@@ -4999,9 +4999,9 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 				Updates(map[string]any{
 					"state":             StateVerifying,
 					"remote_sync_state": StateVerifying,
-					"retry_at":     &next,
-					"verify_count": max(0, attempts-1),
-					"last_error":   "115 multipart upload remains divergent after one repair upload; preserving durable spool and continuing low-frequency verification without another automatic reupload",
+					"retry_at":          &next,
+					"verify_count":      max(0, attempts-1),
+					"last_error":        "115 multipart upload remains divergent after one repair upload; preserving durable spool and continuing low-frequency verification without another automatic reupload",
 				}).Error
 			return
 		}
@@ -5011,10 +5011,10 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 			Updates(map[string]any{
 				"state":             StateQueued,
 				"remote_sync_state": StateQueued,
-				"retry_at":     &next,
-				"retry_count":  row.RetryCount + 1,
-				"verify_count": 0,
-				"last_error":   "fresh provider evidence stayed divergent through the verification window",
+				"retry_at":          &next,
+				"retry_count":       row.RetryCount + 1,
+				"verify_count":      0,
+				"last_error":        "fresh provider evidence stayed divergent through the verification window",
 			}).Error
 		return
 	}
@@ -5038,9 +5038,9 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		Updates(map[string]any{
 			"state":             StateVerifying,
 			"remote_sync_state": StateVerifying,
-			"retry_at":     &next,
-			"verify_count": nextCount,
-			"last_error":   msg,
+			"retry_at":          &next,
+			"verify_count":      nextCount,
+			"last_error":        msg,
 		}).Error
 }
 
@@ -5178,9 +5178,9 @@ func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 				Updates(map[string]any{
 					"state":             StateQueued,
 					"remote_sync_state": StateQueued,
-					"retry_at":     &now,
-					"completed_at": nil,
-					"last_error":   "re-queued because an older delete overlapped this generation",
+					"retry_at":          &now,
+					"completed_at":      nil,
+					"last_error":        "re-queued because an older delete overlapped this generation",
 				})
 			if res.Error == nil && res.RowsAffected > 0 {
 				wake()
@@ -5256,9 +5256,9 @@ func (m *workerManager) failAfter(row *model.WebDAVWritebackObject, err error, d
 		Updates(map[string]any{
 			"state":             StateFailed,
 			"remote_sync_state": StateFailed,
-			"retry_at":    &next,
-			"retry_count": row.RetryCount + 1,
-			"last_error":  err.Error(),
+			"retry_at":          &next,
+			"retry_count":       row.RetryCount + 1,
+			"last_error":        err.Error(),
 		}).Error
 }
 
