@@ -164,28 +164,18 @@ func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]mode
 			delete(byName, row.Name)
 			continue
 		}
-		remoteObj, remotePresent := byName[row.Name]
+		_, remotePresent := byName[row.Name]
 		if row.IsDir {
-			remoteDirPresent := remotePresent && remoteObj.IsDir()
-			if remoteReliable && row.State == StateCompleted && remoteDirPresent {
+			if remoteReliable && directoryShadowExpired(row, now) {
 				res := db.GetDb().
 					Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateCompleted).
 					Delete(&model.WebDAVWritebackObject{})
 				if res.Error != nil {
 					return nil, false, res.Error
 				}
-				continue
-			}
-			if remoteReliable && !remoteDirPresent && directoryShadowExpired(row, now) {
-				res := db.GetDb().
-					Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateCompleted).
-					Delete(&model.WebDAVWritebackObject{})
-				if res.Error != nil {
-					return nil, false, res.Error
-				}
-				// If the provider exposes a same-name object with the wrong type,
-				// stop shadowing it after the grace window so Cloud Sync can observe
-				// the real conflict instead of seeing the name disappear entirely.
+				// After the grace window, hand the name back to the provider. If
+				// it is missing, remove the shadowed name; if it exists with either
+				// directory or file type, leave the real provider object visible.
 				if !remotePresent {
 					delete(byName, row.Name)
 				}
