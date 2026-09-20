@@ -17,6 +17,37 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
+type canonicalProxyHeaders struct {
+	etag          string
+	lastModified  string
+	contentType   string
+	contentLength string
+}
+
+func snapshotCanonicalProxyHeaders(header http.Header) canonicalProxyHeaders {
+	return canonicalProxyHeaders{
+		etag:          header.Get("Etag"),
+		lastModified:  header.Get("Last-Modified"),
+		contentType:   header.Get("Content-Type"),
+		contentLength: header.Get("Content-Length"),
+	}
+}
+
+func (h canonicalProxyHeaders) restore(header http.Header) {
+	if h.etag != "" {
+		header.Set("Etag", h.etag)
+	}
+	if h.lastModified != "" {
+		header.Set("Last-Modified", h.lastModified)
+	}
+	if h.contentType != "" {
+		header.Set("Content-Type", h.contentType)
+	}
+	if h.contentLength != "" {
+		header.Set("Content-Length", h.contentLength)
+	}
+}
+
 func Proxy(w http.ResponseWriter, r *http.Request, link *model.Link, file model.Obj) error {
 	// if link.MFile != nil {
 	// 	attachHeader(w, file, link)
@@ -50,10 +81,9 @@ func Proxy(w http.ResponseWriter, r *http.Request, link *model.Link, file model.
 		})
 	}
 
-	// transparent proxy. Preserve caller-supplied canonical WebDAV metadata
-	// instead of leaking provider-side timestamps/ETags back to sync clients.
-	canonicalETag := w.Header().Get("Etag")
-	canonicalLastModified := w.Header().Get("Last-Modified")
+	// Transparent proxy. Preserve caller-supplied canonical WebDAV metadata
+	// instead of leaking provider-side metadata back to sync clients.
+	canonicalHeaders := snapshotCanonicalProxyHeaders(w.Header())
 	header := net.ProcessHeader(r.Header, link.Header)
 	res, err := net.RequestHttp(r.Context(), r.Method, header, link.URL)
 	if err != nil {
@@ -62,12 +92,7 @@ func Proxy(w http.ResponseWriter, r *http.Request, link *model.Link, file model.
 	defer res.Body.Close()
 
 	maps.Copy(w.Header(), res.Header)
-	if canonicalETag != "" {
-		w.Header().Set("Etag", canonicalETag)
-	}
-	if canonicalLastModified != "" {
-		w.Header().Set("Last-Modified", canonicalLastModified)
-	}
+	canonicalHeaders.restore(w.Header())
 	w.Header().Set("Content-Disposition", utils.GenerateContentDisposition(file.GetName()))
 	w.WriteHeader(res.StatusCode)
 	if r.Method == http.MethodHead {

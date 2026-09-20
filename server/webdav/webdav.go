@@ -293,6 +293,9 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 			if row.MimeType != "" {
 				w.Header().Set("Content-Type", row.MimeType)
 			}
+			if r.Method == http.MethodHead && row.Size >= 0 {
+				w.Header().Set("Content-Length", strconv.FormatInt(row.Size, 10))
+			}
 		}
 		if localFile != nil {
 			defer localFile.Close()

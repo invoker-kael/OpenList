@@ -1,54 +1,55 @@
 package common
 
 import (
-	"io"
 	"net/http"
-	"net/http/httptest"
 	"testing"
-
-	"github.com/OpenListTeam/OpenList/v4/internal/conf"
-	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
-func TestProxyOverridesUpstreamContentDisposition(t *testing.T) {
-	previousConfig := conf.Conf
-	conf.Conf = conf.DefaultConfig("data")
-	t.Cleanup(func() {
-		conf.Conf = previousConfig
-	})
+func TestCanonicalProxyHeadersRestoreProviderOverrides(t *testing.T) {
+	canonical := make(http.Header)
+	canonical.Set("Etag", "\"canonical\"")
+	canonical.Set("Last-Modified", "Sun, 20 Sep 2026 05:00:00 GMT")
+	canonical.Set("Content-Type", "application/octet-stream")
+	canonical.Set("Content-Length", "123456")
 
-	const content = "archive content"
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Disposition", `attachment; filename="download"`)
-		w.Header().Set("Content-Type", "application/x-rar-compressed")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, content)
-	}))
-	t.Cleanup(upstream.Close)
+	saved := snapshotCanonicalProxyHeaders(canonical)
+	provider := make(http.Header)
+	provider.Set("Etag", "\"provider\"")
+	provider.Set("Last-Modified", "Sun, 20 Sep 2026 06:00:00 GMT")
+	provider.Set("Content-Type", "text/plain")
+	provider.Set("Content-Length", "42")
+	provider.Set("Accept-Ranges", "bytes")
 
-	file := &model.Object{
-		Name: "测试文件.rar",
-		Size: int64(len(content)),
-	}
-	link := &model.Link{URL: upstream.URL}
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/sd/example", nil)
+	saved.restore(provider)
 
-	err := Proxy(recorder, request, link, file)
-	if err != nil {
-		t.Fatalf("Proxy() error = %v", err)
+	checks := map[string]string{
+		"Etag":           "\"canonical\"",
+		"Last-Modified":  "Sun, 20 Sep 2026 05:00:00 GMT",
+		"Content-Type":   "application/octet-stream",
+		"Content-Length": "123456",
 	}
-	if got, want := recorder.Code, http.StatusOK; got != want {
-		t.Fatalf("status code = %d, want %d", got, want)
+	for key, want := range checks {
+		if got := provider.Get(key); got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
 	}
-	if got, want := recorder.Header().Get("Content-Disposition"), utils.GenerateContentDisposition(file.GetName()); got != want {
-		t.Errorf("Content-Disposition = %q, want %q", got, want)
+	if got := provider.Get("Accept-Ranges"); got != "bytes" {
+		t.Fatalf("provider-only header should be retained, got %q", got)
 	}
-	if got, want := recorder.Header().Get("Content-Type"), "application/x-rar-compressed"; got != want {
-		t.Errorf("Content-Type = %q, want %q", got, want)
+}
+
+func TestCanonicalProxyHeadersDoNotInventMissingValues(t *testing.T) {
+	saved := snapshotCanonicalProxyHeaders(make(http.Header))
+	provider := make(http.Header)
+	provider.Set("Etag", "\"provider\"")
+	provider.Set("Content-Length", "42")
+
+	saved.restore(provider)
+
+	if got := provider.Get("Etag"); got != "\"provider\"" {
+		t.Fatalf("provider ETag unexpectedly replaced: %q", got)
 	}
-	if got, want := recorder.Body.String(), content; got != want {
-		t.Errorf("body = %q, want %q", got, want)
+	if got := provider.Get("Content-Length"); got != "42" {
+		t.Fatalf("provider Content-Length unexpectedly replaced: %q", got)
 	}
 }

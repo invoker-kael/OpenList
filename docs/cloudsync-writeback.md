@@ -192,6 +192,8 @@ After the completed local cache expires, direct `GET`, `HEAD` and single-resourc
 
 A 115 single-object NotFound or type mismatch is never trusted alone. OpenList force-refreshes the parent listing before dropping canonical metadata. After the consistency grace, completed files whose local spool is gone are also content-checked: provider mtime is ignored, but resource type, encrypted size and provider SHA-1 (when present) must still match the canonical generation. A missing object or a real size/SHA-1 change therefore becomes visible to one-way Cloud Sync so the NAS can repair it, while timestamp-only provider changes stay hidden.
 
+Canonical `HEAD` responses also pin `Content-Length` to the MySQL generation size. If a completed object has to fall back to transparent provider proxying after its local spool expires, OpenList restores the canonical `ETag`, `Last-Modified`, `Content-Type` and `Content-Length` after copying provider headers. This keeps `PROPFIND` and `HEAD` from presenting two different identities for the same encrypted payload during provider metadata drift.
+
 `PROPPATCH` is also canonical-aware, so a just-written object does not become temporarily unpatchable merely because the backing provider has not exposed it yet.
 
 ## 115 Open driver hardening

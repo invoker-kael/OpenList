@@ -6,6 +6,8 @@ on:
     paths:
       - "internal/writeback/**"
       - "server/webdav/**"
+      - "server/common/proxy.go"
+      - "server/common/proxy_test.go"
       - "drivers/115_open/**"
       - "internal/model/webdav_writeback.go"
       - "internal/conf/**"
@@ -15,6 +17,8 @@ on:
     paths:
       - "internal/writeback/**"
       - "server/webdav/**"
+      - "server/common/proxy.go"
+      - "server/common/proxy_test.go"
       - "drivers/115_open/**"
       - "internal/model/webdav_writeback.go"
       - "internal/conf/**"
@@ -52,6 +56,8 @@ jobs:
             server/webdav/webdav.go
             server/webdav/precondition.go
             server/webdav/precondition_test.go
+            server/common/proxy.go
+            server/common/proxy_test.go
             drivers/115_open/driver.go
             drivers/115_open/types.go
             drivers/115_open/upload.go
@@ -63,7 +69,7 @@ jobs:
           fi
 
       - name: Unit and compile tests
-        run: go test ./internal/writeback ./server/webdav ./drivers/115_open
+        run: go test ./internal/writeback ./server/webdav ./server/common ./drivers/115_open
 
       - name: Format gate
         run: git diff --exit-code
