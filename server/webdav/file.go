@@ -31,6 +31,13 @@ func slashClean(name string) string {
 
 func resourceExists(ctx context.Context, name string) (bool, error) {
 	if writeback.Enabled() {
+		missing, err := writeback.ReconcileDirect(ctx, name)
+		if err != nil {
+			return false, err
+		}
+		if missing {
+			return false, nil
+		}
 		obj, found, deleted, err := writeback.Canonical(name)
 		if err != nil {
 			return false, err
