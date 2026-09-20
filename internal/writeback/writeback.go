@@ -81,6 +81,29 @@ func canonicalETag(key string, generation uint64, size int64) string {
 	return fmt.Sprintf("\"olwb-%s-%d-%x\"", key[:16], generation, uint64(size))
 }
 
+func clearRemoteVerification(row *model.WebDAVWritebackObject) {
+	if row == nil {
+		return
+	}
+	row.RemoteObjectID = ""
+	row.RemoteSHA1 = ""
+	row.RemoteGeneration = 0
+	row.RemoteVerifiedAt = nil
+}
+
+func canonicalContentSHA1(row *model.WebDAVWritebackObject) string {
+	if row == nil {
+		return ""
+	}
+	if row.PayloadSHA1 != "" {
+		return row.PayloadSHA1
+	}
+	if row.RemoteGeneration == row.Generation {
+		return row.RemoteSHA1
+	}
+	return ""
+}
+
 func canCoalesceDuplicatePut(row *model.WebDAVWritebackObject, size int64, payloadSHA1 string) bool {
 	return row != nil &&
 		!row.IsDir &&
@@ -157,9 +180,10 @@ func remoteContentMatchesCanonical(row *model.WebDAVWritebackObject, remote mode
 	if remote.GetSize() != row.Size {
 		return false
 	}
-	if row.PayloadSHA1 != "" {
+	expectedSHA1 := canonicalContentSHA1(row)
+	if expectedSHA1 != "" {
 		remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
-		if remoteSHA1 != "" && !strings.EqualFold(remoteSHA1, row.PayloadSHA1) {
+		if remoteSHA1 != "" && !strings.EqualFold(remoteSHA1, expectedSHA1) {
 			return false
 		}
 	}
@@ -587,6 +611,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		row.VerifyCount = 0
 		row.RetryAt = &settleAt
 		row.CompletedAt = nil
+		clearRemoteVerification(&row)
 
 		if row.ID == 0 {
 			if err := tx.Create(&row).Error; err != nil {
@@ -676,6 +701,7 @@ func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*m
 		row.VerifyCount = 0
 		row.RetryAt = &now
 		row.CompletedAt = nil
+		clearRemoteVerification(&row)
 
 		if row.ID == 0 {
 			if err := tx.Create(&row).Error; err != nil {
@@ -748,9 +774,13 @@ func DeleteTree(p string) (bool, error) {
 					"state":        StateDeleted,
 					"retry_at":     &now,
 					"last_error":   "",
-					"retry_count":  0,
-					"verify_count": 0,
-					"completed_at": nil,
+					"retry_count":        0,
+					"verify_count":       0,
+					"completed_at":       nil,
+					"remote_object_id":   "",
+					"remote_sha1":        "",
+					"remote_generation":  0,
+					"remote_verified_at": nil,
 				}).Error; err != nil {
 				return err
 			}
@@ -800,6 +830,7 @@ func tombstoneMovedSource(row *model.WebDAVWritebackObject, now time.Time) {
 	row.VerifyCount = 0
 	row.RetryAt = &now
 	row.CompletedAt = nil
+	clearRemoteVerification(row)
 }
 
 func pendingDirectoryMoveLocallyAuthoritative(root *model.WebDAVWritebackObject, rows []model.WebDAVWritebackObject, now time.Time) bool {
@@ -924,6 +955,7 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 			destinationRow.RetryCount = 0
 			destinationRow.VerifyCount = 0
 			destinationRow.CompletedAt = nil
+			clearRemoteVerification(&destinationRow)
 			retryAt := now
 			if !sourceRow.IsDir {
 				retryAt = now.Add(cloudSyncSettleDelay(sourceRow.Size))
@@ -1171,6 +1203,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		dstRow.LastError = ""
 		dstRow.RetryCount = 0
 		dstRow.VerifyCount = 0
+		clearRemoteVerification(&dstRow)
 		dstRow.RetryAt = &settleAt
 		dstRow.CompletedAt = nil
 
@@ -1278,6 +1311,7 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 		dstRow.LastError = ""
 		dstRow.RetryCount = 0
 		dstRow.VerifyCount = 0
+		clearRemoteVerification(&dstRow)
 		dstRow.RetryAt = &settleAt
 		dstRow.CompletedAt = nil
 
@@ -1319,6 +1353,7 @@ func refreshUnknownProviderOverwrite(row *model.WebDAVWritebackObject, now time.
 	row.LastError = ""
 	row.RetryCount = 0
 	row.VerifyCount = 0
+	clearRemoteVerification(row)
 	row.RetryAt = nil
 	row.CompletedAt = &now
 }
@@ -1352,6 +1387,7 @@ func setProviderCompletedRoot(row *model.WebDAVWritebackObject, dst string, sour
 	row.LastError = ""
 	row.RetryCount = 0
 	row.VerifyCount = 0
+	clearRemoteVerification(row)
 	row.RetryAt = nil
 	row.CompletedAt = &now
 }
@@ -1504,6 +1540,7 @@ func CopyTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 			destinationRow.LastError = ""
 			destinationRow.RetryCount = 0
 			destinationRow.VerifyCount = 0
+			clearRemoteVerification(&destinationRow)
 
 			switch sourceRow.State {
 			case StateDeleted:
@@ -1695,6 +1732,7 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 				destinationRow.LastError = ""
 				destinationRow.RetryCount = 0
 				destinationRow.VerifyCount = 0
+				clearRemoteVerification(destinationRow)
 
 				switch {
 				case sourceRow.State == StateDeleted:
@@ -1733,6 +1771,7 @@ func MoveTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 			sourceRow.Name = path.Base(newPath)
 			sourceRow.Generation++
 			sourceRow.ETag = canonicalETag(sourceRow.PathKey, sourceRow.Generation, sourceRow.Size)
+			clearRemoteVerification(sourceRow)
 			switch {
 			case sourceRow.State == StateCompleted:
 				sourceRow.CompletedAt = &now
@@ -1909,19 +1948,20 @@ func Stop() {
 
 func (m *workerManager) recoverInterrupted() error {
 	// An UPLOADING row is ambiguous after a process crash: the provider may
-	// have accepted the payload even though we never durably recorded the
-	// transition to VERIFYING. Do not accept a same-sized pre-existing remote
-	// object as proof that this generation arrived. Re-queue the durable spool
-	// payload instead. Remote writes are therefore at-least-once across crashes,
-	// which is safer for one-way Cloud Sync than a false-positive completion.
+	// already contain the exact encrypted payload even though MySQL never
+	// durably recorded VERIFYING. Re-queue it as a retry so processUpload first
+	// performs the same size/SHA-1 remote verification used after normal retry
+	// backoff. 115 therefore avoids retransmitting a successfully accepted large
+	// object while still requiring exact content identity before completion.
 	now := time.Now()
 	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("state = ?", StateUploading).
 		Updates(map[string]any{
 			"state":        StateQueued,
 			"retry_at":     &now,
+			"retry_count":  gorm.Expr("retry_count + 1"),
 			"verify_count": 0,
-			"last_error":   "re-queued after restart because upload completion was not durably confirmed",
+			"last_error":   "re-queued after restart; remote content will be verified before retransmit",
 		}).Error
 }
 
@@ -2141,10 +2181,28 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 
 	now := time.Now()
-	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("id = ? AND generation = ?", row.ID, row.Generation).
-		Updates(map[string]any{"state": StateVerifying, "retry_at": &now, "verify_count": 0}).Error; err != nil {
-		log.Errorf("write-back failed to enter verifying state for %s: %v", row.Path, err)
+	res = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+		Updates(map[string]any{"state": StateVerifying, "retry_at": &now, "verify_count": 0})
+	if res.Error != nil {
+		// The provider PUT has already returned success. If MySQL briefly fails
+		// here, do not strand the row forever in UPLOADING. A best-effort
+		// recovery update turns it into a retry, whose first action is remote
+		// size/SHA-1 verification before any retransmit.
+		next := time.Now().Add(2 * time.Second)
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+			Updates(map[string]any{
+				"state":        StateQueued,
+				"retry_at":     &next,
+				"retry_count":  gorm.Expr("retry_count + 1"),
+				"verify_count": 0,
+				"last_error":   fmt.Sprintf("provider upload succeeded but verification state persistence failed: %v", res.Error),
+			}).Error
+		log.Errorf("write-back failed to enter verifying state for %s: %v", row.Path, res.Error)
+		return
+	}
+	if res.RowsAffected == 0 {
 		return
 	}
 	m.processVerify(row)
@@ -2203,14 +2261,15 @@ func remoteMatchesCanonical(row *model.WebDAVWritebackObject, remote model.Obj, 
 	if row == nil || remote == nil || remote.IsDir() || remote.GetSize() != row.Size {
 		return false
 	}
-	if row.PayloadSHA1 == "" {
+	expectedSHA1 := canonicalContentSHA1(row)
+	if expectedSHA1 == "" {
 		return true
 	}
 	remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
 	if remoteSHA1 == "" {
 		return !requireHash
 	}
-	return strings.EqualFold(remoteSHA1, row.PayloadSHA1)
+	return strings.EqualFold(remoteSHA1, expectedSHA1)
 }
 
 func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model.Obj, error) {

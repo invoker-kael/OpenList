@@ -760,3 +760,71 @@ func TestCaptureRemoteVerificationWithoutProviderHash(t *testing.T) {
 		t.Fatalf("unexpected verification evidence: %+v", evidence)
 	}
 }
+
+
+func TestClearRemoteVerification(t *testing.T) {
+	now := time.Now()
+	row := &model.WebDAVWritebackObject{
+		Generation:       9,
+		RemoteObjectID:   "115-object",
+		RemoteSHA1:       strings.Repeat("a", 40),
+		RemoteGeneration: 8,
+		RemoteVerifiedAt: &now,
+	}
+
+	clearRemoteVerification(row)
+	if row.RemoteObjectID != "" || row.RemoteSHA1 != "" || row.RemoteGeneration != 0 || row.RemoteVerifiedAt != nil {
+		t.Fatalf("remote verification evidence was not cleared: %+v", row)
+	}
+	if row.Generation != 9 {
+		t.Fatalf("clearing remote evidence changed canonical generation to %d", row.Generation)
+	}
+}
+
+func TestCanonicalContentSHA1IsGenerationScoped(t *testing.T) {
+	payloadSHA1 := strings.Repeat("a", 40)
+	remoteSHA1 := strings.Repeat("b", 40)
+	row := &model.WebDAVWritebackObject{
+		Generation:       7,
+		PayloadSHA1:      payloadSHA1,
+		RemoteSHA1:       remoteSHA1,
+		RemoteGeneration: 7,
+	}
+	if got := canonicalContentSHA1(row); got != payloadSHA1 {
+		t.Fatalf("payload SHA1 should win, got %q", got)
+	}
+
+	row.PayloadSHA1 = ""
+	if got := canonicalContentSHA1(row); got != remoteSHA1 {
+		t.Fatalf("verified SHA1 for current generation = %q, want %q", got, remoteSHA1)
+	}
+
+	row.RemoteGeneration = 6
+	if got := canonicalContentSHA1(row); got != "" {
+		t.Fatalf("stale remote generation leaked SHA1 %q", got)
+	}
+}
+
+func TestRemoteMatchesCanonicalUsesGenerationScopedEvidence(t *testing.T) {
+	sha := strings.Repeat("c", 40)
+	row := &model.WebDAVWritebackObject{
+		Size:             4096,
+		Generation:       3,
+		RemoteSHA1:       sha,
+		RemoteGeneration: 3,
+	}
+	same := &model.Object{Size: 4096, HashInfo: utils.NewHashInfo(utils.SHA1, strings.ToUpper(sha))}
+	if !remoteMatchesCanonical(row, same, true) {
+		t.Fatal("current-generation verified SHA1 should match remote content")
+	}
+
+	different := &model.Object{Size: 4096, HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("d", 40))}
+	if remoteMatchesCanonical(row, different, true) {
+		t.Fatal("different remote SHA1 must not match current-generation evidence")
+	}
+
+	row.RemoteGeneration = 2
+	if !remoteMatchesCanonical(row, different, true) {
+		t.Fatal("stale remote verification evidence must not constrain a newer generation without payload SHA1")
+	}
+}
