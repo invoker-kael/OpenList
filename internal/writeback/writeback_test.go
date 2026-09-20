@@ -656,3 +656,35 @@ func TestRefreshUnknownProviderOverwrite(t *testing.T) {
 	}
 }
 
+func TestCollectConfirmedTombstoneSubtree(t *testing.T) {
+	root := &model.WebDAVWritebackObject{
+		ID:         1,
+		Path:       "/old-folder",
+		Generation: 7,
+		State:      StateDeleted,
+	}
+	rows := []model.WebDAVWritebackObject{
+		{ID: 1, Path: "/old-folder", Generation: 7, State: StateDeleted},
+		{ID: 2, Path: "/old-folder/a.bin", Generation: 2, State: StateDeleted, SpoolPath: "/spool/shared.data"},
+		{ID: 3, Path: "/old-folder/sub/b.bin", Generation: 1, State: StateDeleted, SpoolPath: "/spool/shared.data"},
+		{ID: 4, Path: "/old-folder/recreated.bin", Generation: 3, State: StateQueued, SpoolPath: "/spool/new.data"},
+		{ID: 5, Path: "/old-folder-other/c.bin", Generation: 1, State: StateDeleted},
+	}
+	ids, spools, valid := collectConfirmedTombstoneSubtree(root, rows)
+	if !valid {
+		t.Fatal("matching root generation should validate subtree cleanup")
+	}
+	if len(ids) != 3 || ids[0] != 1 || ids[1] != 2 || ids[2] != 3 {
+		t.Fatalf("subtree tombstone ids = %v", ids)
+	}
+	if len(spools) != 1 || spools[0] != "/spool/shared.data" {
+		t.Fatalf("deduplicated subtree spool paths = %v", spools)
+	}
+
+	staleRoot := *root
+	staleRoot.Generation = 6
+	if _, _, valid := collectConfirmedTombstoneSubtree(&staleRoot, rows); valid {
+		t.Fatal("superseded root generation must not bulk-delete descendants")
+	}
+}
+

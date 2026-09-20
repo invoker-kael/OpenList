@@ -2318,6 +2318,72 @@ func (m *workerManager) remoteDeleteAbsent(row *model.WebDAVWritebackObject) (bo
 	return !remoteListContainsName(objs, row.Name), nil
 }
 
+func collectConfirmedTombstoneSubtree(root *model.WebDAVWritebackObject, rows []model.WebDAVWritebackObject) (ids []uint, spoolPaths []string, valid bool) {
+	if root == nil {
+		return nil, nil, false
+	}
+	seenSpool := make(map[string]struct{})
+	rootMatched := false
+	for i := range rows {
+		row := &rows[i]
+		if row.State != StateDeleted || !isPathOrDescendant(row.Path, root.Path) {
+			continue
+		}
+		if row.ID == root.ID {
+			if row.Generation != root.Generation {
+				return nil, nil, false
+			}
+			rootMatched = true
+		}
+		ids = append(ids, row.ID)
+		if row.SpoolPath != "" {
+			if _, ok := seenSpool[row.SpoolPath]; !ok {
+				seenSpool[row.SpoolPath] = struct{}{}
+				spoolPaths = append(spoolPaths, row.SpoolPath)
+			}
+		}
+	}
+	if !rootMatched {
+		return nil, nil, false
+	}
+	return ids, spoolPaths, true
+}
+
+func deleteConfirmedTombstoneSubtree(root *model.WebDAVWritebackObject) (bool, error) {
+	var spoolPaths []string
+	deleted := false
+	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		var candidates []model.WebDAVWritebackObject
+		query := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("state = ? AND (path = ? OR path LIKE ?)", StateDeleted, root.Path, root.Path+"%").
+			Order("id asc")
+		if err := query.Find(&candidates).Error; err != nil {
+			return err
+		}
+		ids, spools, valid := collectConfirmedTombstoneSubtree(root, candidates)
+		if !valid || len(ids) == 0 {
+			return nil
+		}
+		spoolPaths = spools
+		res := tx.Where("id IN ? AND state = ?", ids, StateDeleted).
+			Delete(&model.WebDAVWritebackObject{})
+		if res.Error != nil {
+			return res.Error
+		}
+		deleted = res.RowsAffected > 0
+		return nil
+	})
+	if err != nil || !deleted {
+		return deleted, err
+	}
+	for _, spoolPath := range spoolPaths {
+		if !spoolIsActive(spoolPath) {
+			removeSpoolIfUnreferenced(spoolPath)
+		}
+	}
+	return true, nil
+}
+
 func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 	// A tombstone can be superseded by a fast Cloud Sync recreate of the same
 	// path. Re-check the generation before touching the provider so a queued old
@@ -2400,14 +2466,13 @@ func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 	if row.CleanupPath != "" && row.CleanupPath != row.Path {
 		_ = fs.Remove(m.ctx, row.CleanupPath)
 	}
-	res := db.GetDb().
-		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateDeleted).
-		Delete(&model.WebDAVWritebackObject{})
-	if res.Error != nil || res.RowsAffected == 0 {
+	deleted, deleteErr := deleteConfirmedTombstoneSubtree(row)
+	if deleteErr != nil {
+		m.failDeleted(row, deleteErr)
 		return
 	}
-	if row.SpoolPath != "" {
-		removeSpoolIfUnreferenced(row.SpoolPath)
+	if !deleted {
+		return
 	}
 }
 
