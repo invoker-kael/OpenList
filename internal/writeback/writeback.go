@@ -2235,6 +2235,10 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		}).Error
 }
 
+func deleteParentMissing(err error) bool {
+	return err != nil && errs.IsObjectNotFound(err)
+}
+
 func remoteListContainsName(objs []model.Obj, name string) bool {
 	for _, obj := range objs {
 		if obj.GetName() == name {
@@ -2255,6 +2259,12 @@ func (m *workerManager) remoteDeleteAbsent(row *model.WebDAVWritebackObject) (bo
 
 	objs, listErr := fs.List(m.ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
 	if listErr != nil {
+		if deleteParentMissing(listErr) {
+			// A missing parent proves that this child is absent. Directory-tree
+			// DELETE/MOVE commonly reaches this state after the parent tombstone
+			// removes the provider subtree before descendant tombstones are checked.
+			return true, nil
+		}
 		return false, listErr
 	}
 	return !remoteListContainsName(objs, row.Name), nil

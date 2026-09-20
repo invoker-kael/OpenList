@@ -1,12 +1,14 @@
 package writeback
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
@@ -581,6 +583,18 @@ func TestMoveMetadataNeedsProviderRootShadow(t *testing.T) {
 	}
 	if root.CompletedAt == nil || !root.CompletedAt.Equal(now) {
 		t.Fatal("provider directory root shadow must receive fresh consistency grace")
+	}
+}
+
+func TestDeleteParentMissing(t *testing.T) {
+	if deleteParentMissing(nil) {
+		t.Fatal("nil error cannot prove a missing provider parent")
+	}
+	if !deleteParentMissing(errs.ObjectNotFound) {
+		t.Fatal("provider ObjectNotFound parent should prove descendant absence")
+	}
+	if deleteParentMissing(errors.New("network failure")) {
+		t.Fatal("unrelated provider failure must not be treated as descendant absence")
 	}
 }
 
