@@ -194,6 +194,12 @@ A 115 single-object NotFound or type mismatch is never trusted alone. OpenList f
 
 Canonical `HEAD` responses also pin `Content-Length` to the MySQL generation size. If a completed object has to fall back to transparent provider proxying after its local spool expires, OpenList restores the canonical `ETag`, `Last-Modified`, `Content-Type` and `Content-Length` after copying provider headers. This keeps `PROPFIND` and `HEAD` from presenting two different identities for the same encrypted payload during provider metadata drift.
 
+Canonical `GET`/`HEAD` conditional requests are evaluated before any 115 request. `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since` therefore use the MySQL generation ETag/mtime rather than provider validators. After evaluation those headers are removed before proxying so 115 cannot re-decide the request with a different ETag. `If-Range` is evaluated against the canonical generation as well: a match preserves the byte range, while a mismatch intentionally downgrades to a full-body response. Non-range canonical GET/HEAD responses pin `Content-Length` to the canonical encrypted size.
+
+### Change identity for one-way encrypted upload
+
+Cloud Sync change detection is intentionally content-first. The opaque encrypted payload size plus SHA-1 identifies content; canonical generation identifies the visible version. Provider mtime is never allowed to manufacture a new generation. A duplicate PUT with the same size/SHA-1 is coalesced, while same-size content with a different SHA-1 creates a new generation and is uploaded. 115 is treated as the durable backing store and post-upload verification source, not as the authority for front-end change detection.
+
 `PROPPATCH` is also canonical-aware, so a just-written object does not become temporarily unpatchable merely because the backing provider has not exposed it yet.
 
 ## 115 Open driver hardening
