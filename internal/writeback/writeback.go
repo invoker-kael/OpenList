@@ -313,7 +313,12 @@ func providerOperationProtectsCanonicalPath(ops []model.WebDAVProviderOperation,
 
 func activeProviderOperations() ([]model.WebDAVProviderOperation, error) {
 	var ops []model.WebDAVProviderOperation
-	if err := db.GetDb().Order("updated_at asc").Find(&ops).Error; err != nil {
+	// Protection checks only need routing/fence fields. Avoid pulling the
+	// operation's large recovery snapshots and TEXT errors on every PROPFIND.
+	if err := db.GetDb().
+		Select("method", "source_path", "destination_path", "depth", "state", "created_at", "updated_at").
+		Order("updated_at asc").
+		Find(&ops).Error; err != nil {
 		return nil, err
 	}
 	return ops, nil
@@ -1455,17 +1460,32 @@ func completedDivergenceConfirmed(verifyCount int, retryAt *time.Time, now time.
 	return verifyCount > 0 && retryAt != nil && !now.Before(*retryAt)
 }
 
+// completedDivergenceProbeState turns the persisted retry deadline into a
+// single-winner lease. A due caller advances the deadline before it performs
+// the expensive provider refresh, so concurrent Cloud Sync scans cannot all
+// force-refresh the same 115 directory. An inconclusive refresh naturally
+// waits until the next deadline instead of hot-looping.
+func completedDivergenceProbeState(verifyCount int, retryAt *time.Time, now time.Time) (claimFresh bool, nextCount int, nextRetryAt *time.Time) {
+	if verifyCount > 0 && retryAt != nil && now.Before(*retryAt) {
+		return false, verifyCount, nil
+	}
+	next := now.Add(completedDivergenceConfirmationDelay())
+	if completedDivergenceConfirmed(verifyCount, retryAt, now) {
+		return true, verifyCount + 1, &next
+	}
+	return false, 1, &next
+}
+
 // observeCompletedFileDivergence records a suspicious provider view but never
 // deletes canonical metadata by itself. Once the confirmation interval has
-// elapsed it only reports that a fresh provider read is required. This keeps
-// cached directory listings from counting as destructive evidence.
-func observeCompletedFileDivergence(row *model.WebDAVWritebackObject, now time.Time) (bool, error) {
+// elapsed exactly one caller claims the next fresh provider read by advancing
+// retry_at while holding the row lock. This keeps cached/concurrent scans from
+// counting as destructive evidence or repeatedly hammering the provider.
+func observeCompletedFileDivergenceWithOps(row *model.WebDAVWritebackObject, now time.Time, activeOps []model.WebDAVProviderOperation) (bool, error) {
 	if row == nil || row.IsDir || row.State != StateCompleted || row.SpoolPath != "" {
 		return false, nil
 	}
-	if ops, err := activeProviderOperations(); err != nil {
-		return false, err
-	} else if providerOperationProtectsCanonicalPath(ops, row.Path, now) {
+	if providerOperationProtectsCanonicalPath(activeOps, row.Path, now) {
 		return false, nil
 	}
 
@@ -1483,23 +1503,32 @@ func observeCompletedFileDivergence(row *model.WebDAVWritebackObject, now time.T
 		if current.IsDir {
 			return nil
 		}
-		if completedDivergenceConfirmed(current.VerifyCount, current.RetryAt, now) {
-			needsFreshConfirmation = true
+		claimFresh, nextCount, nextRetryAt := completedDivergenceProbeState(current.VerifyCount, current.RetryAt, now)
+		if nextRetryAt == nil {
 			return nil
 		}
-		if current.VerifyCount > 0 && current.RetryAt != nil {
-			return nil
+		needsFreshConfirmation = claimFresh
+		lastError := "remote divergence observed once; waiting for force-refreshed confirmation"
+		if claimFresh {
+			lastError = "remote divergence fresh confirmation claimed; throttling additional provider refreshes"
 		}
-		next := now.Add(completedDivergenceConfirmationDelay())
 		return tx.Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", current.ID, current.Generation, StateCompleted).
 			Updates(map[string]any{
-				"verify_count": 1,
-				"retry_at":     &next,
-				"last_error":   "remote divergence observed once; waiting for force-refreshed confirmation",
+				"verify_count": nextCount,
+				"retry_at":     nextRetryAt,
+				"last_error":   lastError,
 			}).Error
 	})
 	return needsFreshConfirmation, err
+}
+
+func observeCompletedFileDivergence(row *model.WebDAVWritebackObject, now time.Time) (bool, error) {
+	ops, err := activeProviderOperations()
+	if err != nil {
+		return false, err
+	}
+	return observeCompletedFileDivergenceWithOps(row, now, ops)
 }
 
 func clearCompletedFileDivergence(row *model.WebDAVWritebackObject) error {
@@ -1530,7 +1559,8 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	if err != nil || row == nil || row.State != StateCompleted || row.SpoolPath != "" {
 		return false, err
 	}
-	if canonicalShadowInGrace(row, time.Now()) {
+	now := time.Now()
+	if canonicalShadowInGrace(row, now) {
 		return false, nil
 	}
 
@@ -1555,15 +1585,25 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 		return false, nil
 	}
 
+	// A single-object miss/mismatch only arms the confirmation deadline. Direct
+	// GET/HEAD/PROPFIND traffic inside that window must not force-refresh the
+	// parent repeatedly. Once due, the row-lock claim below advances retry_at
+	// before the expensive refresh, so only one concurrent request performs it.
+	if !row.IsDir {
+		ready, observeErr := observeCompletedFileDivergence(row, now)
+		if observeErr != nil || !ready {
+			return false, observeErr
+		}
+	}
+
 	objs, listErr := fs.List(ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
 	if listErr != nil {
 		return false, nil
 	}
 	remote = exactRemoteByName(objs, row.Name)
 	if remote == nil {
-		ready, observeErr := observeCompletedFileDivergence(row, time.Now())
-		if observeErr != nil || !ready {
-			return false, observeErr
+		if row.IsDir {
+			return false, nil
 		}
 		return deleteCompletedCanonical(row)
 	}
@@ -1571,10 +1611,6 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 		if row.IsDir {
 			_, delErr := deleteCompletedCanonical(row)
 			return false, delErr
-		}
-		ready, observeErr := observeCompletedFileDivergence(row, time.Now())
-		if observeErr != nil || !ready {
-			return false, observeErr
 		}
 		_, delErr := deleteCompletedCanonical(row)
 		return false, delErr
@@ -1592,14 +1628,10 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 		return false, nil
 	case remoteContentInconclusive:
 		// A refreshed 115 listing that still omits SHA-1 cannot prove either
-		// identity or loss. Keep canonical metadata and try again later instead
-		// of manufacturing a Cloud Sync repair upload.
+		// identity or loss. The fresh-confirmation claim has already moved
+		// retry_at forward, so subsequent scans wait before refreshing again.
 		return false, nil
 	default:
-		ready, observeErr := observeCompletedFileDivergence(row, time.Now())
-		if observeErr != nil || !ready {
-			return false, observeErr
-		}
 		_, delErr := deleteCompletedCanonical(row)
 		return false, delErr
 	}
@@ -1692,6 +1724,10 @@ func OverlayList(ctx context.Context, parent string, remote []model.Obj, remoteR
 	for i := range rows {
 		row := &rows[i]
 		protectedByProviderOperation := providerOperationProtectsCanonicalPath(activeOps, row.Path, now)
+		requireHash := false
+		if !row.IsDir {
+			requireHash = providerRequiresPayloadHash(row.Path)
+		}
 		if row.State == StateDeleted {
 			delete(byName, row.Name)
 			continue
@@ -1715,14 +1751,14 @@ func OverlayList(ctx context.Context, parent string, remote []model.Obj, remoteR
 			}
 		}
 		if !protectedByProviderOperation && row.State == StateCompleted && !row.IsDir && row.SpoolPath == "" && remoteReliable && remoteObj != nil &&
-			compareRemoteContent(row, remoteObj, providerRequiresPayloadHash(row.Path)) == remoteContentMatch {
+			compareRemoteContent(row, remoteObj, requireHash) == remoteContentMatch {
 			if clearErr := clearCompletedFileDivergence(row); clearErr != nil {
 				return nil, false, clearErr
 			}
 		}
 		if !protectedByProviderOperation &&
-			shouldDropCanonicalAfterRemoteList(row, remoteReliable, remoteObj, now, providerRequiresPayloadHash(row.Path)) {
-			ready, observeErr := observeCompletedFileDivergence(row, now)
+			shouldDropCanonicalAfterRemoteList(row, remoteReliable, remoteObj, now, requireHash) {
+			ready, observeErr := observeCompletedFileDivergenceWithOps(row, now, activeOps)
 			if observeErr != nil {
 				return nil, false, observeErr
 			}
@@ -1732,7 +1768,7 @@ func OverlayList(ctx context.Context, parent string, remote []model.Obj, remoteR
 					freshObj, freshPresent := freshByName[row.Name]
 					freshComparison := remoteContentMismatch
 					if freshPresent {
-						freshComparison = compareRemoteContent(row, freshObj, providerRequiresPayloadHash(row.Path))
+						freshComparison = compareRemoteContent(row, freshObj, requireHash)
 					}
 					switch freshComparison {
 					case remoteContentMatch:

@@ -550,6 +550,55 @@ func TestCompletedDivergenceConfirmationDelayUsesVerifyInterval(t *testing.T) {
 	}
 }
 
+func TestCompletedDivergenceProbeStateFirstObservationOnlyArms(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyIntervalSeconds: 7}}
+	defer func() { conf.Conf = oldConf }()
+
+	now := time.Unix(100, 0)
+	claim, count, retryAt := completedDivergenceProbeState(0, nil, now)
+	if claim {
+		t.Fatal("first divergence observation must not claim a provider refresh")
+	}
+	if count != 1 {
+		t.Fatalf("verify count=%d, want 1", count)
+	}
+	if retryAt == nil || !retryAt.Equal(now.Add(7*time.Second)) {
+		t.Fatalf("retry_at=%v, want %v", retryAt, now.Add(7*time.Second))
+	}
+}
+
+func TestCompletedDivergenceProbeStateClaimsAndRearms(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyIntervalSeconds: 7}}
+	defer func() { conf.Conf = oldConf }()
+
+	now := time.Unix(200, 0)
+	due := now.Add(-time.Second)
+	claim, count, retryAt := completedDivergenceProbeState(1, &due, now)
+	if !claim {
+		t.Fatal("due divergence must claim the fresh provider confirmation")
+	}
+	if count != 2 {
+		t.Fatalf("verify count=%d, want 2", count)
+	}
+	wantRetry := now.Add(7 * time.Second)
+	if retryAt == nil || !retryAt.Equal(wantRetry) {
+		t.Fatalf("retry_at=%v, want %v", retryAt, wantRetry)
+	}
+
+	claim, count, next := completedDivergenceProbeState(count, retryAt, now.Add(time.Second))
+	if claim {
+		t.Fatal("a second scan inside the claimed window must not refresh again")
+	}
+	if count != 2 {
+		t.Fatalf("verify count changed inside claim window: %d", count)
+	}
+	if next != nil {
+		t.Fatalf("claimed window unexpectedly requested a persistence update: %v", next)
+	}
+}
+
 func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
 	completedNoSpool := &model.WebDAVWritebackObject{
 		State:     StateCompleted,
