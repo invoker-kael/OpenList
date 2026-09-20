@@ -895,6 +895,37 @@ func (m *workerManager) process(id uint) {
 	}
 }
 
+func (m *workerManager) waitForCanonicalParent(row *model.WebDAVWritebackObject) (bool, error) {
+	parent, err := getByPath(row.Parent)
+	if err != nil {
+		return false, err
+	}
+	if parent == nil || !parent.IsDir || parent.State == StateCompleted {
+		return false, nil
+	}
+	next := time.Now().Add(time.Second)
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
+		Update("retry_at", &next)
+	return true, res.Error
+}
+
+func (m *workerManager) remoteDirectoryExists(row *model.WebDAVWritebackObject) bool {
+	if existing, err := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true}); err == nil && existing != nil && existing.IsDir() {
+		return true
+	}
+	objs, err := fs.List(m.ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	if err != nil {
+		return false
+	}
+	for _, obj := range objs {
+		if obj.GetName() == row.Name && obj.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
 func shouldRemoveStaleRemote(uploadedPath string, current *model.WebDAVWritebackObject) bool {
 	if current == nil {
 		return false
@@ -906,6 +937,12 @@ func shouldRemoveStaleRemote(uploadedPath string, current *model.WebDAVWriteback
 }
 
 func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
+	if waiting, err := m.waitForCanonicalParent(row); err != nil {
+		m.failAfter(row, err, 2*time.Second)
+		return
+	} else if waiting {
+		return
+	}
 	if isReceiving(row.Path) {
 		next := time.Now().Add(time.Second)
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
@@ -981,6 +1018,12 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 }
 
 func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
+	if waiting, err := m.waitForCanonicalParent(row); err != nil {
+		m.failAfter(row, err, 2*time.Second)
+		return
+	} else if waiting {
+		return
+	}
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND is_dir = ? AND state IN ?", row.ID, row.Generation, true, []string{StateQueued, StateFailed}).
 		Updates(map[string]any{"state": StateUploading, "retry_at": nil, "last_error": ""})
@@ -989,10 +1032,8 @@ func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
 	}
 
 	err := fs.MakeDir(m.ctx, row.Path)
-	if err != nil {
-		if existing, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true}); getErr == nil && existing.IsDir() {
-			err = nil
-		}
+	if err != nil && m.remoteDirectoryExists(row) {
+		err = nil
 	}
 	if err != nil {
 		m.failAfter(row, err, 2*time.Second)
