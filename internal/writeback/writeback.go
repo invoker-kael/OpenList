@@ -413,6 +413,9 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		}
 		if findErr == nil {
 			oldSpool = row.SpoolPath
+			if row.State == StateDeleted {
+				created = true
+			}
 			row.Generation++
 		} else {
 			created = true
