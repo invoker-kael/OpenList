@@ -199,3 +199,27 @@ func TestCloudSyncPlaceholderSettleDelay(t *testing.T) {
 		t.Fatalf("zero-byte placeholder settle delay = %v, want 10s", got)
 	}
 }
+
+
+func TestIsPathOrDescendant(t *testing.T) {
+	tests := []struct {
+		candidate string
+		root      string
+		want      bool
+	}{
+		{candidate: "/a", root: "/a", want: true},
+		{candidate: "/a/b", root: "/a", want: true},
+		{candidate: "/a/b/c", root: "/a", want: true},
+		{candidate: "/ab", root: "/a", want: false},
+		{candidate: "/a_b", root: "/a", want: false},
+		{candidate: "/a%2Fb", root: "/a", want: false},
+		{candidate: "/a/../b", root: "/a", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.candidate+" under "+tt.root, func(t *testing.T) {
+			if got := isPathOrDescendant(tt.candidate, tt.root); got != tt.want {
+				t.Fatalf("isPathOrDescendant(%q, %q) = %v, want %v", tt.candidate, tt.root, got, tt.want)
+			}
+		})
+	}
+}
