@@ -113,9 +113,19 @@ func Canonical(p string) (obj model.Obj, found bool, deleted bool, err error) {
 	return toObject(row), true, false, nil
 }
 
+func shouldDropCanonicalAfterRemoteList(row *model.WebDAVWritebackObject, remoteReliable, remotePresent bool) bool {
+	return remoteReliable &&
+		!remotePresent &&
+		row.State == StateCompleted &&
+		row.SpoolPath == ""
+}
+
 // OverlayList replaces remote objects with their canonical WebDAV metadata and
 // injects locally committed objects that are not visible on the remote yet.
-func OverlayList(parent string, remote []model.Obj) ([]model.Obj, bool, error) {
+// When the provider list itself succeeded, a completed row whose local spool
+// cache has already been released is dropped if the remote object disappeared.
+// That lets one-way Cloud Sync observe the loss and upload the source again.
+func OverlayList(parent string, remote []model.Obj, remoteReliable bool) ([]model.Obj, bool, error) {
 	if !Enabled() {
 		return remote, false, nil
 	}
@@ -143,7 +153,17 @@ func OverlayList(parent string, remote []model.Obj) ([]model.Obj, bool, error) {
 			delete(byName, row.Name)
 			continue
 		}
-		if _, ok := byName[row.Name]; !ok {
+		_, remotePresent := byName[row.Name]
+		if shouldDropCanonicalAfterRemoteList(row, remoteReliable, remotePresent) {
+			res := db.GetDb().
+				Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
+				Delete(&model.WebDAVWritebackObject{})
+			if res.Error != nil {
+				return nil, false, res.Error
+			}
+			continue
+		}
+		if !remotePresent {
 			order = append(order, row.Name)
 		}
 		byName[row.Name] = toObject(row)
