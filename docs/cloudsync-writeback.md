@@ -86,6 +86,7 @@ The write-back layer intentionally favors source correctness over avoiding dupli
 - A WebDAV success is returned only after the payload and canonical row are durable locally.
 - Provider timestamps are never used as the Cloud Sync source-of-truth.
 - Same-size remote objects are not trusted after an ambiguous process crash; the spool payload is uploaded again.
+- During normal post-upload verification, 115 SHA-1 is compared with the persisted encrypted payload SHA-1 whenever available; size equality alone is not enough to complete the generation.
 - A superseded upload to the same path is never followed by an eager delete, preventing an old worker from erasing the path while a newer generation is waiting.
 - Duplicate provider writes can occur after a crash. For one-way encrypted backup this is preferable to silently accepting the wrong generation.
 
@@ -141,7 +142,7 @@ PUT honors `If-Match` and `If-None-Match` and returns HTTP 412 when the entity-t
 
 ### 115 verification fallback
 
-The background upload verifier does not trust a single 115 object lookup by itself. If the object lookup is missing or returns incomplete/wrong size metadata, the worker force-refreshes the parent directory and accepts an exact-name, exact-size file match. This prevents 115's post-upload metadata consistency window from turning a successful provider upload into an unnecessary duplicate retry.
+The background upload verifier does not trust a single 115 object lookup by itself. If the object lookup is missing or returns incomplete metadata, the worker force-refreshes the parent directory. For 115 Open, verification now requires the exact encrypted payload size **and** the persisted payload SHA-1 returned by `Obj.GetHash()`; a same-size stale generation is therefore not accepted as the newly uploaded object. Providers that do not expose a content hash retain the size-based fallback. This prevents 115's post-upload metadata consistency window from turning either a successful upload into an unnecessary retry or an older same-size object into a false completion.
 
 
 ## Cloud Sync rename, copy and delete compatibility

@@ -462,3 +462,40 @@ func TestSetProviderCompletedRoot(t *testing.T) {
 	}
 }
 
+func TestRemoteMatchesCanonical(t *testing.T) {
+	wantSHA1 := strings.Repeat("a", 40)
+	row := &model.WebDAVWritebackObject{
+		Size:        4096,
+		PayloadSHA1: wantSHA1,
+	}
+
+	match := &model.Object{
+		Size:     4096,
+		HashInfo: utils.NewHashInfo(utils.SHA1, strings.ToUpper(wantSHA1)),
+	}
+	if !remoteMatchesCanonical(row, match) {
+		t.Fatal("same-size same-SHA1 remote object should verify")
+	}
+
+	wrongHash := &model.Object{
+		Size:     4096,
+		HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40)),
+	}
+	if remoteMatchesCanonical(row, wrongHash) {
+		t.Fatal("same-size old generation with a different SHA1 must not verify")
+	}
+
+	noHash := &model.Object{Size: 4096}
+	if !remoteMatchesCanonical(row, noHash) {
+		t.Fatal("provider without hash support should retain size-based fallback")
+	}
+
+	wrongSize := &model.Object{
+		Size:     4095,
+		HashInfo: utils.NewHashInfo(utils.SHA1, wantSHA1),
+	}
+	if remoteMatchesCanonical(row, wrongSize) {
+		t.Fatal("matching hash cannot compensate for a size mismatch")
+	}
+}
+

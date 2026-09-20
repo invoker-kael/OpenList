@@ -2060,9 +2060,26 @@ func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
 	}
 }
 
+func remoteMatchesCanonical(row *model.WebDAVWritebackObject, remote model.Obj) bool {
+	if row == nil || remote == nil || remote.IsDir() || remote.GetSize() != row.Size {
+		return false
+	}
+	if row.PayloadSHA1 == "" {
+		return true
+	}
+	remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
+	if remoteSHA1 == "" {
+		// Keep write-back usable with providers that do not expose content
+		// hashes. 115 Open does expose SHA-1, so its verification path remains
+		// generation-content exact instead of size-only.
+		return true
+	}
+	return strings.EqualFold(remoteSHA1, row.PayloadSHA1)
+}
+
 func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model.Obj, error) {
 	remote, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true})
-	if getErr == nil && remote != nil && !remote.IsDir() && remote.GetSize() == row.Size {
+	if getErr == nil && remoteMatchesCanonical(row, remote) {
 		return remote, nil
 	}
 
@@ -2073,7 +2090,7 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model
 	objs, listErr := fs.List(m.ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
 	if listErr == nil {
 		for _, obj := range objs {
-			if obj.GetName() == row.Name && !obj.IsDir() && obj.GetSize() == row.Size {
+			if obj.GetName() == row.Name && remoteMatchesCanonical(row, obj) {
 				return obj, nil
 			}
 		}
@@ -2090,7 +2107,7 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model
 
 func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 	remote, err := m.remoteForVerify(row)
-	if err == nil && !remote.IsDir() && remote.GetSize() == row.Size {
+	if err == nil && remoteMatchesCanonical(row, remote) {
 		now := time.Now()
 		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
@@ -2134,7 +2151,12 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 	if err != nil {
 		msg = err.Error()
 	} else if remote != nil {
-		msg = fmt.Sprintf("remote size %d does not match canonical size %d", remote.GetSize(), row.Size)
+		remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
+		if row.PayloadSHA1 != "" && remoteSHA1 != "" && !strings.EqualFold(remoteSHA1, row.PayloadSHA1) {
+			msg = fmt.Sprintf("remote sha1 %s does not match canonical sha1 %s", remoteSHA1, row.PayloadSHA1)
+		} else {
+			msg = fmt.Sprintf("remote size %d does not match canonical size %d", remote.GetSize(), row.Size)
+		}
 	}
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ?", row.ID, row.Generation).
