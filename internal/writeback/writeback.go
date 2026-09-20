@@ -1030,8 +1030,36 @@ func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
 	}
 }
 
+func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model.Obj, error) {
+	remote, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true})
+	if getErr == nil && remote != nil && !remote.IsDir() && remote.GetSize() == row.Size {
+		return remote, nil
+	}
+
+	// 115 Open can briefly return NotFound or zero/incomplete metadata from
+	// single-object lookup immediately after upload while the parent listing is
+	// already correct. Force-refresh the parent and match the exact name/size
+	// before deciding that the upload failed.
+	objs, listErr := fs.List(m.ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	if listErr == nil {
+		for _, obj := range objs {
+			if obj.GetName() == row.Name && !obj.IsDir() && obj.GetSize() == row.Size {
+				return obj, nil
+			}
+		}
+	}
+
+	if getErr != nil {
+		return nil, getErr
+	}
+	if listErr != nil && remote == nil {
+		return nil, listErr
+	}
+	return remote, nil
+}
+
 func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
-	remote, err := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true})
+	remote, err := m.remoteForVerify(row)
 	if err == nil && !remote.IsDir() && remote.GetSize() == row.Size {
 		now := time.Now()
 		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
