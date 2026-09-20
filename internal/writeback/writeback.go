@@ -1097,58 +1097,176 @@ func providerOverwriteQuiescent(rows []model.WebDAVWritebackObject) bool {
 	return true
 }
 
-// PrepareProviderOverwrite removes a quiescent canonical destination before a
-// synchronous provider COPY/MOVE fallback. Pending/uploading/verifying/deleted
-// rows are deliberately reported busy so an old worker cannot race and overwrite
-// the provider result after WebDAV has already returned success.
-func PrepareProviderOverwrite(p string) (tracked bool, busy bool, err error) {
+// ProviderOverwriteReady checks whether a provider COPY/MOVE may safely replace
+// a tracked destination. It intentionally does not mutate canonical state:
+// provider failure must leave the old stable WebDAV view intact.
+func ProviderOverwriteReady(p string) (tracked bool, busy bool, err error) {
 	if !Enabled() {
 		return false, false, nil
 	}
 	p = utils.FixAndCleanPath(p)
-	var spoolPaths []string
-	err = db.GetDb().Transaction(func(tx *gorm.DB) error {
+	var candidates []model.WebDAVWritebackObject
+	if err := db.GetDb().
+		Where("path = ? OR path LIKE ?", p, p+"%").
+		Order("id asc").
+		Find(&candidates).Error; err != nil {
+		return false, false, err
+	}
+	rows := make([]model.WebDAVWritebackObject, 0, len(candidates))
+	for i := range candidates {
+		row := candidates[i]
+		if !isPathOrDescendant(row.Path, p) {
+			continue
+		}
+		tracked = true
+		rows = append(rows, row)
+	}
+	if len(rows) == 0 {
+		return false, false, nil
+	}
+	return true, !providerOverwriteQuiescent(rows), nil
+}
+
+// CopyTreeMetadata follows a successful synchronous provider COPY. It mirrors
+// canonical source generations to the destination only after the provider has
+// succeeded, so a failed provider operation never destroys the old destination
+// shadow. Pending source generations stay queued with their shared immutable
+// spool and therefore still converge to the newest Cloud Sync payload.
+func CopyTreeMetadata(src, dst string) error {
+	if !Enabled() {
+		return nil
+	}
+	src = utils.FixAndCleanPath(src)
+	dst = utils.FixAndCleanPath(dst)
+	if src == dst {
+		return nil
+	}
+	if isPathOrDescendant(dst, src) || isPathOrDescendant(src, dst) {
+		return fmt.Errorf("write-back metadata copy paths overlap: %s -> %s", src, dst)
+	}
+
+	now := time.Now()
+	var staleSpools []string
+	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var candidates []model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("path = ? OR path LIKE ?", p, p+"%").
+			Where("path = ? OR path LIKE ? OR path = ? OR path LIKE ?", src, src+"%", dst, dst+"%").
 			Order("id asc").
 			Find(&candidates).Error; err != nil {
 			return err
 		}
-		rows := make([]model.WebDAVWritebackObject, 0, len(candidates))
-		ids := make([]uint, 0, len(candidates))
+
+		sourceRows := make([]model.WebDAVWritebackObject, 0, len(candidates))
+		destinationRows := make([]model.WebDAVWritebackObject, 0, len(candidates))
 		for i := range candidates {
 			row := candidates[i]
-			if !isPathOrDescendant(row.Path, p) {
+			if isPathOrDescendant(row.Path, src) {
+				sourceRows = append(sourceRows, row)
+			}
+			if isPathOrDescendant(row.Path, dst) {
+				destinationRows = append(destinationRows, row)
+			}
+		}
+		if len(sourceRows) == 0 {
+			return nil
+		}
+
+		destinationByPath := make(map[string]int, len(destinationRows))
+		for i := range destinationRows {
+			destinationByPath[utils.FixAndCleanPath(destinationRows[i].Path)] = i
+		}
+		usedDestination := make(map[uint]struct{})
+
+		for i := range sourceRows {
+			sourceRow := &sourceRows[i]
+			suffix := strings.TrimPrefix(sourceRow.Path, src)
+			newPath := utils.FixAndCleanPath(dst + suffix)
+			newParent := path.Dir(newPath)
+
+			var destinationRow model.WebDAVWritebackObject
+			if idx, ok := destinationByPath[newPath]; ok {
+				destinationRow = destinationRows[idx]
+				usedDestination[destinationRow.ID] = struct{}{}
+				if destinationRow.SpoolPath != "" && destinationRow.SpoolPath != sourceRow.SpoolPath {
+					staleSpools = append(staleSpools, destinationRow.SpoolPath)
+				}
+				destinationRow.Generation++
+			} else {
+				destinationRow.Generation = 1
+			}
+
+			destinationRow.PathKey = pathKey(newPath)
+			destinationRow.ParentKey = pathKey(newParent)
+			destinationRow.Path = newPath
+			destinationRow.Parent = newParent
+			destinationRow.Name = path.Base(newPath)
+			destinationRow.IsDir = sourceRow.IsDir
+			destinationRow.Size = sourceRow.Size
+			destinationRow.ModTime = sourceRow.ModTime
+			destinationRow.CreateTime = sourceRow.CreateTime
+			destinationRow.ETag = canonicalETag(destinationRow.PathKey, destinationRow.Generation, sourceRow.Size)
+			destinationRow.SpoolPath = sourceRow.SpoolPath
+			destinationRow.PayloadSHA1 = sourceRow.PayloadSHA1
+			destinationRow.MimeType = sourceRow.MimeType
+			destinationRow.CleanupPath = ""
+			destinationRow.LastError = ""
+			destinationRow.RetryCount = 0
+			destinationRow.VerifyCount = 0
+
+			switch sourceRow.State {
+			case StateDeleted:
+				destinationRow.State = StateDeleted
+				destinationRow.SpoolPath = ""
+				destinationRow.PayloadSHA1 = ""
+				destinationRow.RetryAt = &now
+				destinationRow.CompletedAt = nil
+			case StateCompleted:
+				destinationRow.State = StateCompleted
+				destinationRow.RetryAt = nil
+				destinationRow.CompletedAt = &now
+			default:
+				destinationRow.State = StateQueued
+				destinationRow.RetryAt = &now
+				destinationRow.CompletedAt = nil
+			}
+
+			if destinationRow.ID == 0 {
+				if err := tx.Create(&destinationRow).Error; err != nil {
+					return err
+				}
+			} else if err := tx.Save(&destinationRow).Error; err != nil {
+				return err
+			}
+		}
+
+		for i := range destinationRows {
+			destinationRow := &destinationRows[i]
+			if _, ok := usedDestination[destinationRow.ID]; ok {
 				continue
 			}
-			tracked = true
-			rows = append(rows, row)
-			ids = append(ids, row.ID)
-		}
-		if len(rows) == 0 {
-			return nil
-		}
-		if !providerOverwriteQuiescent(rows) {
-			busy = true
-			return nil
-		}
-		for i := range rows {
-			if rows[i].SpoolPath != "" {
-				spoolPaths = append(spoolPaths, rows[i].SpoolPath)
+			if destinationRow.SpoolPath != "" {
+				staleSpools = append(staleSpools, destinationRow.SpoolPath)
+			}
+			if destinationRow.State == StateDeleted {
+				continue
+			}
+			tombstoneMovedSource(destinationRow, now)
+			if err := tx.Save(destinationRow).Error; err != nil {
+				return err
 			}
 		}
-		return tx.Where("id IN ?", ids).Delete(&model.WebDAVWritebackObject{}).Error
+		return nil
 	})
-	if err != nil || busy {
-		return tracked, busy, err
+	if err != nil {
+		return err
 	}
-	for _, spoolPath := range spoolPaths {
-		if !spoolIsActive(spoolPath) {
+	for _, spoolPath := range staleSpools {
+		if spoolPath != "" && !spoolIsActive(spoolPath) {
 			removeSpoolIfUnreferenced(spoolPath)
 		}
 	}
-	return tracked, false, nil
+	wake()
+	return nil
 }
 
 // MoveTreeMetadata follows a successful remote MOVE and keeps canonical

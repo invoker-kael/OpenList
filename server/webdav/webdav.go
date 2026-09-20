@@ -747,7 +747,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 				}
 			}
 			if dstTracked {
-				_, busy, prepErr := writeback.PrepareProviderOverwrite(dst)
+				_, busy, prepErr := writeback.ProviderOverwriteReady(dst)
 				if prepErr != nil {
 					return http.StatusInternalServerError, prepErr
 				}
@@ -759,6 +759,11 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 		}
 
 		copyStatus, copyErr := copyFiles(ctx, src, dst, overwrite, depth)
+		if copyErr == nil && writeback.Enabled() {
+			if wbErr := writeback.CopyTreeMetadata(src, dst); wbErr != nil {
+				return http.StatusInternalServerError, wbErr
+			}
+		}
 		if copyErr == nil && dstExisted && copyStatus == http.StatusCreated {
 			copyStatus = http.StatusNoContent
 		}
@@ -806,7 +811,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 			}
 		}
 		if dstTracked {
-			_, busy, prepErr := writeback.PrepareProviderOverwrite(dst)
+			_, busy, prepErr := writeback.ProviderOverwriteReady(dst)
 			if prepErr != nil {
 				return http.StatusInternalServerError, prepErr
 			}
