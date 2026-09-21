@@ -5257,15 +5257,59 @@ func (m *workerManager) recoverInterrupted() error {
 		return err
 	}
 
-	// An UPLOADING file is ambiguous after a process crash: 115 may already
-	// contain the exact encrypted payload even though MySQL never recorded
-	// VERIFYING. Resume files in VERIFYING so the normal size/SHA-1 window runs
-	// before retransmission. Directories have no payload/hash verification, so
-	// re-queue interrupted MKCOL operations instead.
+	// Replica MOVE control jobs have no payload spool. After a crash they must
+	// return to their MOVE state machine, which first checks destination/source
+	// evidence and can recover an already-applied provider mutation safely.
+	// Treating them as ordinary uploads would add a wrong verification phase.
 	now := time.Now()
 	return db.GetDb().Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&model.WebDAVWritebackObject{}).
-			Where("state = ? AND is_dir = ?", StateUploading, true).
+			Where("state IN ? AND spool_path = '' AND cleanup_path <> ''", []string{StateUploading, StateVerifying}).
+			Updates(map[string]any{
+				"state":        StateQueued,
+				"retry_at":     &now,
+				"verify_count": 0,
+				"last_error":   "resuming interrupted provider MOVE control job",
+			}).Error; err != nil {
+			return err
+		}
+
+		// Re-establish the old-source tombstone hold before workers start. This
+		// prevents DELETE priority from removing the physical provider source in
+		// the small restart window before the MOVE control job is dispatched.
+		var moves []model.WebDAVWritebackObject
+		if err := tx.Select("is_dir", "cleanup_path").
+			Where("state = ? AND spool_path = '' AND cleanup_path <> ''", StateQueued).
+			Find(&moves).Error; err != nil {
+			return err
+		}
+		holdUntil := now.Add(replicaMoveSourceHoldDelay())
+		for i := range moves {
+			move := &moves[i]
+			src := utils.FixAndCleanPath(move.CleanupPath)
+			if src == "" {
+				continue
+			}
+			query := tx.Model(&model.WebDAVWritebackObject{}).
+				Where("state = ?", StateDeleted)
+			if move.IsDir {
+				query = query.Where("path = ? OR path LIKE ? ESCAPE '~'", src, descendantLikePattern(src))
+			} else {
+				query = query.Where("path_key = ?", pathKey(src))
+			}
+			if err := query.Updates(map[string]any{
+				"retry_at":   &holdUntil,
+				"last_error": "waiting for recovered canonical MOVE",
+			}).Error; err != nil {
+				return err
+			}
+		}
+
+		// An ordinary UPLOADING file remains ambiguous after a crash: the
+		// provider may already contain the exact payload. Resume it in VERIFYING.
+		// Ordinary directories re-enter MKCOL directly.
+		if err := tx.Model(&model.WebDAVWritebackObject{}).
+			Where("state = ? AND is_dir = ? AND cleanup_path = ''", StateUploading, true).
 			Updates(map[string]any{
 				"state":        StateQueued,
 				"retry_at":     &now,
@@ -5275,7 +5319,7 @@ func (m *workerManager) recoverInterrupted() error {
 			return err
 		}
 		return tx.Model(&model.WebDAVWritebackObject{}).
-			Where("state = ? AND is_dir = ?", StateUploading, false).
+			Where("state = ? AND is_dir = ? AND cleanup_path = ''", StateUploading, false).
 			Updates(map[string]any{
 				"state":        StateVerifying,
 				"retry_at":     &now,
@@ -5895,6 +5939,18 @@ func loadReplicaTreeRows(root string) ([]model.WebDAVWritebackObject, error) {
 	return rows, err
 }
 
+func providerListingHasUnexpectedName(objs []model.Obj, allowed map[string]struct{}) bool {
+	for _, obj := range objs {
+		if obj == nil {
+			continue
+		}
+		if _, ok := allowed[obj.GetName()]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *workerManager) replicaTreeProviderState(canonicalRoot, providerRoot string) (providerOperationRemoteState, error) {
 	canonicalRoot = utils.FixAndCleanPath(canonicalRoot)
 	providerRoot = utils.FixAndCleanPath(providerRoot)
@@ -5923,33 +5979,76 @@ func (m *workerManager) replicaTreeProviderState(canonicalRoot, providerRoot str
 		providerPath string
 	}
 	byParent := make(map[string][]expectedObject)
+	allowedByParent := map[string]map[string]struct{}{
+		providerRoot: {},
+	}
+	ensureParent := func(parent string) map[string]struct{} {
+		parent = utils.FixAndCleanPath(parent)
+		allowed := allowedByParent[parent]
+		if allowed == nil {
+			allowed = make(map[string]struct{})
+			allowedByParent[parent] = allowed
+		}
+		return allowed
+	}
+
 	for i := range rows {
 		row := &rows[i]
-		if row.Path == canonicalRoot || canonicalDeleted(row) || !stagedReplicaTreeRow(row) {
-			continue
-		}
-		// Pending payloads are intentionally excluded: after the root MOVE they
-		// upload at the destination and overwrite any older provider version.
-		if !row.IsDir && row.SpoolPath != "" {
+		if row.Path == canonicalRoot {
 			continue
 		}
 		rel := strings.TrimPrefix(row.Path, canonicalRoot)
+		if rel == row.Path || !strings.HasPrefix(rel, "/") {
+			return providerOperationRemoteInconclusive, nil
+		}
 		providerPath := utils.FixAndCleanPath(providerRoot + rel)
 		parent := path.Dir(providerPath)
+		ensureParent(parent)[path.Base(providerPath)] = struct{}{}
+
+		// Tombstones authorize temporary source presence because the delete will
+		// run after the root MOVE. Later locally-spooled file generations are
+		// also safe: their PUT overwrites the moved baseline at destination.
+		if canonicalDeleted(row) {
+			continue
+		}
+		if !stagedReplicaTreeRow(row) {
+			if row.IsDir || row.SpoolPath == "" {
+				// A later directory or no-spool file generation cannot be
+				// reconstructed by PUT after the root MOVE, so do not mutate the
+				// provider tree from evidence captured by the older generation.
+				return providerOperationRemoteInconclusive, nil
+			}
+			continue
+		}
+		if row.IsDir {
+			ensureParent(providerPath)
+			byParent[parent] = append(byParent[parent], expectedObject{row: *row, providerPath: providerPath})
+			continue
+		}
+		// Pending payloads may be absent or stale at source; their durable PUT
+		// deterministically overwrites the moved baseline afterward.
+		if row.SpoolPath != "" {
+			continue
+		}
 		byParent[parent] = append(byParent[parent], expectedObject{row: *row, providerPath: providerPath})
 	}
 
-	for parent, expected := range byParent {
+	for parent, allowed := range allowedByParent {
 		objs, listErr := m.refreshParent(parent)
 		if listErr != nil {
 			return providerOperationRemoteInconclusive, listErr
 		}
-		for i := range expected {
-			item := &expected[i]
+		if providerListingHasUnexpectedName(objs, allowed) {
+			// The provider tree contains a name that canonical state does not
+			// know about. Moving the root would leak that object into Cloud
+			// Sync's destination namespace, so classify the tree as divergent.
+			return providerOperationRemoteMismatch, nil
+		}
+		for _, item := range byParent[parent] {
 			remote := exactRemoteByName(objs, path.Base(item.providerPath))
 			if remote == nil {
 				// A force-refreshed miss can still be propagation lag around a
-				// just-finished 115 tree mutation. Never mutate on this evidence.
+				// just-finished provider mutation. Never mutate on this evidence.
 				return providerOperationRemoteInconclusive, nil
 			}
 			if item.row.IsDir {

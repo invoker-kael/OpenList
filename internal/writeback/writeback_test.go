@@ -1049,6 +1049,103 @@ func TestMergeCanonicalOverlayKeepsCloudSyncSnapshotStable(t *testing.T) {
 	}
 }
 
+func TestCloudSyncTraceContractCanonicalAuthority(t *testing.T) {
+	modTime := time.Date(2026, time.September, 21, 10, 0, 0, 0, time.UTC)
+	size := int64(4 * 1024 * 1024 * 1024)
+	putRow := model.WebDAVWritebackObject{
+		Path:           "/encrypted/movie.bin",
+		Name:           "movie.bin",
+		Size:           size,
+		ModTime:        modTime,
+		Generation:     9,
+		ETag:           canonicalETag(pathKey("/encrypted/movie.bin"), 9, size),
+		CanonicalState: CanonicalStateAcked,
+		State:          StateUploading,
+	}
+
+	t.Run("PUT then PROPFIND ignores provider propagation", func(t *testing.T) {
+		snapshots := [][]model.Obj{
+			nil,
+			{&model.Object{Name: "movie.bin", Size: 0, Modified: modTime.Add(-time.Hour)}},
+			{&model.Object{Name: "movie.bin", Size: size - 1, Modified: modTime.Add(time.Hour)}},
+			{&model.Object{Name: "movie.bin", Size: size, Modified: modTime}},
+		}
+		for i, remote := range snapshots {
+			got := mergeCanonicalOverlay(remote, []model.WebDAVWritebackObject{putRow})
+			if len(got) != 1 {
+				t.Fatalf("snapshot %d returned %d objects, want 1", i, len(got))
+			}
+			if got[0].GetSize() != size || !got[0].ModTime().Equal(modTime) {
+				t.Fatalf("snapshot %d polluted canonical PUT verification: size=%d mtime=%v", i, got[0].GetSize(), got[0].ModTime())
+			}
+			if got[0].GetHash().GetHash(utils.ETag) != putRow.ETag {
+				t.Fatalf("snapshot %d changed canonical ETag", i)
+			}
+		}
+	})
+
+	t.Run("MOVE immediately hides source and exposes destination", func(t *testing.T) {
+		src := putRow
+		src.Name = "old.bin"
+		src.Path = "/encrypted/old.bin"
+		src.CanonicalState = CanonicalStateDeleted
+		src.State = StateDeleted
+
+		dst := putRow
+		dst.Name = "new.bin"
+		dst.Path = "/encrypted/new.bin"
+		dst.Generation = 10
+		dst.ETag = canonicalETag(pathKey(dst.Path), dst.Generation, dst.Size)
+
+		remote := []model.Obj{
+			&model.Object{Name: "old.bin", Size: size, Modified: modTime},
+		}
+		got := mergeCanonicalOverlay(remote, []model.WebDAVWritebackObject{src, dst})
+		byName := make(map[string]model.Obj, len(got))
+		for _, obj := range got {
+			byName[obj.GetName()] = obj
+		}
+		if _, ok := byName["old.bin"]; ok {
+			t.Fatal("MOVE source remained visible while provider still exposed old path")
+		}
+		if obj := byName["new.bin"]; obj == nil || obj.GetSize() != size {
+			t.Fatal("MOVE destination was not immediately canonical")
+		}
+	})
+
+	t.Run("DELETE immediately hides stale provider object", func(t *testing.T) {
+		deleted := putRow
+		deleted.CanonicalState = CanonicalStateDeleted
+		deleted.State = StateDeleted
+		remote := []model.Obj{
+			&model.Object{Name: "movie.bin", Size: size, Modified: modTime},
+		}
+		got := mergeCanonicalOverlay(remote, []model.WebDAVWritebackObject{deleted})
+		if len(got) != 0 {
+			t.Fatalf("DELETE left %d stale provider objects visible", len(got))
+		}
+	})
+}
+
+func TestProviderListingUnexpectedNameIsDivergentEvidence(t *testing.T) {
+	allowed := map[string]struct{}{
+		"known.bin": {},
+		"pending.bin": {},
+	}
+	if providerListingHasUnexpectedName([]model.Obj{
+		&model.Object{Name: "known.bin"},
+		&model.Object{Name: "pending.bin"},
+	}, allowed) {
+		t.Fatal("known canonical children were classified as provider-only")
+	}
+	if !providerListingHasUnexpectedName([]model.Obj{
+		&model.Object{Name: "known.bin"},
+		&model.Object{Name: "orphan.bin"},
+	}, allowed) {
+		t.Fatal("provider-only child must block canonical-first root MOVE")
+	}
+}
+
 func TestCompletedCanonicalReconcileDueIsBackgroundOnly(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{
@@ -1462,6 +1559,30 @@ func TestIsPathOrDescendant(t *testing.T) {
 				t.Fatalf("isPathOrDescendant(%q, %q) = %v, want %v", tt.candidate, tt.root, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestInterruptedReplicaMoveControlState(t *testing.T) {
+	file := &model.WebDAVWritebackObject{
+		State:       StateUploading,
+		SpoolPath:   "",
+		CleanupPath: "/encrypted/old.bin",
+	}
+	if file.SpoolPath != "" || file.CleanupPath == "" {
+		t.Fatal("test fixture must represent a metadata-only MOVE")
+	}
+	file.State = StateQueued
+	if !queuedReplicaMove(file) {
+		t.Fatal("recovered file MOVE must return to the replica MOVE control path")
+	}
+
+	tree := &model.WebDAVWritebackObject{
+		IsDir:       true,
+		State:       StateQueued,
+		CleanupPath: "/encrypted/old-album",
+	}
+	if !queuedReplicaTreeMove(tree) {
+		t.Fatal("recovered directory MOVE must return to the tree MOVE control path")
 	}
 }
 

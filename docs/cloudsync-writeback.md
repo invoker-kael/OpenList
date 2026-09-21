@@ -411,3 +411,12 @@ The background root MOVE verifies only immutable staged generations. Completed n
 A same-generation, unverified RemoteGeneration value is used only as an internal staging fence. It lets recovery distinguish the generations published by the original MOVE from later Cloud Sync edits without adding another lifecycle state. If provider identity cannot be proven, unchanged directories fall back to normal MKCOL, unchanged spooled files return to normal PUT, and only unchanged no-spool files are hidden for Cloud Sync repair. Later destination generations are never rolled back.
 
 Source tombstones and completed destination evidence are deferred while the provider root MOVE is pending. After destination verification succeeds, staged child directories become completed in one transaction, background-probe holds are released, pending payload children resume beneath the now-completed root, and source tombstones are released for normal two-observation delete cleanup.
+
+
+### Crash recovery and provider-only tree divergence
+
+Startup recovery now recognizes metadata-only MOVE control rows explicitly. Interrupted file or directory MOVE jobs in UPLOADING/VERIFYING are returned to QUEUED so their own destination/source recovery logic runs first, rather than passing through ordinary upload verification. Before workers start, the old-source tombstone hold is restored in the same recovery transaction, closing the restart race where DELETE priority could otherwise remove the provider source.
+
+Canonical-first directory MOVE now treats provider-only children as divergence. Every fresh provider directory listing is compared with the current canonical namespace: canonical tombstones and pending locally-spooled files authorize temporary source names, but a name with no canonical row blocks the root MOVE. Empty canonical directories are also listed, so hidden objects inside them cannot ride along unnoticed. Later directory or no-spool file generations are treated as inconclusive rather than allowing an older MOVE snapshot to mutate the provider tree.
+
+Trace-contract regression tests now encode the observed Cloud Sync sequence directly: PUT followed by stale/zero-size PROPFIND snapshots must still return the canonical size/mtime/ETag; MOVE must hide the source and expose the destination before provider propagation; DELETE must hide a stale provider object immediately.
