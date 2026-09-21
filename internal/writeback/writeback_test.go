@@ -2,6 +2,7 @@ package writeback
 
 import (
 	"context"
+	"io"
 	"errors"
 	"os"
 	"path/filepath"
@@ -1554,6 +1555,34 @@ func TestCloudSyncPlaceholderSettleDelay(t *testing.T) {
 	}
 	if got := cloudSyncSettleDelay(0); got != 10*time.Second {
 		t.Fatalf("zero-byte placeholder settle delay = %v, want 10s", got)
+	}
+	if got := emptyPayloadSHA1(); got != "da39a3ee5e6b4b0d3255bfef95601890afd80709" {
+		t.Fatalf("empty payload sha1 = %q", got)
+	}
+}
+
+func TestZeroByteCanonicalPayloadNeedsNoSpoolFile(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		Size:           0,
+		PayloadSHA1:    emptyPayloadSHA1(),
+		CanonicalState: CanonicalStateAcked,
+		State:          StateQueued,
+	}
+	payload, available, err := openLocalPayload(row)
+	if err != nil {
+		t.Fatalf("openLocalPayload returned error: %v", err)
+	}
+	if !available || payload == nil {
+		t.Fatal("zero-byte canonical payload should be reconstructible without a spool file")
+	}
+	defer payload.Close()
+	buf := make([]byte, 1)
+	n, readErr := payload.Read(buf)
+	if n != 0 || !errors.Is(readErr, io.EOF) {
+		t.Fatalf("zero-byte payload read = (%d, %v), want (0, EOF)", n, readErr)
+	}
+	if _, seekErr := payload.Seek(0, io.SeekStart); seekErr != nil {
+		t.Fatalf("zero-byte payload seek failed: %v", seekErr)
 	}
 }
 

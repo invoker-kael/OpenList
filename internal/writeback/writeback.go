@@ -1,6 +1,7 @@
 package writeback
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -152,6 +153,11 @@ func canonicalETag(key string, generation uint64, size int64) string {
 	return fmt.Sprintf("\"olwb-%s-%d-%x\"", key[:16], generation, uint64(size))
 }
 
+func emptyPayloadSHA1() string {
+	hasher := utils.SHA1.NewFunc()
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
 func clearRemoteVerification(row *model.WebDAVWritebackObject) {
 	if row == nil {
 		return
@@ -175,11 +181,23 @@ func canonicalContentSHA1(row *model.WebDAVWritebackObject) string {
 	return ""
 }
 
+
+func durableLocalPayloadAvailable(row *model.WebDAVWritebackObject) bool {
+	if row == nil || row.IsDir || canonicalDeleted(row) {
+		return false
+	}
+	if row.SpoolPath == "" {
+		return row.Size == 0 && canonicalAcked(row)
+	}
+	_, err := os.Stat(row.SpoolPath)
+	return err == nil
+}
+
 func canCoalesceDuplicatePut(row *model.WebDAVWritebackObject, size int64, payloadSHA1 string) bool {
 	return row != nil &&
 		!row.IsDir &&
 		!canonicalDeleted(row) &&
-		row.SpoolPath != "" &&
+		(row.SpoolPath != "" || row.Size == 0) &&
 		row.Size == size &&
 		row.PayloadSHA1 != "" &&
 		payloadSHA1 != "" &&
@@ -2616,8 +2634,10 @@ func beginDurableReceiveSequence(ctx context.Context, p string, expected int64) 
 	now := time.Now()
 	leaseUntil := now.Add(receiveLeaseDuration)
 	limit := maxPendingSpoolBytes()
+	backlogWeight := spoolBacklogAdmissionWeight(expected)
+	backlogLimited := receiveAdmissionNeedsGlobalFence(limit) && backlogWeight > 0
 	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if receiveAdmissionNeedsGlobalFence(limit) {
+		if backlogLimited {
 			if err := lockAdmissionFence(tx); err != nil {
 				return err
 			}
@@ -2641,12 +2661,12 @@ func beginDurableReceiveSequence(ctx context.Context, p string, expected int64) 
 			fence.ActiveReceivers = 0
 		}
 
-		if limit > 0 {
+		if backlogLimited {
 			current, err := durableBacklogAdmissionCurrent(tx, p, now)
 			if err != nil {
 				return err
 			}
-			projected, allowed := projectSpoolBacklogAdmission(current, spoolBacklogAdmissionWeight(expected), limit)
+			projected, allowed := projectSpoolBacklogAdmission(current, backlogWeight, limit)
 			if !allowed {
 				return &SpoolCapacityError{Backlog: projected, BacklogLimit: limit}
 			}
@@ -2672,13 +2692,13 @@ func beginDurableReceiveSequence(ctx context.Context, p string, expected int64) 
 			return err
 		}
 
-		if limit == 0 {
+		if !backlogLimited {
 			return nil
 		}
 		reservation := model.WebDAVWritebackReceiveReservation{
 			PathKey:    pathKey(p),
 			Sequence:   sequence,
-			Bytes:      spoolBacklogAdmissionWeight(expected),
+			Bytes:      backlogWeight,
 			LeaseUntil: leaseUntil,
 		}
 		return tx.Create(&reservation).Error
@@ -2707,7 +2727,7 @@ func refreshReceiveLease(tx *gorm.DB, key string, sequence uint64, leaseUntil ti
 func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64, expected, received int64) {
 	leaseUntil := time.Now().Add(receiveLeaseDuration)
 	key := pathKey(p)
-	backlogLimited := maxPendingSpoolBytes() > 0
+	backlogLimited := maxPendingSpoolBytes() > 0 && spoolBacklogAdmissionWeight(expected) > 0
 
 	if !receiveHeartbeatNeedsAdmission(expected, received, backlogLimited) {
 		// Known-length PUTs already reserved their complete declared size.
@@ -2770,8 +2790,8 @@ func startReceiveLeaseHeartbeat(ctx context.Context, p string, sequence uint64, 
 	}
 }
 
-func endReceiveSequence(ctx context.Context, p string, sequence uint64) {
-	backlogLimited := receiveAdmissionNeedsGlobalFence(maxPendingSpoolBytes())
+func endReceiveSequence(ctx context.Context, p string, sequence uint64, expected int64) {
+	backlogLimited := receiveAdmissionNeedsGlobalFence(maxPendingSpoolBytes()) && spoolBacklogAdmissionWeight(expected) > 0
 	_ = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Reservation release only needs the global admission fence when backlog
 		// accounting is active. Without a configured high-water mark, same-path
@@ -3091,53 +3111,71 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	stopLeaseHeartbeat := startReceiveLeaseHeartbeat(receiveCtx, p, receiveSequence, expected)
 	defer func() {
 		stopLeaseHeartbeat()
-		endReceiveSequence(receiveCtx, p, receiveSequence)
+		endReceiveSequence(receiveCtx, p, receiveSequence, expected)
 	}()
 	spoolDir := conf.Conf.WebDAVWriteback.SpoolDir
-	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
-		return nil, false, err
-	}
+	actualSize := int64(0)
+	payloadSHA1 := ""
+	finalName := ""
 
-	reservation, err := reserveIncomingBytes(expected)
-	if err != nil {
-		return nil, false, err
-	}
-	defer reservation.release()
-
-	tmp, err := os.CreateTemp(spoolDir, "recv-*.part")
-	if err != nil {
-		return nil, false, err
-	}
-	tmpName := tmp.Name()
-	committed := false
-	defer func() {
-		_ = tmp.Close()
-		if !committed {
-			_ = os.Remove(tmpName)
+	if expected == 0 {
+		// An exact zero-byte body has no payload bytes that require filesystem
+		// durability. Confirm the body is actually empty, then persist only its
+		// canonical metadata and content hash in MySQL.
+		n, readErr := io.CopyN(io.Discard, body, 1)
+		if n > 0 {
+			return nil, false, fmt.Errorf("WebDAV PUT exceeds declared size: expected 0 bytes")
 		}
-	}()
-
-	actualSize, payloadSHA1, err := copyToSpool(tmp, body, expected, reservation, func(received int64) {
-		heartbeatReceiveSequence(receiveCtx, p, receiveSequence, expected, received)
-	})
-	if err != nil {
-		if expected >= 0 {
-			return nil, false, fmt.Errorf("WebDAV PUT receive failed after %d/%d bytes: %w", actualSize, expected, err)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, false, fmt.Errorf("WebDAV PUT receive failed after 0/0 bytes: %w", readErr)
 		}
-		return nil, false, fmt.Errorf("WebDAV PUT receive failed after %d bytes with unknown declared length: %w", actualSize, err)
+		payloadSHA1 = emptyPayloadSHA1()
+	} else {
+		if err := os.MkdirAll(spoolDir, 0o700); err != nil {
+			return nil, false, err
+		}
+
+		reservation, err := reserveIncomingBytes(expected)
+		if err != nil {
+			return nil, false, err
+		}
+		defer reservation.release()
+
+		tmp, err := os.CreateTemp(spoolDir, "recv-*.part")
+		if err != nil {
+			return nil, false, err
+		}
+		tmpName := tmp.Name()
+		committed := false
+		defer func() {
+			_ = tmp.Close()
+			if !committed {
+				_ = os.Remove(tmpName)
+			}
+		}()
+
+		actualSize, payloadSHA1, err = copyToSpool(tmp, body, expected, reservation, func(received int64) {
+			heartbeatReceiveSequence(receiveCtx, p, receiveSequence, expected, received)
+		})
+		if err != nil {
+			if expected >= 0 {
+				return nil, false, fmt.Errorf("WebDAV PUT receive failed after %d/%d bytes: %w", actualSize, expected, err)
+			}
+			return nil, false, fmt.Errorf("WebDAV PUT receive failed after %d bytes with unknown declared length: %w", actualSize, err)
+		}
+		if err := tmp.Sync(); err != nil {
+			return nil, false, err
+		}
+		if err := tmp.Close(); err != nil {
+			return nil, false, err
+		}
+		finalName = filepath.Join(spoolDir, uuid.NewString()+".data")
+		if err := os.Rename(tmpName, finalName); err != nil {
+			return nil, false, err
+		}
+		syncDir(spoolDir)
+		committed = true
 	}
-	if err := tmp.Sync(); err != nil {
-		return nil, false, err
-	}
-	if err := tmp.Close(); err != nil {
-		return nil, false, err
-	}
-	finalName := filepath.Join(spoolDir, uuid.NewString()+".data")
-	if err := os.Rename(tmpName, finalName); err != nil {
-		return nil, false, err
-	}
-	syncDir(spoolDir)
-	committed = true
 
 	if modTime.IsZero() {
 		modTime = time.Now()
@@ -3177,7 +3215,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		}
 		if findErr == nil {
 			if canCoalesceDuplicatePut(&row, actualSize, payloadSHA1) {
-				if _, statErr := os.Stat(row.SpoolPath); statErr == nil {
+				if durableLocalPayloadAvailable(&row) {
 					duplicate = true
 					applyDuplicatePutMetadata(&row, modTime, createTime, mime, modTimeProvided, createTimeProvided)
 					markCanonicalAcked(&row, time.Now())
@@ -3261,17 +3299,23 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		return advanceReceiveFence(tx, fence, receiveSequence)
 	})
 	if err != nil {
-		_ = os.Remove(finalName)
+		if finalName != "" {
+			_ = os.Remove(finalName)
+		}
 		return nil, false, err
 	}
 	if superseded {
-		_ = os.Remove(finalName)
-		syncDir(spoolDir)
+		if finalName != "" {
+			_ = os.Remove(finalName)
+			syncDir(spoolDir)
+		}
 		return &saved, false, nil
 	}
 	if duplicate {
-		_ = os.Remove(finalName)
-		syncDir(spoolDir)
+		if finalName != "" {
+			_ = os.Remove(finalName)
+			syncDir(spoolDir)
+		}
 		return &saved, false, nil
 	}
 
@@ -3363,16 +3407,49 @@ func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*m
 	return &saved, created, nil
 }
 
-func OpenLocal(p string) (*os.File, *model.WebDAVWritebackObject, error) {
+type LocalPayload interface {
+	io.ReadSeeker
+	io.Closer
+}
+
+type memoryPayload struct {
+	*bytes.Reader
+}
+
+func (m *memoryPayload) Close() error {
+	return nil
+}
+
+func openLocalPayload(row *model.WebDAVWritebackObject) (LocalPayload, bool, error) {
+	if row == nil || canonicalDeleted(row) || row.IsDir {
+		return nil, false, nil
+	}
+	if row.SpoolPath != "" {
+		f, err := os.Open(row.SpoolPath)
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		return f, true, nil
+	}
+	if row.Size == 0 && canonicalAcked(row) {
+		return &memoryPayload{Reader: bytes.NewReader(nil)}, true, nil
+	}
+	return nil, false, nil
+}
+
+func OpenLocal(p string) (LocalPayload, *model.WebDAVWritebackObject, error) {
 	row, err := getByPath(p)
-	if err != nil || row == nil || canonicalDeleted(row) || row.SpoolPath == "" {
+	if err != nil || row == nil || canonicalDeleted(row) {
 		return nil, row, err
 	}
-	f, err := os.Open(row.SpoolPath)
-	if os.IsNotExist(err) {
-		return nil, row, nil
+	payload, available, err := openLocalPayload(row)
+	if err != nil || !available {
+		return nil, row, err
 	}
-	return f, row, err
+	return payload, row, nil
 }
 
 // DeleteTree creates durable tombstones for a tracked path and every tracked
@@ -6701,19 +6778,22 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 			return
 		}
 	}
-	if row.SpoolPath == "" {
-		m.fail(row, errors.New("spool payload is missing"))
-		return
-	}
-	f, err := os.Open(row.SpoolPath)
+	payload, available, err := openLocalPayload(row)
 	if err != nil {
 		m.fail(row, err)
 		return
 	}
-	releaseActiveSpool := markSpoolActive(row.SpoolPath)
+	if !available {
+		m.fail(row, errors.New("durable local payload is missing"))
+		return
+	}
+	releaseActiveSpool := func() {}
+	if row.SpoolPath != "" {
+		releaseActiveSpool = markSpoolActive(row.SpoolPath)
+	}
 	defer func() {
 		releaseActiveSpool()
-		_ = f.Close()
+		_ = payload.Close()
 	}()
 
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
@@ -6732,7 +6812,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 	fsStream := &stream.FileStream{
 		Obj:      obj,
-		Reader:   f,
+		Reader:   payload,
 		Mimetype: row.MimeType,
 	}
 	err = fs.PutDirectly(m.ctx, row.Parent, fsStream, true)
