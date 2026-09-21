@@ -1675,6 +1675,107 @@ func refreshCompletedRemoteVerification(row *model.WebDAVWritebackObject, remote
 		}).Error
 }
 
+const completedSiblingProbeBatchLimit = 128
+
+var completedProbeRefreshes providerRefreshGroup
+
+func matchingCompletedSiblingRows(rows []model.WebDAVWritebackObject, remotes []model.Obj, skipID uint, requireHash bool) []verificationBatchMatch {
+	if len(rows) == 0 || len(remotes) == 0 {
+		return nil
+	}
+	byName := make(map[string]model.Obj, len(remotes))
+	for _, remote := range remotes {
+		if remote != nil {
+			byName[remote.GetName()] = remote
+		}
+	}
+	matches := make([]verificationBatchMatch, 0, min(len(rows), len(remotes)))
+	for i := range rows {
+		row := &rows[i]
+		if row.ID == skipID || row.IsDir || row.State != StateCompleted || row.SpoolPath != "" {
+			continue
+		}
+		remote := byName[row.Name]
+		if remoteMatchesCanonical(row, remote, requireHash) {
+			matches = append(matches, verificationBatchMatch{row: *row, remote: remote})
+		}
+	}
+	return matches
+}
+
+func refreshMatchingCompletedSiblings(trigger *model.WebDAVWritebackObject, remotes []model.Obj, requireHash bool, now time.Time) {
+	if trigger == nil || !requireHash || len(remotes) == 0 {
+		return
+	}
+	cutoff := now.Add(-completedRemoteVerificationInterval())
+	var rows []model.WebDAVWritebackObject
+	if err := db.GetDb().
+		Select("id", "name", "is_dir", "size", "payload_sha1", "remote_sha1", "remote_generation", "remote_verified_at", "generation", "spool_path", "state", "verify_count", "retry_at", "last_error").
+		Where("parent_key = ? AND state = ? AND is_dir = ? AND spool_path = '' AND id <> ?",
+			pathKey(trigger.Parent), StateCompleted, false, trigger.ID).
+		Where("(remote_verified_at IS NULL OR remote_verified_at <= ? OR remote_generation <> generation OR verify_count <> 0 OR retry_at IS NOT NULL OR last_error <> '')", cutoff).
+		Order("remote_verified_at asc").
+		Order("id asc").
+		Limit(completedSiblingProbeBatchLimit).
+		Find(&rows).Error; err != nil {
+		log.Errorf("write-back completed sibling probe scan failed for %s: %v", trigger.Parent, err)
+		return
+	}
+	for _, match := range matchingCompletedSiblingRows(rows, remotes, trigger.ID, requireHash) {
+		if err := refreshCompletedRemoteVerification(&match.row, match.remote, now); err != nil {
+			log.Errorf("write-back completed sibling probe refresh failed for %s: %v", match.row.Path, err)
+		}
+	}
+}
+
+func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWritebackObject, now time.Time) (bool, error) {
+	if row == nil || row.IsDir {
+		return false, nil
+	}
+
+	confirmationClaimed := false
+	if row.VerifyCount > 0 || row.RetryAt != nil || row.LastError != "" {
+		ready, observeErr := observeCompletedFileDivergence(row, now)
+		if observeErr != nil || !ready {
+			return false, observeErr
+		}
+		confirmationClaimed = true
+	}
+
+	objs, listErr := completedProbeRefreshes.do(ctx.Done(), row.Parent, func() ([]model.Obj, error) {
+		return fs.List(ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	})
+	if listErr != nil {
+		// Provider/network failures are not evidence of remote loss.
+		return false, nil
+	}
+	remote := exactRemoteByName(objs, row.Name)
+	switch compareRemoteContent(row, remote, true) {
+	case remoteContentMatch:
+		if err := refreshCompletedRemoteVerification(row, remote, now); err != nil {
+			return false, err
+		}
+		refreshMatchingCompletedSiblings(row, objs, true, now)
+		return false, nil
+	case remoteContentInconclusive:
+		if confirmationClaimed {
+			// The claimed confirmation remains throttled by retry_at. Missing
+			// 115 SHA-1 still cannot prove identity or loss.
+			return false, nil
+		}
+	default:
+		if confirmationClaimed {
+			return deleteCompletedCanonical(row)
+		}
+	}
+
+	// The first suspicious refreshed snapshot only arms a later confirmation.
+	// This preserves the existing two-observation deletion rule while avoiding
+	// a per-file GET before the authoritative 115 parent listing.
+	_, observeErr := observeCompletedFileDivergence(row, now)
+	return false, observeErr
+}
+
 func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	if !Enabled() {
 		return false, nil
@@ -1692,6 +1793,10 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	}
 
 	requireHash := providerRequiresPayloadHash(row.Path)
+	if requireHash && !row.IsDir {
+		return reconcileCompletedHashProvider(ctx, row, now)
+	}
+
 	remote, getErr := fs.Get(ctx, row.Path, &fs.GetArgs{NoLog: true})
 	if getErr == nil && remote != nil {
 		if row.IsDir && remote.IsDir() {
@@ -6247,21 +6352,58 @@ func (m *workerManager) failDeleted(row *model.WebDAVWritebackObject, err error)
 		}).Error
 }
 
-func (m *workerManager) cleanupCompleted() {
-	ttl := conf.Conf.WebDAVWriteback.CompletedCacheTTLMinutes
-	if ttl < 0 {
-		return
+const (
+	completedCleanupBatchSize = 256
+	completedCleanupMaxBatches = 8
+)
+
+func unreferencedSpoolPaths(candidates, referenced []string) []string {
+	if len(candidates) == 0 {
+		return nil
 	}
-	cutoff := time.Now().Add(-time.Duration(ttl) * time.Minute)
+	live := make(map[string]struct{}, len(referenced))
+	for _, p := range referenced {
+		if p != "" {
+			live[p] = struct{}{}
+		}
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	out := make([]string, 0, len(candidates))
+	for _, p := range candidates {
+		if p == "" {
+			continue
+		}
+		if _, duplicate := seen[p]; duplicate {
+			continue
+		}
+		seen[p] = struct{}{}
+		if _, stillReferenced := live[p]; !stillReferenced {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func releaseCompletedSpoolBatch(cutoff time.Time, limit int) (selected, released int, err error) {
+	if limit <= 0 {
+		return 0, 0, nil
+	}
 	var rows []model.WebDAVWritebackObject
 	if err := db.GetDb().
 		Select("id", "generation", "spool_path", "completed_at").
 		Where("state = ? AND spool_path <> '' AND completed_at IS NOT NULL AND completed_at <= ?", StateCompleted, cutoff).
-		Limit(100).
+		Order("completed_at asc").
+		Order("id asc").
+		Limit(limit * 2).
 		Find(&rows).Error; err != nil {
-		return
+		return 0, 0, err
 	}
+	selected = len(rows)
+	cleared := make([]string, 0, min(len(rows), limit))
 	for i := range rows {
+		if len(cleared) >= limit {
+			break
+		}
 		row := &rows[i]
 		if spoolIsActive(row.SpoolPath) {
 			continue
@@ -6270,13 +6412,58 @@ func (m *workerManager) cleanupCompleted() {
 			Where("id = ? AND generation = ? AND state = ? AND spool_path = ? AND completed_at IS NOT NULL AND completed_at <= ?",
 				row.ID, row.Generation, StateCompleted, row.SpoolPath, cutoff).
 			Update("spool_path", "")
-		if res.Error != nil || res.RowsAffected == 0 {
+		if res.Error != nil {
+			return selected, released, res.Error
+		}
+		if res.RowsAffected == 0 {
 			continue
 		}
-		// COPY can make several canonical rows reference the same immutable
-		// spool payload. Only unlink the physical file after the last database
-		// reference has been released.
-		removeSpoolIfUnreferenced(row.SpoolPath)
+		released++
+		cleared = append(cleared, row.SpoolPath)
+	}
+	if len(cleared) == 0 {
+		return selected, released, nil
+	}
+
+	unique := make([]string, 0, len(cleared))
+	seen := make(map[string]struct{}, len(cleared))
+	for _, p := range cleared {
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		unique = append(unique, p)
+	}
+	var referenced []string
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Distinct("spool_path").
+		Where("spool_path IN ?", unique).
+		Pluck("spool_path", &referenced).Error; err != nil {
+		return selected, released, err
+	}
+	for _, p := range unreferencedSpoolPaths(unique, referenced) {
+		if !spoolIsActive(p) {
+			_ = os.Remove(p)
+		}
+	}
+	return selected, released, nil
+}
+
+func (m *workerManager) cleanupCompleted() {
+	ttl := conf.Conf.WebDAVWriteback.CompletedCacheTTLMinutes
+	if ttl < 0 {
+		return
+	}
+	cutoff := time.Now().Add(-time.Duration(ttl) * time.Minute)
+	for batch := 0; batch < completedCleanupMaxBatches; batch++ {
+		selected, released, err := releaseCompletedSpoolBatch(cutoff, completedCleanupBatchSize)
+		if err != nil {
+			log.Errorf("write-back completed spool cleanup failed: %v", err)
+			return
+		}
+		if selected == 0 || released == 0 || selected < completedCleanupBatchSize {
+			return
+		}
 	}
 }
 

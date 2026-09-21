@@ -330,3 +330,10 @@ Client-visible canonical state remains compact and independent: `durable_acked`,
 Lease-only receive heartbeats no longer acquire the singleton backlog admission fence. Known-length PUTs reserve their complete declared size at admission, and periodic unknown-length heartbeats with no new progress only extend the per-path fence/reservation lease. The global admission lock is now reserved for unknown-length progress checkpoints that actually increase durable reserved bytes. This prevents several simultaneous large uploads from serializing unrelated PUT admission once per heartbeat interval.
 
 Queued directory/file dispatch also filters canonical parent readiness before consuming a worker slot. A bounded candidate batch performs one indexed parent-key lookup and suppresses children while their canonical parent directory is still pending, deleted, or a file. The worker-side parent check remains as a race-safe final guard. This removes the previous cycle where large directory bursts repeatedly consumed workers, selected the same parent, updated child retry timestamps, and returned without provider work.
+
+
+### Completed health-probe and spool-drain batching
+
+For 115-backed completed files whose local spool has already been released, direct reconciliation now uses a force-refreshed parent listing as the health authority instead of issuing one object GET per stale file. Concurrent requests for the same parent share the refresh, and a matching snapshot refreshes up to 128 stale completed siblings in the same directory. Suspicious results still preserve the two-observation divergence rule: the first refreshed mismatch only arms a later confirmation, and only a separately claimed refreshed snapshot may remove canonical metadata.
+
+Completed spool cleanup now drains up to 256 eligible rows per batch and up to eight batches per maintenance pass. Cleared immutable spool paths are deduplicated, checked for remaining COPY/shared references with one batched database query, and only then unlinked. This replaces the former per-file reference COUNT query and lets large small-file bursts converge much faster without sacrificing shared-spool safety.

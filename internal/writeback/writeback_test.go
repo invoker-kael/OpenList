@@ -2600,6 +2600,39 @@ func TestCaptureRemoteVerificationWithoutProviderHash(t *testing.T) {
 	}
 }
 
+func TestMatchingCompletedSiblingRows(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	rows := []model.WebDAVWritebackObject{
+		{ID: 1, Name: "one.bin", State: StateCompleted, Size: 100, PayloadSHA1: sha},
+		{ID: 2, Name: "two.bin", State: StateCompleted, Size: 200, PayloadSHA1: sha},
+		{ID: 3, Name: "pending.bin", State: StateQueued, Size: 300, PayloadSHA1: sha},
+		{ID: 4, Name: "cached.bin", State: StateCompleted, Size: 400, PayloadSHA1: sha, SpoolPath: "/spool/cached.data"},
+	}
+	remotes := []model.Obj{
+		&model.Object{Name: "one.bin", Size: 100, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
+		&model.Object{Name: "two.bin", Size: 201, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
+		&model.Object{Name: "pending.bin", Size: 300, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
+		&model.Object{Name: "cached.bin", Size: 400, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
+	}
+	got := matchingCompletedSiblingRows(rows, remotes, 0, true)
+	if len(got) != 1 || got[0].row.ID != 1 {
+		t.Fatalf("completed sibling matches=%v, want only row 1", got)
+	}
+	if got := matchingCompletedSiblingRows(rows, remotes, 1, true); len(got) != 0 {
+		t.Fatalf("trigger row must be skipped, got %v", got)
+	}
+}
+
+func TestUnreferencedSpoolPaths(t *testing.T) {
+	candidates := []string{"/spool/a.data", "/spool/b.data", "/spool/a.data", "", "/spool/c.data"}
+	referenced := []string{"/spool/b.data"}
+	got := unreferencedSpoolPaths(candidates, referenced)
+	want := []string{"/spool/a.data", "/spool/c.data"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unreferenced spool paths=%v, want %v", got, want)
+	}
+}
+
 func TestClearRemoteVerification(t *testing.T) {
 	now := time.Now()
 	row := &model.WebDAVWritebackObject{
