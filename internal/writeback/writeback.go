@@ -1755,7 +1755,7 @@ func completedRemoteVerificationInterval() time.Duration {
 	// cadence into continuous provider health checks. Keep healthy completed
 	// probes on a separate, longer cooldown while never probing more frequently
 	// than the upload verification interval.
-	seconds := 5 * 60
+	seconds := 30 * 60
 	if conf.Conf != nil {
 		if configured := conf.Conf.WebDAVWriteback.CompletedRemoteProbeSeconds; configured > 0 {
 			seconds = configured
@@ -5166,9 +5166,97 @@ type providerRefreshCall struct {
 	err  error
 }
 
+type providerSnapshotEntry struct {
+	objs        []model.Obj
+	refreshedAt time.Time
+}
+
+const providerSnapshotMaxEntries = 128
+
 type providerRefreshGroup struct {
-	mu    sync.Mutex
-	calls map[string]*providerRefreshCall
+	mu        sync.Mutex
+	calls     map[string]*providerRefreshCall
+	snapshots map[string]providerSnapshotEntry
+}
+
+func cloneProviderObjects(objs []model.Obj) []model.Obj {
+	if len(objs) == 0 {
+		return nil
+	}
+	return append([]model.Obj(nil), objs...)
+}
+
+func providerSnapshotTTL() time.Duration {
+	seconds := 10 * 60
+	if conf.Conf != nil {
+		configured := conf.Conf.WebDAVWriteback.ProviderSnapshotTTLSeconds
+		if configured < 0 {
+			return 0
+		}
+		if configured > 0 {
+			seconds = configured
+		}
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (g *providerRefreshGroup) cached(parent string, now time.Time) ([]model.Obj, bool) {
+	ttl := providerSnapshotTTL()
+	if ttl <= 0 {
+		return nil, false
+	}
+	parent = utils.FixAndCleanPath(parent)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	entry, ok := g.snapshots[parent]
+	if !ok {
+		return nil, false
+	}
+	if !now.Before(entry.refreshedAt.Add(ttl)) {
+		delete(g.snapshots, parent)
+		return nil, false
+	}
+	return cloneProviderObjects(entry.objs), true
+}
+
+func (g *providerRefreshGroup) storeSnapshotLocked(parent string, objs []model.Obj, now time.Time) {
+	if providerSnapshotTTL() <= 0 {
+		return
+	}
+	if g.snapshots == nil {
+		g.snapshots = make(map[string]providerSnapshotEntry)
+	}
+	if _, exists := g.snapshots[parent]; !exists && len(g.snapshots) >= providerSnapshotMaxEntries {
+		oldestKey := ""
+		var oldest time.Time
+		for key, entry := range g.snapshots {
+			if oldestKey == "" || entry.refreshedAt.Before(oldest) {
+				oldestKey = key
+				oldest = entry.refreshedAt
+			}
+		}
+		if oldestKey != "" {
+			delete(g.snapshots, oldestKey)
+		}
+	}
+	g.snapshots[parent] = providerSnapshotEntry{objs: cloneProviderObjects(objs), refreshedAt: now}
+}
+
+func (g *providerRefreshGroup) invalidate(parents ...string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, parent := range parents {
+		if parent == "" {
+			continue
+		}
+		delete(g.snapshots, utils.FixAndCleanPath(parent))
+	}
+}
+
+func (g *providerRefreshGroup) clear() {
+	g.mu.Lock()
+	g.snapshots = nil
+	g.mu.Unlock()
 }
 
 func (g *providerRefreshGroup) do(stop <-chan struct{}, parent string, refresh func() ([]model.Obj, error)) ([]model.Obj, error) {
@@ -5191,12 +5279,38 @@ func (g *providerRefreshGroup) do(stop <-chan struct{}, parent string, refresh f
 	g.mu.Unlock()
 
 	call.objs, call.err = refresh()
+	if call.err == nil {
+		g.mu.Lock()
+		g.storeSnapshotLocked(parent, call.objs, time.Now())
+		g.mu.Unlock()
+	}
 	close(call.done)
 
 	g.mu.Lock()
 	delete(g.calls, parent)
 	g.mu.Unlock()
 	return call.objs, call.err
+}
+
+var providerParentSnapshots providerRefreshGroup
+
+// ProviderListForWebDAV serves ordinary directory revalidation from a recent
+// successful fresh provider snapshot. Expired/missing snapshots perform one
+// coalesced Refresh:true listing. Verification and divergence decisions do not
+// use this cache; worker refreshParent always requests fresh provider evidence.
+func ProviderListForWebDAV(ctx context.Context, parent string) ([]model.Obj, bool, error) {
+	parent = utils.FixAndCleanPath(parent)
+	if objs, ok := providerParentSnapshots.cached(parent, time.Now()); ok {
+		return objs, true, nil
+	}
+	objs, err := providerParentSnapshots.do(ctx.Done(), parent, func() ([]model.Obj, error) {
+		return fs.List(ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	})
+	return objs, false, err
+}
+
+func InvalidateProviderSnapshots(parents ...string) {
+	providerParentSnapshots.invalidate(parents...)
 }
 
 type workerManager struct {
@@ -5210,7 +5324,6 @@ type workerManager struct {
 	providerProbes chan struct{}
 	inflight       sync.Map
 	batchCompleted sync.Map
-	refreshes      providerRefreshGroup
 	wg             sync.WaitGroup
 }
 
@@ -5319,7 +5432,7 @@ func acquireWorkerSlot(slots chan struct{}, stop <-chan struct{}) (bool, error) 
 }
 
 func (m *workerManager) refreshParent(parent string) ([]model.Obj, error) {
-	return m.refreshes.do(m.stop, parent, func() ([]model.Obj, error) {
+	return providerParentSnapshots.do(m.stop, parent, func() ([]model.Obj, error) {
 		reserved, err := acquireWorkerSlot(m.providerProbes, m.stop)
 		if err != nil {
 			return nil, err
@@ -5368,6 +5481,7 @@ func Start() {
 	if !Enabled() {
 		return
 	}
+	providerParentSnapshots.clear()
 	managerMu.Lock()
 	if manager != nil {
 		managerMu.Unlock()
@@ -5437,6 +5551,7 @@ func Stop() {
 	m.cancel()
 	close(m.stop)
 	m.wg.Wait()
+	providerParentSnapshots.clear()
 }
 
 func (m *workerManager) recoverInterrupted() error {

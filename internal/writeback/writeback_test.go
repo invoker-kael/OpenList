@@ -166,6 +166,48 @@ func TestProviderRefreshGroupSharesInflightResult(t *testing.T) {
 	}
 }
 
+func TestProviderSnapshotUsesBoundedFreshnessAndInvalidation(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{ProviderSnapshotTTLSeconds: 600}}
+	defer func() { conf.Conf = oldConf }()
+
+	group := &providerRefreshGroup{}
+	now := time.Now()
+	group.mu.Lock()
+	group.storeSnapshotLocked("/encrypted", []model.Obj{&model.Object{Name: "file.bin", Size: 123}}, now)
+	group.mu.Unlock()
+
+	objs, ok := group.cached("/encrypted", now.Add(9*time.Minute))
+	if !ok || len(objs) != 1 || objs[0].GetName() != "file.bin" {
+		t.Fatalf("fresh provider snapshot = %#v ok=%v", objs, ok)
+	}
+	if _, ok := group.cached("/encrypted", now.Add(11*time.Minute)); ok {
+		t.Fatal("expired provider snapshot must force a fresh provider listing")
+	}
+
+	group.mu.Lock()
+	group.storeSnapshotLocked("/encrypted", []model.Obj{&model.Object{Name: "file.bin"}}, now)
+	group.mu.Unlock()
+	group.invalidate("/encrypted")
+	if _, ok := group.cached("/encrypted", now); ok {
+		t.Fatal("explicit provider mutation invalidation must drop the cached parent snapshot")
+	}
+}
+
+func TestProviderSnapshotTTLDefaultsConservatively(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{}
+	defer func() { conf.Conf = oldConf }()
+
+	if got := providerSnapshotTTL(); got != 10*time.Minute {
+		t.Fatalf("default provider snapshot TTL=%v, want 10m", got)
+	}
+	conf.Conf.WebDAVWriteback.ProviderSnapshotTTLSeconds = -1
+	if got := providerSnapshotTTL(); got != 0 {
+		t.Fatalf("negative provider snapshot TTL=%v, want disabled", got)
+	}
+}
+
 func TestDispatchFilePriority(t *testing.T) {
 	small := &model.WebDAVWritebackObject{Size: open115MultipartChunkSize}
 	large := &model.WebDAVWritebackObject{Size: open115MultipartChunkSize + 1}
@@ -1189,7 +1231,7 @@ func TestCompletedCanonicalReconcileDueIsBackgroundOnly(t *testing.T) {
 	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{
 		DirectoryGraceSeconds:       60,
 		VerifyIntervalSeconds:       5,
-		CompletedRemoteProbeSeconds: 300,
+		CompletedRemoteProbeSeconds: 1800,
 	}}
 	defer func() { conf.Conf = oldConf }()
 
@@ -2663,13 +2705,13 @@ func TestCompletedRemoteVerificationIntervalSeparatesHealthyProbeCadence(t *test
 	conf.Conf = &conf.Config{
 		WebDAVWriteback: conf.WebDAVWritebackConfig{
 			VerifyIntervalSeconds:       5,
-			CompletedRemoteProbeSeconds: 300,
+			CompletedRemoteProbeSeconds: 1800,
 		},
 	}
 	defer func() { conf.Conf = oldConf }()
 
-	if got := completedRemoteVerificationInterval(); got != 5*time.Minute {
-		t.Fatalf("completed remote probe interval=%v, want 5m", got)
+	if got := completedRemoteVerificationInterval(); got != 30*time.Minute {
+		t.Fatalf("completed remote probe interval=%v, want 30m", got)
 	}
 
 	conf.Conf.WebDAVWriteback.CompletedRemoteProbeSeconds = 2
@@ -2678,8 +2720,8 @@ func TestCompletedRemoteVerificationIntervalSeparatesHealthyProbeCadence(t *test
 	}
 
 	conf.Conf.WebDAVWriteback.CompletedRemoteProbeSeconds = 0
-	if got := completedRemoteVerificationInterval(); got != 5*time.Minute {
-		t.Fatalf("zero completed probe setting should use the 5m default, got %v", got)
+	if got := completedRemoteVerificationInterval(); got != 30*time.Minute {
+		t.Fatalf("zero completed probe setting should use the 30m default, got %v", got)
 	}
 }
 

@@ -406,9 +406,17 @@ func walkFS(ctx context.Context, depth int, name string, info model.Obj, walkFn 
 		depth = 0
 	}
 	meta, _ := op.GetNearestMeta(name)
-	// Read directory names.
+	// Read directory names. In write-back mode, a recent successful provider
+	// snapshot is sufficient for ordinary Cloud Sync revalidation; expired
+	// snapshots are refreshed once and coalesced by parent.
 	listCtx := context.WithValue(ctx, conf.MetaKey, meta)
-	objs, err := fs.List(listCtx, name, &fs.ListArgs{})
+	var objs []model.Obj
+	var err error
+	if writeback.Enabled() {
+		objs, _, err = writeback.ProviderListForWebDAV(listCtx, name)
+	} else {
+		objs, err = fs.List(listCtx, name, &fs.ListArgs{})
+	}
 	if writeback.Enabled() {
 		remoteReliable := err == nil
 		_, canonicalParent := info.(*writeback.CanonicalObject)

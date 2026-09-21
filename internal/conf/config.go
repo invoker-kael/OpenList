@@ -131,6 +131,7 @@ type WebDAVWritebackConfig struct {
 	VerifyAttempts              int    `json:"verify_attempts" env:"VERIFY_ATTEMPTS"`
 	CompletedCacheTTLMinutes    int    `json:"completed_cache_ttl_minutes" env:"COMPLETED_CACHE_TTL_MINUTES"`
 	CompletedRemoteProbeSeconds int    `json:"completed_remote_probe_seconds" env:"COMPLETED_REMOTE_PROBE_SECONDS"`
+	ProviderSnapshotTTLSeconds  int    `json:"provider_snapshot_ttl_seconds" env:"PROVIDER_SNAPSHOT_TTL_SECONDS"`
 }
 
 type Config struct {
@@ -296,7 +297,8 @@ func DefaultConfig(dataDir string) *Config {
 			VerifyIntervalSeconds:       5,
 			VerifyAttempts:              60,
 			CompletedCacheTTLMinutes:    30,
-			CompletedRemoteProbeSeconds: 300,
+			CompletedRemoteProbeSeconds: 30 * 60,
+			ProviderSnapshotTTLSeconds:  10 * 60,
 		},
 		LastLaunchedVersion: "",
 		ProxyAddress:        "",

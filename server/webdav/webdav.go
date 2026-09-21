@@ -1165,6 +1165,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 				w.Header().Set("Retry-After", "2")
 				return http.StatusServiceUnavailable, wbErr
 			}
+			writeback.InvalidateProviderSnapshots(path.Dir(dst), dst)
 			if providerOp != nil {
 				if finishErr := writeback.FinishProviderOperation(providerOp.ID); finishErr != nil {
 					log.Warnf("provider COPY metadata reconciled but intent cleanup failed for %s -> %s: %v", src, dst, finishErr)
@@ -1293,6 +1294,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 			w.Header().Set("Retry-After", "2")
 			return http.StatusServiceUnavailable, wbErr
 		}
+		writeback.InvalidateProviderSnapshots(path.Dir(src), path.Dir(dst), src, dst)
 		if providerOp != nil {
 			if finishErr := writeback.FinishProviderOperation(providerOp.ID); finishErr != nil {
 				log.Warnf("provider MOVE metadata reconciled but intent cleanup failed for %s -> %s: %v", src, dst, finishErr)
