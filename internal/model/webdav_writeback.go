@@ -56,10 +56,10 @@ type WebDAVWritebackReceiveFence struct {
 	Path                  string     `json:"path" gorm:"type:text"`
 	NextSequence          uint64     `json:"next_sequence"`
 	LastCommittedSequence uint64     `json:"last_committed_sequence"`
-	ActiveReceivers       int        `json:"active_receivers"`
+	ActiveReceivers       int        `json:"active_receivers" gorm:"index:idx_webdav_writeback_receive_active_lease,priority:1"`
 	LatestExpectedSize    int64      `json:"latest_expected_size"`
 	LatestStartedAt       *time.Time `json:"latest_started_at"`
-	ReceiveLeaseUntil     *time.Time `json:"receive_lease_until"`
+	ReceiveLeaseUntil     *time.Time `json:"receive_lease_until" gorm:"index:idx_webdav_writeback_receive_active_lease,priority:2"`
 	ReceiveState          string     `json:"receive_state" gorm:"size:16;index"`
 	ReceiveUpdatedAt      *time.Time `json:"receive_updated_at"`
 	CreatedAt             time.Time  `json:"created_at"`

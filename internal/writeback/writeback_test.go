@@ -1369,6 +1369,12 @@ func TestProjectSpoolBacklogAdmission(t *testing.T) {
 	if projected, ok := projectSpoolBacklogAdmission(900, 500, 1000); ok || projected != 1400 {
 		t.Fatalf("over-limit projection=%d ok=%v, want 1400 false", projected, ok)
 	}
+	if projected, ok := projectSpoolBacklogAdmission(0, 1500, 1000); !ok || projected != 1500 {
+		t.Fatalf("singleton oversize projection=%d ok=%v, want 1500 true", projected, ok)
+	}
+	if projected, ok := projectSpoolBacklogAdmission(1, 1500, 1000); ok || projected != 1501 {
+		t.Fatalf("oversize with existing backlog projection=%d ok=%v, want 1501 false", projected, ok)
+	}
 	if projected, ok := projectSpoolBacklogAdmission(^uint64(0)-5, 10, ^uint64(0)); ok || projected != ^uint64(0) {
 		t.Fatalf("overflow projection=%d ok=%v, want max false", projected, ok)
 	}
@@ -1448,6 +1454,30 @@ func TestReceiveFenceActive(t *testing.T) {
 func TestReceiveRetrySeconds(t *testing.T) {
 	if got := ReceiveRetrySeconds(); got < 1 || got > 10 {
 		t.Fatalf("receive retry interval=%d, want a short bounded retry", got)
+	}
+}
+
+func TestReceivingTreeActiveUsesStrictPathBoundaries(t *testing.T) {
+	now := time.Now()
+	future := now.Add(time.Minute)
+	past := now.Add(-time.Minute)
+	fences := []model.WebDAVWritebackReceiveFence{
+		{Path: "/ab/file", ActiveReceivers: 1, ReceiveLeaseUntil: &future},
+		{Path: "/a/expired", ActiveReceivers: 1, ReceiveLeaseUntil: &past},
+	}
+	if receivingTreeActive(fences, "/a", now) {
+		t.Fatal("sibling prefix or expired lease must not block /a")
+	}
+	fences = append(fences, model.WebDAVWritebackReceiveFence{
+		Path: "/a/live/file",
+		ActiveReceivers: 1,
+		ReceiveLeaseUntil: &future,
+	})
+	if !receivingTreeActive(fences, "/a", now) {
+		t.Fatal("live descendant receive must block /a")
+	}
+	if !receivingTreeActive(fences, "/", now) {
+		t.Fatal("root tree check must include live descendants")
 	}
 }
 

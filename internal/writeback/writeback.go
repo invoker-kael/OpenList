@@ -2087,6 +2087,13 @@ func projectSpoolBacklogAdmission(current, incoming, limit uint64) (uint64, bool
 		return ^uint64(0), false
 	}
 	if limit > 0 && projected > limit {
+		// max_pending_spool_mb is a soft queue high-water mark, not a maximum
+		// object size. If the queue is otherwise empty, admit one known oversize
+		// object and let its full reservation block subsequent PUTs until it
+		// drains. Physical free-space admission still protects the spool.
+		if current == 0 && incoming > limit {
+			return projected, true
+		}
 		return projected, false
 	}
 	return projected, true
@@ -2462,6 +2469,14 @@ func receiveFenceActive(fence *model.WebDAVWritebackReceiveFence, now time.Time)
 
 func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64, error) {
 	p = utils.FixAndCleanPath(p)
+	// Most Cloud Sync duplicate retries hit the same OpenList instance. Reject
+	// them from the in-process receive registry before taking the singleton
+	// MySQL admission fence so one stuck large-file retry storm cannot serialize
+	// unrelated PUT admissions. The durable fence inside the transaction remains
+	// the authoritative cross-instance check.
+	if isReceiving(p) {
+		return 0, ErrReceiveInProgress
+	}
 	var sequence uint64
 	now := time.Now()
 	leaseUntil := now.Add(receiveLeaseDuration)
@@ -2673,16 +2688,36 @@ func Receiving(p string) (bool, error) {
 	return durableReceiving(utils.FixAndCleanPath(p), time.Now())
 }
 
+func receivingTreeActive(fences []model.WebDAVWritebackReceiveFence, root string, now time.Time) bool {
+	root = utils.FixAndCleanPath(root)
+	for i := range fences {
+		fence := &fences[i]
+		if !receiveFenceActive(fence, now) {
+			continue
+		}
+		if isPathOrDescendant(fence.Path, root) {
+			return true
+		}
+	}
+	return false
+}
+
 func ReceivingTree(root string) (bool, error) {
 	root = utils.FixAndCleanPath(root)
 	now := time.Now()
-	var count int64
+	var fences []model.WebDAVWritebackReceiveFence
+	// Active receive rows are normally tiny in number. Use the composite
+	// active+lease index to fetch only live receivers, then do strict path
+	// boundary matching in Go. This avoids a recursive TEXT LIKE + COUNT scan
+	// on every DELETE/MOVE/COPY overlap check.
 	err := db.GetDb().Model(&model.WebDAVWritebackReceiveFence{}).
+		Select("path", "active_receivers", "receive_lease_until").
 		Where("active_receivers > 0 AND receive_lease_until > ?", now).
-		Where("path = ? OR path LIKE ? ESCAPE '~'", root, descendantLikePattern(root)).
-		Limit(1).
-		Count(&count).Error
-	return count > 0, err
+		Find(&fences).Error
+	if err != nil {
+		return false, err
+	}
+	return receivingTreeActive(fences, root, now), nil
 }
 
 func lockReceiveFence(tx *gorm.DB, p string) (*model.WebDAVWritebackReceiveFence, error) {
@@ -2879,12 +2914,12 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	p = utils.FixAndCleanPath(p)
 	modTimeProvided := !modTime.IsZero()
 	createTimeProvided := !createTime.IsZero()
-	_, releaseReceiving := beginReceiving(p)
-	defer releaseReceiving()
 	receiveSequence, err := beginReceiveSequence(ctx, p, expected)
 	if err != nil {
 		return nil, false, err
 	}
+	_, releaseReceiving := beginReceiving(p)
+	defer releaseReceiving()
 	receiveCtx := durableCommitContext(ctx)
 	stopLeaseHeartbeat := startReceiveLeaseHeartbeat(receiveCtx, p, receiveSequence, expected)
 	defer func() {
@@ -5339,7 +5374,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		return
 	}
 	if receiving {
-		next := time.Now().Add(time.Second)
+		next := time.Now().Add(time.Duration(ReceiveRetrySeconds()) * time.Second)
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
 			Update("retry_at", &next).Error
