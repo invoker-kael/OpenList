@@ -6872,7 +6872,9 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 
 	var current model.WebDAVWritebackObject
-	if err := db.GetDb().First(&current, row.ID).Error; err != nil {
+	if err := db.GetDb().
+		Select("generation", "canonical_state", "state", "path", "spool_path").
+		Take(&current, row.ID).Error; err != nil {
 		return
 	}
 	if current.Generation != row.Generation || canonicalDeleted(&current) || current.Path != row.Path {
