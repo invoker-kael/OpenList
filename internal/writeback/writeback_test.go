@@ -32,6 +32,23 @@ func TestUploadWorkerLimit(t *testing.T) {
 	}
 }
 
+func TestProviderProbeWorkerLimit(t *testing.T) {
+	for _, tc := range []struct {
+		workers    int
+		configured int
+		want       int
+	}{
+		{workers: 4, configured: 2, want: 2},
+		{workers: 4, configured: 0, want: 4},
+		{workers: 4, configured: 8, want: 4},
+		{workers: 1, configured: 2, want: 1},
+	} {
+		if got := providerProbeWorkerLimit(tc.workers, tc.configured); got != tc.want {
+			t.Fatalf("providerProbeWorkerLimit(%d, %d)=%d, want %d", tc.workers, tc.configured, got, tc.want)
+		}
+	}
+}
+
 func TestLargeUploadWorkerLimit(t *testing.T) {
 	for _, tc := range []struct {
 		workers    int
@@ -115,12 +132,52 @@ func TestDispatchFilePriority(t *testing.T) {
 	small := &model.WebDAVWritebackObject{Size: open115MultipartChunkSize}
 	large := &model.WebDAVWritebackObject{Size: open115MultipartChunkSize + 1}
 	if dispatchFilePriority(small) != 0 || dispatchFilePriority(large) != 1 {
-		t.Fatal("dispatch file priority must keep small uploads ahead of multipart-sized uploads")
+		t.Fatal("dispatch file priority must classify multipart-sized uploads")
 	}
-	rows := []model.WebDAVWritebackObject{{ID: 1, Size: open115MultipartChunkSize + 1}, {ID: 2, Size: 1}, {ID: 3, Size: open115MultipartChunkSize + 2}}
-	sortDispatchFiles(rows)
-	if rows[0].ID != 2 || rows[1].ID != 1 || rows[2].ID != 3 {
-		t.Fatalf("dispatch file order = %v, want small first with stable large-file order", []uint{rows[0].ID, rows[1].ID, rows[2].ID})
+}
+
+func TestFairDispatchFilesPreventsLargeStarvation(t *testing.T) {
+	rows := []model.WebDAVWritebackObject{
+		{ID: 1, Size: 1},
+		{ID: 2, Size: 2},
+		{ID: 3, Size: 3},
+		{ID: 4, Size: 4},
+		{ID: 10, Size: open115MultipartChunkSize + 1},
+		{ID: 11, Size: open115MultipartChunkSize + 2},
+	}
+	got := fairDispatchFiles(rows)
+	want := []uint{1, 2, 3, 10, 4, 11}
+	for i := range want {
+		if got[i].ID != want[i] {
+			t.Fatalf("fair dispatch ids = %v, want %v", []uint{got[0].ID, got[1].ID, got[2].ID, got[3].ID, got[4].ID, got[5].ID}, want)
+		}
+	}
+}
+
+func TestWorkerManagerInflightIDsAreStable(t *testing.T) {
+	m := &workerManager{}
+	m.inflight.Store(uint(9), struct{}{})
+	m.inflight.Store(uint(2), struct{}{})
+	m.inflight.Store("ignore", struct{}{})
+	got := m.inflightIDs()
+	if !reflect.DeepEqual(got, []uint{2, 9}) {
+		t.Fatalf("inflight ids = %v, want [2 9]", got)
+	}
+}
+
+func TestBatchCompletedOnlyMarksInflightJobs(t *testing.T) {
+	m := &workerManager{}
+	m.markBatchCompleted(7)
+	if m.consumeBatchCompleted(7) {
+		t.Fatal("non-inflight completion must not leave a stale-job marker")
+	}
+	m.inflight.Store(uint(7), struct{}{})
+	m.markBatchCompleted(7)
+	if !m.consumeBatchCompleted(7) {
+		t.Fatal("inflight sibling completion should mark its queued job as stale")
+	}
+	if m.consumeBatchCompleted(7) {
+		t.Fatal("stale-job marker should be consumed exactly once")
 	}
 }
 

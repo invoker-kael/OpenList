@@ -120,6 +120,7 @@ type WebDAVWritebackConfig struct {
 	Workers                     int    `json:"workers" env:"WORKERS"`
 	UploadWorkers               int    `json:"upload_workers" env:"UPLOAD_WORKERS"`
 	LargeUploadWorkers          int    `json:"large_upload_workers" env:"LARGE_UPLOAD_WORKERS"`
+	ProviderProbeWorkers        int    `json:"provider_probe_workers" env:"PROVIDER_PROBE_WORKERS"`
 	CloudSyncSettleMillis       int    `json:"cloudsync_settle_millis" env:"CLOUDSYNC_SETTLE_MILLIS"`
 	CloudSyncPlaceholderMillis  int    `json:"cloudsync_placeholder_millis" env:"CLOUDSYNC_PLACEHOLDER_MILLIS"`
 	DirectoryGraceSeconds       int    `json:"directory_grace_seconds" env:"DIRECTORY_GRACE_SECONDS"`
@@ -284,6 +285,7 @@ func DefaultConfig(dataDir string) *Config {
 			Workers:                     4,
 			UploadWorkers:               3,
 			LargeUploadWorkers:          2,
+			ProviderProbeWorkers:        2,
 			CloudSyncSettleMillis:       2000,
 			CloudSyncPlaceholderMillis:  10000,
 			DirectoryGraceSeconds:       60,

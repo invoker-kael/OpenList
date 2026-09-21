@@ -4423,16 +4423,18 @@ func (g *providerRefreshGroup) do(stop <-chan struct{}, parent string, refresh f
 }
 
 type workerManager struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	stop         chan struct{}
-	wake         chan struct{}
-	jobs         chan workerJob
-	uploads      chan struct{}
-	largeUploads chan struct{}
-	inflight     sync.Map
-	refreshes    providerRefreshGroup
-	wg           sync.WaitGroup
+	ctx            context.Context
+	cancel         context.CancelFunc
+	stop           chan struct{}
+	wake           chan struct{}
+	jobs           chan workerJob
+	uploads        chan struct{}
+	largeUploads   chan struct{}
+	providerProbes chan struct{}
+	inflight       sync.Map
+	batchCompleted sync.Map
+	refreshes      providerRefreshGroup
+	wg             sync.WaitGroup
 }
 
 func boundedWorkerLimit(workers, configured int) int {
@@ -4448,6 +4450,10 @@ func uploadWorkerLimit(workers, configured int) int {
 }
 
 func largeUploadWorkerLimit(workers, configured int) int {
+	return boundedWorkerLimit(workers, configured)
+}
+
+func providerProbeWorkerLimit(workers, configured int) int {
 	return boundedWorkerLimit(workers, configured)
 }
 
@@ -4484,10 +4490,50 @@ func releaseWorkerSlot(slots chan struct{}, reserved bool) {
 	<-slots
 }
 
+func acquireWorkerSlot(slots chan struct{}, stop <-chan struct{}) (bool, error) {
+	if slots == nil {
+		return false, nil
+	}
+	select {
+	case slots <- struct{}{}:
+		return true, nil
+	case <-stop:
+		return false, context.Canceled
+	}
+}
+
 func (m *workerManager) refreshParent(parent string) ([]model.Obj, error) {
 	return m.refreshes.do(m.stop, parent, func() ([]model.Obj, error) {
+		reserved, err := acquireWorkerSlot(m.providerProbes, m.stop)
+		if err != nil {
+			return nil, err
+		}
+		defer releaseWorkerSlot(m.providerProbes, reserved)
 		return fs.List(m.ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
 	})
+}
+
+func (m *workerManager) markBatchCompleted(id uint) {
+	if _, active := m.inflight.Load(id); active {
+		m.batchCompleted.Store(id, struct{}{})
+	}
+}
+
+func (m *workerManager) consumeBatchCompleted(id uint) bool {
+	_, ok := m.batchCompleted.LoadAndDelete(id)
+	return ok
+}
+
+func (m *workerManager) inflightIDs() []uint {
+	ids := make([]uint, 0)
+	m.inflight.Range(func(key, _ any) bool {
+		if id, ok := key.(uint); ok {
+			ids = append(ids, id)
+		}
+		return true
+	})
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 func wake() {
@@ -4516,6 +4562,7 @@ func Start() {
 	workers := max(1, conf.Conf.WebDAVWriteback.Workers)
 	uploadWorkers := uploadWorkerLimit(workers, conf.Conf.WebDAVWriteback.UploadWorkers)
 	largeUploadWorkers := largeUploadWorkerLimit(workers, conf.Conf.WebDAVWriteback.LargeUploadWorkers)
+	providerProbeWorkers := providerProbeWorkerLimit(workers, conf.Conf.WebDAVWriteback.ProviderProbeWorkers)
 	var uploads chan struct{}
 	if uploadWorkers < workers {
 		uploads = make(chan struct{}, uploadWorkers)
@@ -4524,14 +4571,19 @@ func Start() {
 	if largeUploadWorkers < workers {
 		largeUploads = make(chan struct{}, largeUploadWorkers)
 	}
+	var providerProbes chan struct{}
+	if providerProbeWorkers < workers {
+		providerProbes = make(chan struct{}, providerProbeWorkers)
+	}
 	m := &workerManager{
-		ctx:          workerCtx,
-		cancel:       cancel,
-		stop:         make(chan struct{}),
-		wake:         make(chan struct{}, 1),
-		jobs:         make(chan workerJob, max(4, workers*4)),
-		uploads:      uploads,
-		largeUploads: largeUploads,
+		ctx:            workerCtx,
+		cancel:         cancel,
+		stop:           make(chan struct{}),
+		wake:           make(chan struct{}, 1),
+		jobs:           make(chan workerJob, max(4, workers*4)),
+		uploads:        uploads,
+		largeUploads:   largeUploads,
+		providerProbes: providerProbes,
 	}
 	manager = m
 	managerMu.Unlock()
@@ -4679,6 +4731,8 @@ func (m *workerManager) scheduler() {
 	}
 }
 
+const dispatchSmallBurst = 3
+
 func dispatchFilePriority(row *model.WebDAVWritebackObject) int {
 	if row != nil && row.Size > open115MultipartChunkSize {
 		return 1
@@ -4686,19 +4740,51 @@ func dispatchFilePriority(row *model.WebDAVWritebackObject) int {
 	return 0
 }
 
-func sortDispatchFiles(rows []model.WebDAVWritebackObject) {
-	sort.SliceStable(rows, func(i, j int) bool {
-		return dispatchFilePriority(&rows[i]) < dispatchFilePriority(&rows[j])
-	})
+func fairDispatchFiles(rows []model.WebDAVWritebackObject) []model.WebDAVWritebackObject {
+	if len(rows) < 2 {
+		return rows
+	}
+	small := make([]model.WebDAVWritebackObject, 0, len(rows))
+	large := make([]model.WebDAVWritebackObject, 0, len(rows))
+	for i := range rows {
+		if dispatchFilePriority(&rows[i]) == 0 {
+			small = append(small, rows[i])
+		} else {
+			large = append(large, rows[i])
+		}
+	}
+	if len(small) == 0 || len(large) == 0 {
+		return rows
+	}
+	out := make([]model.WebDAVWritebackObject, 0, len(rows))
+	si, li := 0, 0
+	for si < len(small) || li < len(large) {
+		for n := 0; n < dispatchSmallBurst && si < len(small); n++ {
+			out = append(out, small[si])
+			si++
+		}
+		if li < len(large) {
+			out = append(out, large[li])
+			li++
+		}
+		if si >= len(small) {
+			out = append(out, large[li:]...)
+			break
+		}
+	}
+	return out
 }
 
-func loadDispatchClass(now time.Time, states []string, isDir *bool, limit int) ([]model.WebDAVWritebackObject, error) {
+func loadDispatchClass(now time.Time, states []string, isDir *bool, excludedIDs []uint, limit int) ([]model.WebDAVWritebackObject, error) {
 	var rows []model.WebDAVWritebackObject
 	query := db.GetDb().
 		Select("id", "path", "size", "is_dir", "state").
 		Where("state IN ? AND (retry_at IS NULL OR retry_at <= ?)", states, now)
 	if isDir != nil {
 		query = query.Where("is_dir = ?", *isDir)
+	}
+	if len(excludedIDs) > 0 {
+		query = query.Where("id NOT IN ?", excludedIDs)
 	}
 	err := query.
 		Order("retry_at asc").
@@ -4708,29 +4794,29 @@ func loadDispatchClass(now time.Time, states []string, isDir *bool, limit int) (
 	return rows, err
 }
 
-func loadDispatchRows(now time.Time, workers int) ([]model.WebDAVWritebackObject, error) {
+func loadDispatchRows(now time.Time, workers int, excludedIDs []uint) ([]model.WebDAVWritebackObject, error) {
 	limit := max(4, workers*2)
 	fileLimit := max(8, workers*4)
 	isDir := true
 	isFile := false
 
-	deleted, err := loadDispatchClass(now, []string{StateDeleted}, nil, limit)
+	deleted, err := loadDispatchClass(now, []string{StateDeleted}, nil, excludedIDs, limit)
 	if err != nil {
 		return nil, err
 	}
-	verifying, err := loadDispatchClass(now, []string{StateVerifying}, nil, limit)
+	verifying, err := loadDispatchClass(now, []string{StateVerifying}, nil, excludedIDs, limit)
 	if err != nil {
 		return nil, err
 	}
-	directories, err := loadDispatchClass(now, []string{StateQueued, StateFailed}, &isDir, limit)
+	directories, err := loadDispatchClass(now, []string{StateQueued, StateFailed}, &isDir, excludedIDs, limit)
 	if err != nil {
 		return nil, err
 	}
-	files, err := loadDispatchClass(now, []string{StateQueued, StateFailed}, &isFile, fileLimit)
+	files, err := loadDispatchClass(now, []string{StateQueued, StateFailed}, &isFile, excludedIDs, fileLimit)
 	if err != nil {
 		return nil, err
 	}
-	sortDispatchFiles(files)
+	files = fairDispatchFiles(files)
 
 	rows := make([]model.WebDAVWritebackObject, 0, len(deleted)+len(verifying)+len(directories)+len(files))
 	rows = append(rows, deleted...)
@@ -4741,15 +4827,16 @@ func loadDispatchRows(now time.Time, workers int) ([]model.WebDAVWritebackObject
 }
 
 func (m *workerManager) dispatch() {
+	if len(m.jobs) >= cap(m.jobs) {
+		return
+	}
 	now := time.Now()
-	// Finite lock-null resources expire with the in-memory lock. Infinite locks
-	// have retry_at=NULL and are removed by UNLOCK or startup recovery.
 	if err := db.GetDb().
 		Where("state = ? AND retry_at IS NOT NULL AND retry_at <= ?", StateLockNull, now).
 		Delete(&model.WebDAVWritebackObject{}).Error; err != nil {
 		log.Errorf("write-back lock-null cleanup failed: %v", err)
 	}
-	rows, err := loadDispatchRows(now, max(1, conf.Conf.WebDAVWriteback.Workers))
+	rows, err := loadDispatchRows(now, max(1, conf.Conf.WebDAVWriteback.Workers), m.inflightIDs())
 	if err != nil {
 		log.Errorf("write-back queue scan failed: %v", err)
 		return
@@ -4760,7 +4847,6 @@ func (m *workerManager) dispatch() {
 		if _, loaded := m.inflight.LoadOrStore(id, struct{}{}); loaded {
 			continue
 		}
-
 		job := workerJob{id: id}
 		if providerUploadCandidate(row) {
 			reserved, allowed := tryReserveWorkerSlot(m.uploads)
@@ -4769,7 +4855,6 @@ func (m *workerManager) dispatch() {
 				continue
 			}
 			job.upload = reserved
-
 			if largeProviderUploadCandidate(row, providerRequiresPayloadHash(row.Path)) {
 				largeReserved, largeAllowed := tryReserveWorkerSlot(m.largeUploads)
 				if !largeAllowed {
@@ -4780,7 +4865,6 @@ func (m *workerManager) dispatch() {
 				job.largeUpload = largeReserved
 			}
 		}
-
 		select {
 		case m.jobs <- job:
 		default:
@@ -4799,10 +4883,13 @@ func (m *workerManager) worker() {
 		case <-m.stop:
 			return
 		case job := <-m.jobs:
-			m.process(job.id)
+			if !m.consumeBatchCompleted(job.id) {
+				m.process(job.id)
+			}
 			releaseWorkerSlot(m.largeUploads, job.largeUpload)
 			releaseWorkerSlot(m.uploads, job.upload)
 			m.inflight.Delete(job.id)
+			m.batchCompleted.Delete(job.id)
 			select {
 			case m.wake <- struct{}{}:
 			default:
@@ -5182,6 +5269,7 @@ func (m *workerManager) completeMatchingVerifySiblings(trigger *model.WebDAVWrit
 	}
 	var rows []model.WebDAVWritebackObject
 	if err := db.GetDb().
+		Select("id", "path", "name", "is_dir", "size", "payload_sha1", "remote_sha1", "remote_generation", "generation", "cleanup_path", "state").
 		Where("parent_key = ? AND state = ? AND is_dir = ? AND id <> ?", pathKey(trigger.Parent), StateVerifying, false, trigger.ID).
 		Order("retry_at asc").
 		Limit(verificationSiblingBatchLimit).
@@ -5190,7 +5278,9 @@ func (m *workerManager) completeMatchingVerifySiblings(trigger *model.WebDAVWrit
 		return
 	}
 	for _, match := range matchingVerificationRows(rows, remotes, trigger.ID, requireHash) {
-		m.completeRemoteVerification(&match.row, match.remote, []string{StateVerifying})
+		if m.completeRemoteVerification(&match.row, match.remote, []string{StateVerifying}) {
+			m.markBatchCompleted(match.row.ID)
+		}
 	}
 }
 
