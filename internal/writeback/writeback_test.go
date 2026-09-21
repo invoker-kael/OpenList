@@ -1078,7 +1078,8 @@ func TestCloudSyncTraceContractCanonicalAuthority(t *testing.T) {
 			if got[0].GetSize() != size || !got[0].ModTime().Equal(modTime) {
 				t.Fatalf("snapshot %d polluted canonical PUT verification: size=%d mtime=%v", i, got[0].GetSize(), got[0].ModTime())
 			}
-			if got[0].GetHash().GetHash(utils.ETag) != putRow.ETag {
+			canonical, ok := got[0].(*CanonicalObject)
+			if !ok || canonical.etag != putRow.ETag {
 				t.Fatalf("snapshot %d changed canonical ETag", i)
 			}
 		}
@@ -1129,7 +1130,7 @@ func TestCloudSyncTraceContractCanonicalAuthority(t *testing.T) {
 
 func TestProviderListingUnexpectedNameIsDivergentEvidence(t *testing.T) {
 	allowed := map[string]struct{}{
-		"known.bin": {},
+		"known.bin":   {},
 		"pending.bin": {},
 	}
 	if providerListingHasUnexpectedName([]model.Obj{
