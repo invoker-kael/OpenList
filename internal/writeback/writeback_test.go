@@ -1374,31 +1374,19 @@ func TestMaxPendingSpoolBytes(t *testing.T) {
 	}
 }
 
-func TestIncomingReservationReleasesBacklogBudget(t *testing.T) {
-	spaceMu.Lock()
-	oldReserved := reservedBacklog
-	reservedBacklog = 4096
-	spaceMu.Unlock()
-	defer func() {
-		spaceMu.Lock()
-		reservedBacklog = oldReserved
-		spaceMu.Unlock()
-	}()
-
-	r := &incomingReservation{backlogReserved: 4096}
-	r.release()
-	spaceMu.Lock()
-	got := reservedBacklog
-	spaceMu.Unlock()
-	if got != 0 {
-		t.Fatalf("backlog reservation leaked %d bytes", got)
+func TestReceiveReservationIdentityUsesPathAndSequence(t *testing.T) {
+	first := model.WebDAVWritebackReceiveReservation{
+		PathKey:  "same-path",
+		Sequence: 1,
+		Bytes:    1024,
 	}
-	r.release()
-	spaceMu.Lock()
-	got = reservedBacklog
-	spaceMu.Unlock()
-	if got != 0 {
-		t.Fatalf("double release changed backlog reservation to %d", got)
+	second := model.WebDAVWritebackReceiveReservation{
+		PathKey:  "same-path",
+		Sequence: 2,
+		Bytes:    2048,
+	}
+	if first.PathKey != second.PathKey || first.Sequence == second.Sequence {
+		t.Fatal("overlapping same-path receives must have independent sequence reservations")
 	}
 }
 

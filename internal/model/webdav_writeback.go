@@ -66,6 +66,26 @@ type WebDAVWritebackReceiveFence struct {
 	UpdatedAt             time.Time  `json:"updated_at"`
 }
 
+// WebDAVWritebackAdmissionFence serializes backlog admission across OpenList
+// instances. The singleton row is only a transaction lock.
+type WebDAVWritebackAdmissionFence struct {
+	ID        uint      `json:"id" gorm:"primaryKey"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// WebDAVWritebackReceiveReservation tracks one in-flight PUT's logical backlog
+// reservation. Sequence ownership makes overlapping same-path receives safe.
+type WebDAVWritebackReceiveReservation struct {
+	ID         uint      `json:"id" gorm:"primaryKey"`
+	PathKey    string    `json:"path_key" gorm:"size:64;uniqueIndex:idx_webdav_writeback_receive_reservation,priority:1"`
+	Sequence   uint64    `json:"sequence" gorm:"uniqueIndex:idx_webdav_writeback_receive_reservation,priority:2"`
+	Bytes      uint64    `json:"bytes"`
+	LeaseUntil time.Time `json:"lease_until" gorm:"index"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
 // WebDAVProviderOperation is a durable intent around synchronous provider
 // COPY/MOVE mutations. It closes the gap between a successful remote mutation
 // and the MySQL transaction that reconciles canonical WebDAV metadata.

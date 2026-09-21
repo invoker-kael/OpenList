@@ -2086,8 +2086,8 @@ func spoolBacklogAdmissionWeight(expected int64) uint64 {
 	return 0
 }
 
-func pendingSpoolBacklogBytes(excludePath string) (uint64, error) {
-	query := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+func pendingSpoolBacklogBytes(tx *gorm.DB, excludePath string) (uint64, error) {
+	query := tx.Model(&model.WebDAVWritebackObject{}).
 		Select("COALESCE(SUM(size), 0) AS bytes").
 		Where("spool_path <> ''").
 		Where("state IN ?", []string{StateQueued, StateFailed, StateUploading, StateVerifying})
@@ -2106,6 +2106,45 @@ func pendingSpoolBacklogBytes(excludePath string) (uint64, error) {
 	return uint64(result.Bytes), nil
 }
 
+func activeReceiveBacklogBytes(tx *gorm.DB, now time.Time) (uint64, error) {
+	var result struct {
+		Bytes uint64 `gorm:"column:bytes"`
+	}
+	err := tx.Model(&model.WebDAVWritebackReceiveReservation{}).
+		Select("COALESCE(SUM(bytes), 0) AS bytes").
+		Where("lease_until > ?", now).
+		Scan(&result).Error
+	return result.Bytes, err
+}
+
+func durableBacklogAdmissionCurrent(tx *gorm.DB, excludePath string, now time.Time) (uint64, error) {
+	pending, err := pendingSpoolBacklogBytes(tx, excludePath)
+	if err != nil {
+		return 0, err
+	}
+	receiving, err := activeReceiveBacklogBytes(tx, now)
+	if err != nil {
+		return 0, err
+	}
+	current, ok := spoolBacklogAdmissionCurrent(pending, receiving)
+	if !ok {
+		return ^uint64(0), nil
+	}
+	return current, nil
+}
+
+func lockAdmissionFence(tx *gorm.DB) error {
+	seed := model.WebDAVWritebackAdmissionFence{ID: 1}
+	if err := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoNothing: true,
+	}).Create(&seed).Error; err != nil {
+		return err
+	}
+	var fence model.WebDAVWritebackAdmissionFence
+	return tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&fence, 1).Error
+}
+
 type receivingPathState struct {
 	active int
 }
@@ -2118,45 +2157,13 @@ type receivingSession struct {
 var (
 	spaceMu          sync.Mutex
 	reservedIncoming uint64
-	reservedBacklog  uint64
 	receivingMu      sync.Mutex
 	receivingPaths   = make(map[string]*receivingPathState)
 )
 
 type incomingReservation struct {
-	remaining       uint64
-	backlogReserved uint64
-	released        bool
-}
-
-func (r *incomingReservation) reserveBacklog(p string, expected int64) error {
-	if r == nil {
-		return nil
-	}
-	limit := maxPendingSpoolBytes()
-	if limit == 0 {
-		return nil
-	}
-
-	spaceMu.Lock()
-	defer spaceMu.Unlock()
-
-	pending, err := pendingSpoolBacklogBytes(p)
-	if err != nil {
-		return err
-	}
-	current, ok := spoolBacklogAdmissionCurrent(pending, reservedBacklog)
-	if !ok || current >= limit {
-		return &SpoolCapacityError{Backlog: current, BacklogLimit: limit}
-	}
-
-	weight := spoolBacklogAdmissionWeight(expected)
-	if weight > ^uint64(0)-reservedBacklog {
-		return &SpoolCapacityError{Backlog: ^uint64(0), BacklogLimit: limit}
-	}
-	reservedBacklog += weight
-	r.backlogReserved = weight
-	return nil
+	remaining uint64
+	released  bool
 }
 
 func completedSpoolPressureReclaimEnabled() bool {
@@ -2316,29 +2323,18 @@ func (r *incomingReservation) release() {
 	} else {
 		reservedIncoming -= r.remaining
 	}
-	if r.backlogReserved > reservedBacklog {
-		reservedBacklog = 0
-	} else {
-		reservedBacklog -= r.backlogReserved
-	}
 	r.remaining = 0
-	r.backlogReserved = 0
 	r.released = true
 }
 
-func reserveIncomingBytesForPath(p string, expected int64) (*incomingReservation, error) {
+func reserveIncomingBytes(expected int64) (*incomingReservation, error) {
 	reservation := &incomingReservation{}
-	if err := reservation.reserveBacklog(p, expected); err != nil {
-		return nil, err
-	}
-
 	var initial uint64
 	switch {
 	case expected > 0:
 		initial = uint64(expected)
 	case expected == 0:
 		if err := reservation.verifyCapacity(); err != nil {
-			reservation.release()
 			return nil, err
 		}
 		return reservation, nil
@@ -2346,14 +2342,9 @@ func reserveIncomingBytesForPath(p string, expected int64) (*incomingReservation
 		initial = incomingReservationChunkBytes()
 	}
 	if err := reservation.grow(initial); err != nil {
-		reservation.release()
 		return nil, err
 	}
 	return reservation, nil
-}
-
-func reserveIncomingBytes(expected int64) (*incomingReservation, error) {
-	return reserveIncomingBytesForPath("", expected)
 }
 
 func beginReceiving(p string) (*receivingSession, func()) {
@@ -2410,6 +2401,24 @@ func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64
 	now := time.Now()
 	leaseUntil := now.Add(receiveLeaseDuration)
 	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAdmissionFence(tx); err != nil {
+			return err
+		}
+		if err := tx.Where("lease_until <= ?", now).Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
+			return err
+		}
+
+		limit := maxPendingSpoolBytes()
+		if limit > 0 {
+			current, err := durableBacklogAdmissionCurrent(tx, p, now)
+			if err != nil {
+				return err
+			}
+			if current >= limit {
+				return &SpoolCapacityError{Backlog: current, BacklogLimit: limit}
+			}
+		}
+
 		fence, err := lockOrCreateReceiveFence(tx, p)
 		if err != nil {
 			return err
@@ -2428,7 +2437,7 @@ func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64
 		fence.ReceiveState = CanonicalStateReceiving
 		fence.ReceiveUpdatedAt = &now
 		sequence = fence.NextSequence
-		return tx.Model(&model.WebDAVWritebackReceiveFence{}).
+		if err := tx.Model(&model.WebDAVWritebackReceiveFence{}).
 			Where("id = ?", fence.ID).
 			Updates(map[string]any{
 				"path":                 p,
@@ -2439,26 +2448,50 @@ func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64
 				"receive_lease_until":  &leaseUntil,
 				"receive_state":        CanonicalStateReceiving,
 				"receive_updated_at":   &now,
-			}).Error
+			}).Error; err != nil {
+			return err
+		}
+
+		if limit == 0 {
+			return nil
+		}
+		reservation := model.WebDAVWritebackReceiveReservation{
+			PathKey:    pathKey(p),
+			Sequence:   sequence,
+			Bytes:      spoolBacklogAdmissionWeight(expected),
+			LeaseUntil: leaseUntil,
+		}
+		return tx.Create(&reservation).Error
 	})
 	return sequence, err
 }
 
-func heartbeatReceiveSequence(ctx context.Context, p string) {
+func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64) {
 	now := time.Now()
 	leaseUntil := now.Add(receiveLeaseDuration)
-	_ = db.GetDb().WithContext(ctx).
-		Model(&model.WebDAVWritebackReceiveFence{}).
-		Where("path_key = ? AND active_receivers > 0", pathKey(p)).
-		Updates(map[string]any{
-			"receive_lease_until": &leaseUntil,
-			"receive_state":       CanonicalStateReceiving,
-			"receive_updated_at":  &now,
-		}).Error
+	_ = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.WebDAVWritebackReceiveFence{}).
+			Where("path_key = ? AND active_receivers > 0", pathKey(p)).
+			Updates(map[string]any{
+				"receive_lease_until": &leaseUntil,
+				"receive_state":       CanonicalStateReceiving,
+				"receive_updated_at":  &now,
+			}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.WebDAVWritebackReceiveReservation{}).
+			Where("path_key = ? AND sequence = ?", pathKey(p), sequence).
+			Update("lease_until", leaseUntil).Error
+	})
 }
 
-func endReceiveSequence(ctx context.Context, p string) {
+func endReceiveSequence(ctx context.Context, p string, sequence uint64) {
 	_ = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("path_key = ? AND sequence = ?", pathKey(p), sequence).
+			Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
+			return err
+		}
+
 		var fence model.WebDAVWritebackReceiveFence
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("path_key = ?", pathKey(p)).
@@ -2715,13 +2748,13 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		return nil, false, err
 	}
 	receiveCtx := durableCommitContext(ctx)
-	defer endReceiveSequence(receiveCtx, p)
+	defer endReceiveSequence(receiveCtx, p, receiveSequence)
 	spoolDir := conf.Conf.WebDAVWriteback.SpoolDir
 	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
 		return nil, false, err
 	}
 
-	reservation, err := reserveIncomingBytesForPath(p, expected)
+	reservation, err := reserveIncomingBytes(expected)
 	if err != nil {
 		return nil, false, err
 	}
@@ -2741,7 +2774,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	}()
 
 	actualSize, payloadSHA1, err := copyToSpool(tmp, body, expected, reservation, func() {
-		heartbeatReceiveSequence(receiveCtx, p)
+		heartbeatReceiveSequence(receiveCtx, p, receiveSequence)
 	})
 	if err != nil {
 		if expected >= 0 {
@@ -4791,6 +4824,11 @@ func Stop() {
 }
 
 func (m *workerManager) recoverInterrupted() error {
+	if err := db.GetDb().Where("lease_until <= ?", time.Now()).
+		Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
+		return err
+	}
+
 	// Backfill the client-visible lifecycle for rows created before the ACK-state
 	// split. This does not change the existing provider replication State.
 	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
