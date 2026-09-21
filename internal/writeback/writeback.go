@@ -6692,7 +6692,7 @@ func (m *workerManager) processReplicaMove(row *model.WebDAVWritebackObject) {
 	}
 
 	requireHash := providerRequiresPayloadHash(row.Path)
-	remote, verifyErr := m.remoteForVerify(row, requireHash)
+	remote, verifyErr := m.remoteForVerify(row, requireHash, false)
 	verification := classifyRemoteVerification(row, remote, verifyErr, requireHash)
 	switch verification {
 	case remoteVerificationMatch:
@@ -6798,7 +6798,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 	requireHash := providerRequiresPayloadHash(row.Path)
 	if row.RetryCount > 0 {
-		remote, verifyErr := m.remoteForVerify(row, requireHash)
+		remote, verifyErr := m.remoteForVerify(row, requireHash, false)
 		verification := classifyRemoteVerification(row, remote, verifyErr, requireHash)
 		if verification == remoteVerificationMatch {
 			m.completeRemoteVerification(row, remote, []string{StateQueued}, requireHash)
@@ -7043,6 +7043,10 @@ func providerRepairNeedsVerification(state remoteVerificationState) bool {
 	return state == remoteVerificationInconclusive
 }
 
+func shouldBatchVerificationSiblings(currentState string, requireHash bool) bool {
+	return requireHash && currentState == StateVerifying
+}
+
 const verificationSiblingBatchLimit = 64
 
 type verificationBatchMatch struct {
@@ -7095,7 +7099,7 @@ func (m *workerManager) completeMatchingVerifySiblings(trigger *model.WebDAVWrit
 	}
 }
 
-func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject, requireHash bool) (model.Obj, error) {
+func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject, requireHash, batchSiblings bool) (model.Obj, error) {
 	if requireHash {
 		// 115 directory listings already carry size and SHA-1. Use one fresh
 		// parent snapshot as the verification authority instead of issuing a
@@ -7105,7 +7109,9 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject, requir
 		if listErr != nil {
 			return nil, listErr
 		}
-		m.completeMatchingVerifySiblings(row, objs, true)
+		if batchSiblings {
+			m.completeMatchingVerifySiblings(row, objs, true)
+		}
 		return exactRemoteByName(objs, row.Name), nil
 	}
 
@@ -7193,7 +7199,7 @@ func verifyingUpdates(currentState string, updates map[string]any) map[string]an
 }
 
 func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObject, currentState string, requireHash bool) {
-	remote, err := m.remoteForVerify(row, requireHash)
+	remote, err := m.remoteForVerify(row, requireHash, shouldBatchVerificationSiblings(currentState, requireHash))
 	verification := classifyRemoteVerification(row, remote, err, requireHash)
 	if verification == remoteVerificationMatch {
 		if m.completeRemoteVerification(row, remote, []string{currentState}, requireHash) {

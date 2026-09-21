@@ -90,6 +90,21 @@ func TestMatchingVerificationRowsUsesOneParentSnapshot(t *testing.T) {
 	}
 }
 
+func TestVerificationSiblingBatchingOnlyRunsInVerifyState(t *testing.T) {
+	if shouldBatchVerificationSiblings(StateUploading, true) {
+		t.Fatal("normal post-upload verification must not scan sibling rows")
+	}
+	if shouldBatchVerificationSiblings(StateQueued, true) {
+		t.Fatal("retry preflight must not scan sibling rows")
+	}
+	if shouldBatchVerificationSiblings(StateVerifying, false) {
+		t.Fatal("non-hash providers do not use parent-list sibling batching")
+	}
+	if !shouldBatchVerificationSiblings(StateVerifying, true) {
+		t.Fatal("115 VERIFYING worker should reuse its fresh parent snapshot for siblings")
+	}
+}
+
 func TestWritebackParentStateIndex(t *testing.T) {
 	typ := reflect.TypeOf(model.WebDAVWritebackObject{})
 	for _, fieldName := range []string{"ParentKey", "State"} {
