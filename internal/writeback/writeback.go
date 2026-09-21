@@ -5383,8 +5383,29 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	if row.RetryCount > 0 {
 		requireHash := providerRequiresPayloadHash(row.Path)
 		remote, verifyErr := m.remoteForVerify(row)
-		if verifyErr == nil && remoteMatchesCanonical(row, remote, requireHash) {
+		verification := classifyRemoteVerification(row, remote, verifyErr, requireHash)
+		if verification == remoteVerificationMatch {
 			m.completeRemoteVerification(row, remote, []string{StateQueued, StateFailed})
+			return
+		}
+		if providerRepairNeedsVerification(verification) {
+			next := time.Now().Add(remoteVerificationInconclusiveDelay())
+			msg := "provider retry probe is inconclusive; entering verification without reupload"
+			if verifyErr != nil {
+				msg = fmt.Sprintf("provider retry probe is inconclusive: %v", verifyErr)
+			} else if remote != nil && requireHash && remote.GetSize() == row.Size &&
+				remote.GetHash().GetHash(utils.SHA1) == "" {
+				msg = "provider retry probe sees matching size but required 115 SHA-1 is unavailable; entering verification without reupload"
+			}
+			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+				Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
+				Updates(map[string]any{
+					"state":             StateVerifying,
+					"remote_sync_state": StateVerifying,
+					"retry_at":          &next,
+					"verify_count":      0,
+					"last_error":        msg,
+				}).Error
 			return
 		}
 	}
@@ -5613,6 +5634,10 @@ func remoteVerificationInconclusiveDelay() time.Duration {
 	// a bounded cadence for providers that eventually populate hashes.
 	seconds := max(verifySeconds, min(retrySeconds, 30))
 	return time.Duration(seconds) * time.Second
+}
+
+func providerRepairNeedsVerification(state remoteVerificationState) bool {
+	return state == remoteVerificationInconclusive
 }
 
 const verificationSiblingBatchLimit = 64
@@ -5862,12 +5887,18 @@ func remoteListContainsName(objs []model.Obj, name string) bool {
 }
 
 func (m *workerManager) remoteDeleteAbsent(row *model.WebDAVWritebackObject) (bool, error) {
-	remote, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true})
-	if getErr == nil && remote != nil {
-		return false, nil
-	}
-	if getErr != nil && !errs.IsObjectNotFound(getErr) {
-		return false, getErr
+	// 115 directory listings are already the verification authority used by the
+	// upload path and are single-flighted per parent. After a successful DELETE,
+	// skip the redundant per-object GET so sibling tombstones can share one
+	// refreshed parent snapshot instead of producing GET+LIST pairs.
+	if !providerRequiresPayloadHash(row.Path) {
+		remote, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true})
+		if getErr == nil && remote != nil {
+			return false, nil
+		}
+		if getErr != nil && !errs.IsObjectNotFound(getErr) {
+			return false, getErr
+		}
 	}
 
 	objs, listErr := m.refreshParent(row.Parent)
@@ -5881,6 +5912,48 @@ func (m *workerManager) remoteDeleteAbsent(row *model.WebDAVWritebackObject) (bo
 		return false, listErr
 	}
 	return !remoteListContainsName(objs, row.Name), nil
+}
+
+func ancestorPathKeys(p string) []string {
+	p = utils.FixAndCleanPath(p)
+	parent := path.Dir(p)
+	if parent == p || parent == "." {
+		return nil
+	}
+	keys := make([]string, 0, 4)
+	for {
+		keys = append(keys, pathKey(parent))
+		if parent == "/" {
+			break
+		}
+		next := path.Dir(parent)
+		if next == parent || next == "." {
+			break
+		}
+		parent = next
+	}
+	return keys
+}
+
+func deletedAncestorExists(p string) (bool, error) {
+	keys := ancestorPathKeys(p)
+	if len(keys) == 0 {
+		return false, nil
+	}
+	var count int64
+	err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("path_key IN ? AND state = ?", keys, StateDeleted).
+		Limit(1).
+		Count(&count).Error
+	return count > 0, err
+}
+
+func deleteAncestorWaitDelay() time.Duration {
+	seconds := 2
+	if conf.Conf != nil {
+		seconds = max(seconds, max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)*2)
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func collectConfirmedTombstoneSubtree(root *model.WebDAVWritebackObject, rows []model.WebDAVWritebackObject) (ids []uint, spoolPaths []string, valid bool) {
@@ -5958,6 +6031,22 @@ func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 		return
 	}
 	if current.Generation != row.Generation || !canonicalDeleted(&current) {
+		return
+	}
+
+	ancestorDeleted, ancestorErr := deletedAncestorExists(row.Path)
+	if ancestorErr != nil {
+		m.failDeleted(row, ancestorErr)
+		return
+	}
+	if ancestorDeleted {
+		next := time.Now().Add(deleteAncestorWaitDelay())
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateDeleted).
+			Updates(map[string]any{
+				"retry_at":   &next,
+				"last_error": "waiting for deleted ancestor to remove provider subtree",
+			}).Error
 		return
 	}
 

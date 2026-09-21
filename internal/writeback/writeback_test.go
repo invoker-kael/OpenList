@@ -2124,6 +2124,18 @@ func TestRepeatedLargeProviderVerifyDelayUsesRetryMaxFloor(t *testing.T) {
 	}
 }
 
+func TestProviderRepairInconclusiveNeverRetransmitsImmediately(t *testing.T) {
+	if !providerRepairNeedsVerification(remoteVerificationInconclusive) {
+		t.Fatal("inconclusive retry evidence must re-enter verification instead of reuploading")
+	}
+	if providerRepairNeedsVerification(remoteVerificationMatch) {
+		t.Fatal("matching retry evidence should complete directly")
+	}
+	if providerRepairNeedsVerification(remoteVerificationDivergent) {
+		t.Fatal("conclusive divergence may proceed to the bounded repair upload path")
+	}
+}
+
 func TestRemoteVerificationInconclusiveDelayReducesProviderPolling(t *testing.T) {
 	oldConf := conf.Conf
 	defer func() { conf.Conf = oldConf }()
@@ -2377,6 +2389,33 @@ func TestRefreshUnknownProviderOverwrite(t *testing.T) {
 	}
 	if row.CompletedAt == nil || !row.CompletedAt.Equal(now) {
 		t.Fatal("unknown provider overwrite must receive a fresh consistency grace")
+	}
+}
+
+func TestAncestorPathKeysUseExactBoundaries(t *testing.T) {
+	got := ancestorPathKeys("/a/b/file.bin")
+	want := []string{pathKey("/a/b"), pathKey("/a"), pathKey("/")}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ancestor keys=%v, want %v", got, want)
+	}
+	if got := ancestorPathKeys("/"); len(got) != 0 {
+		t.Fatalf("root must not have ancestors: %v", got)
+	}
+	if got := ancestorPathKeys("/a"); !reflect.DeepEqual(got, []string{pathKey("/")}) {
+		t.Fatalf("single-level ancestors=%v", got)
+	}
+}
+
+func TestDeleteAncestorWaitDelayTracksVerificationCadence(t *testing.T) {
+	oldConf := conf.Conf
+	defer func() { conf.Conf = oldConf }()
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyIntervalSeconds: 5}}
+	if got := deleteAncestorWaitDelay(); got != 10*time.Second {
+		t.Fatalf("ancestor wait=%v, want 10s", got)
+	}
+	conf.Conf.WebDAVWriteback.VerifyIntervalSeconds = 0
+	if got := deleteAncestorWaitDelay(); got != 2*time.Second {
+		t.Fatalf("minimum ancestor wait=%v, want 2s", got)
 	}
 }
 
