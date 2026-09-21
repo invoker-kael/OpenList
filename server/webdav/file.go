@@ -411,13 +411,14 @@ func walkFS(ctx context.Context, depth int, name string, info model.Obj, walkFn 
 	objs, err := fs.List(listCtx, name, &fs.ListArgs{})
 	if writeback.Enabled() {
 		remoteReliable := err == nil
-		overlaid, hasWriteback, canonicalParent, overlayErr := writeback.OverlayListState(listCtx, name, objs, remoteReliable)
+		_, canonicalParent := info.(*writeback.CanonicalObject)
+		overlaid, hasWriteback, overlayErr := writeback.OverlayListChildren(listCtx, name, objs, remoteReliable)
 		if overlayErr != nil {
 			return walkFn(name, info, overlayErr)
 		}
 		// A just-created canonical directory is a valid empty collection even
-		// before an eventually-consistent provider can list it. This is needed
-		// for Cloud Sync's immediate MKCOL -> PROPFIND directory scan.
+		// before an eventually-consistent provider can list it. Reuse the parent
+		// object already resolved by PROPFIND instead of re-reading its DB row.
 		if remoteReliable || hasWriteback || canonicalParent {
 			objs = overlaid
 			err = nil

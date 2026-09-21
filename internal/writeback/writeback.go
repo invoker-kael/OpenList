@@ -1967,17 +1967,32 @@ func splitOverlayRows(parent, parentKey string, candidates []model.WebDAVWriteba
 	return rows, canonicalParent
 }
 
+const overlaySelectColumns = "id, path_key, parent_key, path, name, is_dir, size, mod_time, create_time, etag, canonical_state, state"
+
 func loadOverlayRows(parent string) ([]model.WebDAVWritebackObject, bool, error) {
 	parent = utils.FixAndCleanPath(parent)
 	key := pathKey(parent)
 	var candidates []model.WebDAVWritebackObject
 	if err := db.GetDb().
+		Select(overlaySelectColumns).
 		Where("parent_key = ? OR path_key = ?", key, key).
 		Find(&candidates).Error; err != nil {
 		return nil, false, err
 	}
 	rows, canonicalParent := splitOverlayRows(parent, key, candidates)
 	return rows, canonicalParent, nil
+}
+
+func loadOverlayChildRows(parent string) ([]model.WebDAVWritebackObject, error) {
+	parent = utils.FixAndCleanPath(parent)
+	var rows []model.WebDAVWritebackObject
+	if err := db.GetDb().
+		Select(overlaySelectColumns).
+		Where("parent_key = ?", pathKey(parent)).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 func overlayRowsNeedProviderOperationProtection(rows []model.WebDAVWritebackObject, remoteReliable bool, now time.Time) bool {
@@ -2000,6 +2015,22 @@ func overlayRowsNeedProviderOperationProtection(rows []model.WebDAVWritebackObje
 		}
 	}
 	return false
+}
+
+// OverlayListChildren overlays only the known directory's children. WebDAV
+// traversal already owns the parent object, so re-reading the canonical parent
+// row would add an unnecessary MySQL round trip and an OR predicate to the
+// dominant Cloud Sync PROPFIND path.
+func OverlayListChildren(ctx context.Context, parent string, remote []model.Obj, remoteReliable bool) ([]model.Obj, bool, error) {
+	if !Enabled() {
+		return remote, false, nil
+	}
+	parent = utils.FixAndCleanPath(parent)
+	rows, err := loadOverlayChildRows(parent)
+	if err != nil {
+		return nil, false, err
+	}
+	return overlayListRows(ctx, parent, remote, remoteReliable, rows)
 }
 
 // OverlayList replaces remote objects with their canonical WebDAV metadata and
