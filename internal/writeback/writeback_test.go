@@ -1237,7 +1237,7 @@ func TestCompletedCanonicalReconcileDueIsBackgroundOnly(t *testing.T) {
 
 	now := time.Now()
 	completed := now.Add(-2 * time.Minute)
-	staleVerified := now.Add(-10 * time.Minute)
+	staleVerified := now.Add(-40 * time.Minute)
 	freshVerified := now.Add(-time.Minute)
 
 	staleFile := &model.WebDAVWritebackObject{

@@ -411,7 +411,6 @@ func walkFS(ctx context.Context, depth int, name string, info model.Obj, walkFn 
 	// snapshots are refreshed once and coalesced by parent.
 	listCtx := context.WithValue(ctx, conf.MetaKey, meta)
 	var objs []model.Obj
-	var err error
 	if writeback.Enabled() {
 		objs, _, err = writeback.ProviderListForWebDAV(listCtx, name)
 	} else {
