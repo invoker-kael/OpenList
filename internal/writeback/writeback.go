@@ -390,11 +390,23 @@ func providerOperationProtectsCanonicalPath(ops []model.WebDAVProviderOperation,
 	return false
 }
 
+func activeProviderOperationQuery(now time.Time) *gorm.DB {
+	preparedCutoff := now.Add(-providerOperationPreparedAbandonAfter)
+	return db.GetDb().
+		Where("state IN ?", []string{
+			ProviderOperationPrepared,
+			ProviderOperationStarted,
+			ProviderOperationFailed,
+			ProviderOperationApplied,
+		}).
+		Where("state <> ? OR updated_at > ?", ProviderOperationPrepared, preparedCutoff)
+}
+
 func activeProviderOperations() ([]model.WebDAVProviderOperation, error) {
 	var ops []model.WebDAVProviderOperation
-	// Protection checks only need routing/fence fields. Avoid pulling the
-	// operation's large recovery snapshots and TEXT errors on every PROPFIND.
-	if err := db.GetDb().
+	// Protection checks only need routing/fence fields. Filter inactive and
+	// abandoned intents in SQL and avoid loading recovery snapshots/TEXT errors.
+	if err := activeProviderOperationQuery(time.Now()).
 		Select("method", "source_path", "destination_path", "depth", "state", "created_at", "updated_at").
 		Order("updated_at asc").
 		Find(&ops).Error; err != nil {
@@ -408,14 +420,12 @@ func ProviderOperationConflict(method, src, dst string, depth int) (*model.WebDA
 		return nil, nil
 	}
 	var ops []model.WebDAVProviderOperation
-	if err := db.GetDb().Order("updated_at asc").Find(&ops).Error; err != nil {
+	if err := activeProviderOperationQuery(time.Now()).
+		Order("updated_at asc").
+		Find(&ops).Error; err != nil {
 		return nil, err
 	}
-	now := time.Now()
 	for i := range ops {
-		if providerOperationPreparedExpired(&ops[i], now) {
-			continue
-		}
 		if providerOperationsConflict(&ops[i], method, src, dst, depth) {
 			return &ops[i], nil
 		}
@@ -429,14 +439,12 @@ func ProviderOperationPathConflict(p string) (*model.WebDAVProviderOperation, er
 	}
 	p = utils.FixAndCleanPath(p)
 	var ops []model.WebDAVProviderOperation
-	if err := db.GetDb().Order("updated_at asc").Find(&ops).Error; err != nil {
+	if err := activeProviderOperationQuery(time.Now()).
+		Order("updated_at asc").
+		Find(&ops).Error; err != nil {
 		return nil, err
 	}
-	now := time.Now()
 	for i := range ops {
-		if providerOperationPreparedExpired(&ops[i], now) {
-			continue
-		}
 		if providerOperationTouchesPath(&ops[i], p) {
 			return &ops[i], nil
 		}
@@ -2574,6 +2582,10 @@ func receiveFenceActive(fence *model.WebDAVWritebackReceiveFence, now time.Time)
 		now.Before(*fence.ReceiveLeaseUntil)
 }
 
+func receiveAdmissionNeedsGlobalFence(limit uint64) bool {
+	return limit > 0
+}
+
 func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64, error) {
 	p = utils.FixAndCleanPath(p)
 	// Most Cloud Sync duplicate retries hit the same OpenList instance. Reject
@@ -2587,12 +2599,12 @@ func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64
 	var sequence uint64
 	now := time.Now()
 	leaseUntil := now.Add(receiveLeaseDuration)
+	limit := maxPendingSpoolBytes()
 	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := lockAdmissionFence(tx); err != nil {
-			return err
-		}
-		if err := tx.Where("lease_until <= ?", now).Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
-			return err
+		if receiveAdmissionNeedsGlobalFence(limit) {
+			if err := lockAdmissionFence(tx); err != nil {
+				return err
+			}
 		}
 
 		fence, err := lockOrCreateReceiveFence(tx, p)
@@ -2613,7 +2625,6 @@ func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64
 			fence.ActiveReceivers = 0
 		}
 
-		limit := maxPendingSpoolBytes()
 		if limit > 0 {
 			current, err := durableBacklogAdmissionCurrent(tx, p, now)
 			if err != nil {
@@ -2744,12 +2755,15 @@ func startReceiveLeaseHeartbeat(ctx context.Context, p string, sequence uint64, 
 }
 
 func endReceiveSequence(ctx context.Context, p string, sequence uint64) {
+	backlogLimited := receiveAdmissionNeedsGlobalFence(maxPendingSpoolBytes())
 	_ = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Serialize reservation release with admission/progress updates. Without
-		// the same fence, a concurrent PUT can observe a reservation that this
-		// receive has already finished and return a needless 507 retry.
-		if err := lockAdmissionFence(tx); err != nil {
-			return err
+		// Reservation release only needs the global admission fence when backlog
+		// accounting is active. Without a configured high-water mark, same-path
+		// fencing is sufficient and unrelated PUT completions stay independent.
+		if backlogLimited {
+			if err := lockAdmissionFence(tx); err != nil {
+				return err
+			}
 		}
 		if err := tx.Where("path_key = ? AND sequence = ?", pathKey(p), sequence).
 			Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
@@ -5257,6 +5271,14 @@ func cleanupExpiredLockNull(now time.Time) {
 	}
 }
 
+func cleanupExpiredReceiveReservations(now time.Time) {
+	if err := db.GetDb().
+		Where("lease_until <= ?", now).
+		Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
+		log.Errorf("write-back expired receive reservation cleanup failed: %v", err)
+	}
+}
+
 func (m *workerManager) scheduler() {
 	ticker := time.NewTicker(2 * time.Second)
 	providerTicker := time.NewTicker(providerOperationMaintenanceEvery)
@@ -5274,7 +5296,8 @@ func (m *workerManager) scheduler() {
 			cleanupExpiredLockNull(now)
 		case <-providerTicker.C:
 			m.maintainProviderOperations()
-		case <-cleanupTicker.C:
+		case now := <-cleanupTicker.C:
+			cleanupExpiredReceiveReservations(now)
 			m.cleanupCompleted()
 		}
 	}
@@ -5324,6 +5347,33 @@ func fairDispatchFiles(rows []model.WebDAVWritebackObject) []model.WebDAVWriteba
 	return out
 }
 
+func filterDispatchExcludedIDs(rows []model.WebDAVWritebackObject, excludedIDs []uint, limit int) []model.WebDAVWritebackObject {
+	if len(rows) == 0 || limit <= 0 {
+		return nil
+	}
+	if len(excludedIDs) == 0 {
+		if len(rows) > limit {
+			return rows[:limit]
+		}
+		return rows
+	}
+	excluded := make(map[uint]struct{}, len(excludedIDs))
+	for _, id := range excludedIDs {
+		excluded[id] = struct{}{}
+	}
+	filtered := rows[:0]
+	for i := range rows {
+		if _, skip := excluded[rows[i].ID]; skip {
+			continue
+		}
+		filtered = append(filtered, rows[i])
+		if len(filtered) >= limit {
+			break
+		}
+	}
+	return filtered
+}
+
 func loadDispatchClass(now time.Time, states []string, isDir *bool, excludedIDs []uint, limit int) ([]model.WebDAVWritebackObject, error) {
 	var rows []model.WebDAVWritebackObject
 	query := db.GetDb().
@@ -5332,16 +5382,21 @@ func loadDispatchClass(now time.Time, states []string, isDir *bool, excludedIDs 
 	if isDir != nil {
 		query = query.Where("is_dir = ?", *isDir)
 	}
-	if len(excludedIDs) > 0 {
-		query = query.Where("id NOT IN ?", excludedIDs)
-	}
+	// Keep the indexed dispatch predicate stable. A dynamic NOT IN list changes
+	// SQL shape every wake and can degrade the queue index plan. Overfetch by the
+	// tiny inflight set, then remove those IDs in memory; LoadOrStore remains the
+	// final race-safe claim.
+	scanLimit := max(1, limit+len(excludedIDs))
 	err := query.
 		Order("retry_at asc").
 		Order("updated_at asc").
 		Order("id asc").
-		Limit(max(1, limit)).
+		Limit(scanLimit).
 		Find(&rows).Error
-	return rows, err
+	if err != nil {
+		return nil, err
+	}
+	return filterDispatchExcludedIDs(rows, excludedIDs, limit), nil
 }
 
 func appendDispatchRows(rows, incoming []model.WebDAVWritebackObject, remaining int) ([]model.WebDAVWritebackObject, int) {

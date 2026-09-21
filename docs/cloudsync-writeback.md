@@ -355,3 +355,12 @@ Provider-operation maintenance now treats PREPARED as request-owned until its ab
 Shared spool cleanup now batches reference checks through one helper. Confirmed directory tombstone cleanup releases descendant spool paths with one database reference lookup instead of one COUNT per payload, and completed-cache cleanup reuses the same path.
 
 Startup orphan cleanup now builds only the on-disk .data candidate set and streams the spool_path column from MySQL, pruning live references as rows arrive. It no longer materializes all referenced write-back rows in memory before deciding which local spool files are orphaned.
+
+
+### Fewer steps with stronger decision boundaries
+
+The receive path now acquires the singleton admission fence only when `max_pending_spool_mb` actually enables cross-request backlog accounting. With the limit disabled, PUT admission and completion use only the same-path durable receive fence, removing a global MySQL serialization point without weakening same-path sequencing. Expired receive reservations are ignored by backlog SUM queries already, so their physical deletion moved out of every PUT and into periodic maintenance.
+
+Dispatch no longer emits a variable `id NOT IN (...)` predicate for the current in-flight worker set. It overfetchs by the small in-flight count, applies the exclusion in memory, and keeps `LoadOrStore` as the final claim. This preserves the ready window while giving MySQL one stable indexed queue-query shape.
+
+Provider-operation protection/conflict scans now share one active-intent query. Abandoned PREPARED rows and non-lifecycle states are filtered in SQL before protection checks, while STARTED/FAILED/APPLIED and fresh PREPARED intents retain the same safety semantics. This reduces rows and duplicate filtering while making the active-intent definition consistent across WebDAV paths.

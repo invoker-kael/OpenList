@@ -164,6 +164,22 @@ func TestAppendDispatchRowsHonorsQueueBudget(t *testing.T) {
 	}
 }
 
+func TestFilterDispatchExcludedIDsPreservesReadyWindow(t *testing.T) {
+	rows := []model.WebDAVWritebackObject{
+		{ID: 1}, {ID: 2}, {ID: 3}, {ID: 4}, {ID: 5},
+	}
+	got := filterDispatchExcludedIDs(rows, []uint{2, 4}, 3)
+	want := []uint{1, 3, 5}
+	if len(got) != len(want) {
+		t.Fatalf("filtered dispatch len=%d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].ID != want[i] {
+			t.Fatalf("filtered dispatch id[%d]=%d, want %d", i, got[i].ID, want[i])
+		}
+	}
+}
+
 func TestWorkerManagerInflightIDsAreStable(t *testing.T) {
 	m := &workerManager{}
 	m.inflight.Store(uint(9), struct{}{})
@@ -330,6 +346,13 @@ func TestProviderOperationProtectsCanonicalPath(t *testing.T) {
 			CreatedAt:       now,
 			UpdatedAt:       now,
 		},
+		{
+			SourcePath:      "/expired/source",
+			DestinationPath: "/expired/destination",
+			State:           ProviderOperationPrepared,
+			CreatedAt:       now.Add(-time.Minute),
+			UpdatedAt:       now.Add(-providerOperationPreparedAbandonAfter - time.Second),
+		},
 	}
 	for _, p := range []string{"/src/album", "/src/album/a.jpg", "/dst/album", "/dst/album/sub/b.jpg"} {
 		if !providerOperationProtectsCanonicalPath(ops, p, now) {
@@ -338,6 +361,9 @@ func TestProviderOperationProtectsCanonicalPath(t *testing.T) {
 	}
 	if providerOperationProtectsCanonicalPath(ops, "/other/file.jpg", now) {
 		t.Fatal("unrelated canonical path must not be protected")
+	}
+	if providerOperationProtectsCanonicalPath(ops, "/expired/source/file.bin", now) {
+		t.Fatal("abandoned PREPARED intent must not protect canonical state")
 	}
 }
 
@@ -1568,6 +1594,15 @@ func TestReceiveHeartbeatAdmissionOnlyForUnknownProgress(t *testing.T) {
 		if got := receiveHeartbeatNeedsAdmission(tc.expected, tc.received, tc.backlogLimited); got != tc.want {
 			t.Fatalf("%s: admission=%v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestReceiveAdmissionGlobalFenceOnlyWithBacklogLimit(t *testing.T) {
+	if receiveAdmissionNeedsGlobalFence(0) {
+		t.Fatal("disabled backlog limit must not serialize unrelated PUT admissions")
+	}
+	if !receiveAdmissionNeedsGlobalFence(1) {
+		t.Fatal("enabled backlog accounting must keep the global admission fence")
 	}
 }
 
