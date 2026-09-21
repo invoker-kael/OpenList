@@ -346,3 +346,12 @@ LOCK-NULL expiry cleanup is no longer executed on every scheduler wake. Worker c
 DELETE dispatch now scans a bounded wider tombstone window, resolves all candidate ancestor keys with one indexed query, and sends only root tombstones to workers. Descendants under a live tombstone ancestor receive one batched retry deferral and are later removed by the existing confirmed subtree cleanup. The worker-side ancestor check remains as a race-safe guard.
 
 Provider COPY/MOVE maintenance now filters candidates in SQL before loading its 64-row recovery batch. APPLIED intents remain immediately eligible, expired PREPARED intents use a dedicated state+updated_at index, and other recovery work is selected only when last_checked_at is due. The existing Go due checks remain as a safety guard, but fresh intents no longer occupy the maintenance scan window.
+
+
+### Provider-intent and startup GC tightening
+
+Provider-operation maintenance now treats PREPARED as request-owned until its abandonment deadline. Recovery SQL only selects STARTED/FAILED rows whose last check is due, while APPLIED remains immediately eligible and expired PREPARED rows are retired. The loop also explicitly refuses recovery for fresh PREPARED rows, preventing maintenance from racing an in-flight COPY/MOVE if query logic changes later.
+
+Shared spool cleanup now batches reference checks through one helper. Confirmed directory tombstone cleanup releases descendant spool paths with one database reference lookup instead of one COUNT per payload, and completed-cache cleanup reuses the same path.
+
+Startup orphan cleanup now builds only the on-disk .data candidate set and streams the spool_path column from MySQL, pruning live references as rows arrive. It no longer materializes all referenced write-back rows in memory before deciding which local spool files are orphaned.

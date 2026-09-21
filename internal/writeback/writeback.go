@@ -1276,17 +1276,42 @@ func ProviderOperationMetadataApplied(op *model.WebDAVProviderOperation) (bool, 
 	return true, nil
 }
 
+func removeSpoolsIfUnreferenced(spoolPaths []string) {
+	if len(spoolPaths) == 0 {
+		return
+	}
+	unique := make([]string, 0, len(spoolPaths))
+	seen := make(map[string]struct{}, len(spoolPaths))
+	for _, spoolPath := range spoolPaths {
+		if spoolPath == "" {
+			continue
+		}
+		spoolPath = filepath.Clean(spoolPath)
+		if _, ok := seen[spoolPath]; ok {
+			continue
+		}
+		seen[spoolPath] = struct{}{}
+		unique = append(unique, spoolPath)
+	}
+	if len(unique) == 0 {
+		return
+	}
+	var referenced []string
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Distinct("spool_path").
+		Where("spool_path IN ?", unique).
+		Pluck("spool_path", &referenced).Error; err != nil {
+		return
+	}
+	for _, spoolPath := range unreferencedSpoolPaths(unique, referenced) {
+		if !spoolIsActive(spoolPath) {
+			_ = os.Remove(spoolPath)
+		}
+	}
+}
+
 func removeSpoolIfUnreferenced(spoolPath string) {
-	if spoolPath == "" {
-		return
-	}
-	var count int64
-	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).Where("spool_path = ?", spoolPath).Count(&count).Error; err != nil {
-		return
-	}
-	if count == 0 {
-		_ = os.Remove(spoolPath)
-	}
+	removeSpoolsIfUnreferenced([]string{spoolPath})
 }
 
 func toObject(row *model.WebDAVWritebackObject) model.Obj {
@@ -4722,10 +4747,19 @@ func recordProviderOperationError(id uint, err error) {
 }
 
 func providerOperationMaintenanceDue(op *model.WebDAVProviderOperation, now time.Time) bool {
-	return op != nil &&
-		(op.State == ProviderOperationApplied ||
-			providerOperationPreparedExpired(op, now) ||
-			providerOperationRecoveryDue(op, now))
+	if op == nil {
+		return false
+	}
+	switch op.State {
+	case ProviderOperationApplied:
+		return true
+	case ProviderOperationPrepared:
+		return providerOperationPreparedExpired(op, now)
+	case ProviderOperationStarted, ProviderOperationFailed:
+		return providerOperationRecoveryDue(op, now)
+	default:
+		return false
+	}
 }
 
 func loadProviderOperationMaintenanceCandidates(now time.Time, limit int) ([]model.WebDAVProviderOperation, error) {
@@ -4737,11 +4771,11 @@ func loadProviderOperationMaintenanceCandidates(now time.Time, limit int) ([]mod
 	var ops []model.WebDAVProviderOperation
 	err := db.GetDb().
 		Where(
-			"state = ? OR (state = ? AND updated_at <= ?) OR (state <> ? AND (last_checked_at IS NULL OR last_checked_at <= ?))",
+			"state = ? OR (state = ? AND updated_at <= ?) OR (state IN ? AND (last_checked_at IS NULL OR last_checked_at <= ?))",
 			ProviderOperationApplied,
 			ProviderOperationPrepared,
 			preparedCutoff,
-			ProviderOperationApplied,
+			[]string{ProviderOperationStarted, ProviderOperationFailed},
 			recoveryCutoff,
 		).
 		Order("CASE state WHEN 'applied' THEN 0 WHEN 'prepared' THEN 1 ELSE 2 END").
@@ -4779,12 +4813,17 @@ func (m *workerManager) maintainProviderOperations() {
 			continue
 		}
 
-		if providerOperationPreparedExpired(op, now) {
-			if err := FinishProviderOperation(op.ID); err != nil {
-				recordProviderOperationError(op.ID, err)
-			} else {
-				retired++
+		if op.State == ProviderOperationPrepared {
+			if providerOperationPreparedExpired(op, now) {
+				if err := FinishProviderOperation(op.ID); err != nil {
+					recordProviderOperationError(op.ID, err)
+				} else {
+					retired++
+				}
 			}
+			// PREPARED belongs to the request that is about to mutate the
+			// provider. Never recover it before abandonment expiry, even if a
+			// future query regression accidentally returns the fresh row.
 			continue
 		}
 		if !providerOperationRecoveryDue(op, now) {
@@ -6302,11 +6341,7 @@ func deleteConfirmedTombstoneSubtree(root *model.WebDAVWritebackObject) (bool, e
 	if err != nil || !deleted {
 		return deleted, err
 	}
-	for _, spoolPath := range spoolPaths {
-		if !spoolIsActive(spoolPath) {
-			removeSpoolIfUnreferenced(spoolPath)
-		}
-	}
+	removeSpoolsIfUnreferenced(spoolPaths)
 	return true, nil
 }
 
@@ -6530,27 +6565,7 @@ func releaseCompletedSpoolBatch(cutoff time.Time, limit int) (selected, released
 		return selected, released, nil
 	}
 
-	unique := make([]string, 0, len(cleared))
-	seen := make(map[string]struct{}, len(cleared))
-	for _, p := range cleared {
-		if _, ok := seen[p]; ok {
-			continue
-		}
-		seen[p] = struct{}{}
-		unique = append(unique, p)
-	}
-	var referenced []string
-	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Distinct("spool_path").
-		Where("spool_path IN ?", unique).
-		Pluck("spool_path", &referenced).Error; err != nil {
-		return selected, released, err
-	}
-	for _, p := range unreferencedSpoolPaths(unique, referenced) {
-		if !spoolIsActive(p) {
-			_ = os.Remove(p)
-		}
-	}
+	removeSpoolsIfUnreferenced(cleared)
 	return selected, released, nil
 }
 
@@ -6572,20 +6587,21 @@ func (m *workerManager) cleanupCompleted() {
 	}
 }
 
+func pruneReferencedSpoolCandidate(candidates map[string]struct{}, spoolPath string) {
+	if len(candidates) == 0 || spoolPath == "" {
+		return
+	}
+	delete(candidates, filepath.Clean(spoolPath))
+}
+
 func (m *workerManager) cleanupOrphans() {
 	spoolDir := conf.Conf.WebDAVWriteback.SpoolDir
 	entries, err := os.ReadDir(spoolDir)
 	if err != nil {
 		return
 	}
-	var rows []model.WebDAVWritebackObject
-	if err := db.GetDb().Select("spool_path").Where("spool_path <> ''").Find(&rows).Error; err != nil {
-		return
-	}
-	keep := make(map[string]struct{}, len(rows))
-	for i := range rows {
-		keep[filepath.Clean(rows[i].SpoolPath)] = struct{}{}
-	}
+
+	candidates := make(map[string]struct{})
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -6597,11 +6613,30 @@ func (m *workerManager) cleanupOrphans() {
 			_ = os.Remove(p)
 			continue
 		}
-		if !strings.HasSuffix(entry.Name(), ".data") {
-			continue
+		if strings.HasSuffix(entry.Name(), ".data") {
+			candidates[filepath.Clean(p)] = struct{}{}
 		}
-		if _, ok := keep[filepath.Clean(p)]; !ok {
-			_ = os.Remove(p)
+	}
+	if len(candidates) == 0 {
+		return
+	}
+
+	rows, err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Select("spool_path").
+		Where("spool_path <> ''").
+		Rows()
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() && len(candidates) > 0 {
+		var spoolPath string
+		if err := rows.Scan(&spoolPath); err != nil {
+			return
 		}
+		pruneReferencedSpoolCandidate(candidates, spoolPath)
+	}
+	for orphan := range candidates {
+		_ = os.Remove(orphan)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -360,6 +361,7 @@ func TestProviderOperationMaintenanceDue(t *testing.T) {
 	now := time.Now()
 	recent := now.Add(-providerOperationConfirmationDelay() / 2)
 	oldPrepared := now.Add(-providerOperationPreparedAbandonAfter - time.Second)
+	freshPrepared := now.Add(-providerOperationPreparedAbandonAfter + time.Second)
 
 	if providerOperationMaintenanceDue(&model.WebDAVProviderOperation{
 		State:         ProviderOperationStarted,
@@ -377,6 +379,15 @@ func TestProviderOperationMaintenanceDue(t *testing.T) {
 		UpdatedAt: oldPrepared,
 	}, now) {
 		t.Fatal("expired PREPARED operation must be eligible for retirement")
+	}
+	if providerOperationMaintenanceDue(&model.WebDAVProviderOperation{
+		State:     ProviderOperationPrepared,
+		UpdatedAt: freshPrepared,
+	}, now) {
+		t.Fatal("fresh PREPARED operation belongs to the active request and must not enter recovery")
+	}
+	if providerOperationMaintenanceDue(&model.WebDAVProviderOperation{State: "unknown"}, now) {
+		t.Fatal("unknown provider operation state must not enter maintenance")
 	}
 }
 
@@ -2677,6 +2688,21 @@ func TestUnreferencedSpoolPaths(t *testing.T) {
 	want := []string{"/spool/a.data", "/spool/c.data"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unreferenced spool paths=%v, want %v", got, want)
+	}
+}
+
+func TestPruneReferencedSpoolCandidate(t *testing.T) {
+	candidates := map[string]struct{}{
+		filepath.Clean("/spool/a.data"): {},
+		filepath.Clean("/spool/b.data"): {},
+	}
+	pruneReferencedSpoolCandidate(candidates, "/spool/a.data")
+	pruneReferencedSpoolCandidate(candidates, "")
+	if len(candidates) != 1 {
+		t.Fatalf("remaining orphan candidates=%v, want one", candidates)
+	}
+	if _, ok := candidates[filepath.Clean("/spool/b.data")]; !ok {
+		t.Fatal("unreferenced candidate was pruned")
 	}
 }
 
