@@ -2,8 +2,8 @@ package writeback
 
 import (
 	"context"
-	"io"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"

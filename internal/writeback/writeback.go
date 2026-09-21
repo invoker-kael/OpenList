@@ -181,7 +181,6 @@ func canonicalContentSHA1(row *model.WebDAVWritebackObject) string {
 	return ""
 }
 
-
 func durableLocalPayloadAvailable(row *model.WebDAVWritebackObject) bool {
 	if row == nil || row.IsDir || canonicalDeleted(row) {
 		return false
