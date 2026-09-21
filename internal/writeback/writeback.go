@@ -2078,26 +2078,87 @@ type incomingReservation struct {
 	released  bool
 }
 
+func completedSpoolPressureReclaimEnabled() bool {
+	return conf.Conf != nil && conf.Conf.WebDAVWriteback.CompletedCacheTTLMinutes >= 0
+}
+
+func reclaimCompletedSpoolCapacity(targetFree uint64) bool {
+	if !completedSpoolPressureReclaimEnabled() || targetFree == 0 || db.GetDb() == nil {
+		return false
+	}
+
+	reclaimed := false
+	for batch := 0; batch < 10; batch++ {
+		usage, err := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
+		if err != nil || usage.Free >= targetFree {
+			return reclaimed
+		}
+
+		var rows []model.WebDAVWritebackObject
+		if err := db.GetDb().
+			Select("id", "generation", "spool_path", "completed_at", "remote_generation", "remote_verified_at").
+			Where("state = ? AND spool_path <> '' AND completed_at IS NOT NULL", StateCompleted).
+			Where("remote_verified_at IS NOT NULL AND remote_generation = generation").
+			Order("completed_at asc, id asc").
+			Limit(100).
+			Find(&rows).Error; err != nil || len(rows) == 0 {
+			return reclaimed
+		}
+
+		changed := false
+		for i := range rows {
+			row := &rows[i]
+			if spoolIsActive(row.SpoolPath) {
+				continue
+			}
+			res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+				Where("id = ? AND generation = ? AND state = ? AND spool_path = ? AND completed_at IS NOT NULL",
+					row.ID, row.Generation, StateCompleted, row.SpoolPath).
+				Where("remote_verified_at IS NOT NULL AND remote_generation = generation").
+				Update("spool_path", "")
+			if res.Error != nil || res.RowsAffected == 0 {
+				continue
+			}
+			changed = true
+			reclaimed = true
+			removeSpoolIfUnreferenced(row.SpoolPath)
+		}
+		if !changed {
+			return reclaimed
+		}
+	}
+	return reclaimed
+}
+
 func (r *incomingReservation) grow(additional uint64) error {
 	if r == nil || additional == 0 {
 		return nil
 	}
-	spaceMu.Lock()
-	defer spaceMu.Unlock()
 
-	usage, err := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
-	if err != nil {
-		return err
-	}
-	required, ok := spoolAdmissionRequired(reserveBytes(), reservedIncoming, additional)
-	if !ok || usage.Free < required {
+	for attempt := 0; attempt < 2; attempt++ {
+		spaceMu.Lock()
+		usage, err := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
+		if err != nil {
+			spaceMu.Unlock()
+			return err
+		}
+		required, ok := spoolAdmissionRequired(reserveBytes(), reservedIncoming, additional)
+		if ok && usage.Free >= required {
+			reservedIncoming += additional
+			r.remaining += additional
+			spaceMu.Unlock()
+			return nil
+		}
+		spaceMu.Unlock()
+
 		if !ok {
-			required = ^uint64(0)
+			return &SpoolCapacityError{Free: usage.Free, Required: ^uint64(0)}
+		}
+		if attempt == 0 && reclaimCompletedSpoolCapacity(required) {
+			continue
 		}
 		return &SpoolCapacityError{Free: usage.Free, Required: required}
 	}
-	reservedIncoming += additional
-	r.remaining += additional
 	return nil
 }
 
@@ -2134,16 +2195,26 @@ func (r *incomingReservation) verifyCapacity() error {
 	if r == nil {
 		return nil
 	}
-	spaceMu.Lock()
-	defer spaceMu.Unlock()
-	usage, err := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
-	if err != nil {
-		return err
-	}
-	required, ok := spoolAdmissionRequired(reserveBytes(), reservedIncoming, 0)
-	if !ok || usage.Free < required {
+
+	for attempt := 0; attempt < 2; attempt++ {
+		spaceMu.Lock()
+		usage, err := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
+		if err != nil {
+			spaceMu.Unlock()
+			return err
+		}
+		required, ok := spoolAdmissionRequired(reserveBytes(), reservedIncoming, 0)
+		if ok && usage.Free >= required {
+			spaceMu.Unlock()
+			return nil
+		}
+		spaceMu.Unlock()
+
 		if !ok {
-			required = ^uint64(0)
+			return &SpoolCapacityError{Free: usage.Free, Required: ^uint64(0)}
+		}
+		if attempt == 0 && reclaimCompletedSpoolCapacity(required) {
+			continue
 		}
 		return &SpoolCapacityError{Free: usage.Free, Required: required}
 	}
