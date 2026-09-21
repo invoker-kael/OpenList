@@ -400,3 +400,14 @@ Tracked completed files now keep the fast Cloud Sync MOVE path after their local
 That metadata-only MOVE does not count as spool backlog and does not consume payload-upload or large-multipart slots. For 115, both destination and source identity decisions use force-refreshed parent listings and require the canonical SHA-1 evidence before mutation. A matching destination is treated as crash/retry recovery, an inconclusive view waits without mutation, and only a conclusive mismatch may be removed as an authorized overwrite.
 
 The source tombstone is held while the destination MOVE is queued or verifying so DELETE priority cannot erase the provider source first. If the source canonical path is recreated, the worker refuses to move it; if the old provider payload can no longer be proven, the destination becomes a tombstone so Cloud Sync repairs it with PUT instead of risking movement of a newer file.
+
+
+### Canonical-first directory MOVE
+
+Completed directory trees can now use the same Cloud Sync-first contract as files even after completed payload spools have been released. The request transaction publishes the destination subtree and source tombstones immediately. The destination root becomes one metadata-only control job; completed no-spool files stay visible from canonical metadata, pending spooled files remain queued, and descendant directories are held behind the root.
+
+The background root MOVE verifies only immutable staged generations. Completed no-spool files must carry a canonical SHA-1 before this path is eligible; fresh provider listings then compare those stable file identities and directory types before the physical MOVE. Pending spooled files are deliberately excluded from source comparison because they overwrite the moved baseline at the destination after the root converges.
+
+A same-generation, unverified RemoteGeneration value is used only as an internal staging fence. It lets recovery distinguish the generations published by the original MOVE from later Cloud Sync edits without adding another lifecycle state. If provider identity cannot be proven, unchanged directories fall back to normal MKCOL, unchanged spooled files return to normal PUT, and only unchanged no-spool files are hidden for Cloud Sync repair. Later destination generations are never rolled back.
+
+Source tombstones and completed destination evidence are deferred while the provider root MOVE is pending. After destination verification succeeds, staged child directories become completed in one transaction, background-probe holds are released, pending payload children resume beneath the now-completed root, and source tombstones are released for normal two-observation delete cleanup.

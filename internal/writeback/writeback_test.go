@@ -1465,6 +1465,21 @@ func TestIsPathOrDescendant(t *testing.T) {
 	}
 }
 
+func TestQueuedReplicaTreeMoveClassification(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		IsDir:       true,
+		State:       StateQueued,
+		CleanupPath: "/encrypted/old-album",
+	}
+	if !queuedReplicaTreeMove(row) {
+		t.Fatal("queued directory root with old provider path must be a replica tree MOVE")
+	}
+	row.CleanupPath = ""
+	if queuedReplicaTreeMove(row) {
+		t.Fatal("ordinary queued MKCOL must not be treated as a tree MOVE")
+	}
+}
+
 func TestQueuedReplicaMoveClassification(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
 		State:       StateQueued,
@@ -1565,6 +1580,66 @@ func TestFilterDispatchReadyParents(t *testing.T) {
 	got := filterDispatchReadyParents(rows, parents)
 	if len(got) != 2 || got[0].ID != 1 || got[1].ID != 2 {
 		t.Fatalf("ready parent filter returned ids=%v, want [1 2]", []uint{got[0].ID, got[1].ID})
+	}
+}
+
+func TestCompletedDirectoryReplicaMoveEligibility(t *testing.T) {
+	now := time.Now()
+	verifiedAt := now.Add(-time.Minute)
+	root := model.WebDAVWritebackObject{
+		Path:           "/encrypted/album",
+		IsDir:          true,
+		State:          StateCompleted,
+		CanonicalState: CanonicalStateAcked,
+		CompletedAt:    &verifiedAt,
+	}
+	rows := []model.WebDAVWritebackObject{
+		root,
+		{
+			Path:           "/encrypted/album/stable.bin",
+			State:          StateCompleted,
+			CanonicalState: CanonicalStateAcked,
+			Size:           10,
+			PayloadSHA1:    strings.Repeat("a", 40),
+		},
+		{
+			Path:           "/encrypted/album/pending.bin",
+			State:          StateQueued,
+			CanonicalState: CanonicalStateAcked,
+			Size:           20,
+			SpoolPath:      "/spool/pending.data",
+			PayloadSHA1:    strings.Repeat("b", 40),
+		},
+	}
+	if !completedDirectoryReplicaMoveEligible(&rows[0], rows) {
+		t.Fatal("completed directory with verified stable files and local pending payloads should use canonical-first root MOVE")
+	}
+
+	rows[1].PayloadSHA1 = ""
+	if completedDirectoryReplicaMoveEligible(&rows[0], rows) {
+		t.Fatal("completed no-spool file without canonical content identity must force provider fallback")
+	}
+	rows[1].PayloadSHA1 = strings.Repeat("a", 40)
+	rows[0].State = StateQueued
+	if completedDirectoryReplicaMoveEligible(&rows[0], rows) {
+		t.Fatal("non-completed root belongs to the existing local rebuild path")
+	}
+}
+
+func TestStagedReplicaTreeRowRequiresExactGeneration(t *testing.T) {
+	row := &model.WebDAVWritebackObject{Generation: 5, RemoteGeneration: 5}
+	if !stagedReplicaTreeRow(row) {
+		t.Fatal("same-generation unverified marker should identify the staged MOVE snapshot")
+	}
+	now := time.Now()
+	row.RemoteVerifiedAt = &now
+	if stagedReplicaTreeRow(row) {
+		t.Fatal("real remote verification evidence must not be treated as a staging marker")
+	}
+	row.RemoteVerifiedAt = nil
+	row.Generation = 6
+	if stagedReplicaTreeRow(row) {
+		t.Fatal("later canonical generation must not be rolled back by the old MOVE")
 	}
 }
 

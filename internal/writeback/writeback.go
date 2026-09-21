@@ -3470,6 +3470,34 @@ func pendingDirectoryMoveLocallyAuthoritative(root *model.WebDAVWritebackObject,
 	return true
 }
 
+func completedDirectoryReplicaMoveEligible(root *model.WebDAVWritebackObject, rows []model.WebDAVWritebackObject) bool {
+	if root == nil || !root.IsDir || canonicalDeleted(root) || !canonicalAcked(root) || root.State != StateCompleted {
+		return false
+	}
+	for i := range rows {
+		row := &rows[i]
+		if canonicalDeleted(row) {
+			continue
+		}
+		if !canonicalAcked(row) {
+			return false
+		}
+		if row.IsDir {
+			if row.State != StateCompleted {
+				return false
+			}
+			continue
+		}
+		if row.SpoolPath != "" {
+			continue
+		}
+		if row.State != StateCompleted || canonicalContentSHA1(row) == "" {
+			return false
+		}
+	}
+	return true
+}
+
 var errPendingDirectoryMoveFallback = errors.New("pending directory move requires provider fallback")
 
 func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwritten bool, err error) {
@@ -3509,9 +3537,15 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 				destinationRows = append(destinationRows, row)
 			}
 		}
-		if rootIndex < 0 || !pendingDirectoryMoveLocallyAuthoritative(&sourceRows[rootIndex], sourceRows, now) {
+		if rootIndex < 0 {
 			return errPendingDirectoryMoveFallback
 		}
+		localRebuild := pendingDirectoryMoveLocallyAuthoritative(&sourceRows[rootIndex], sourceRows, now)
+		replicaTreeMove := !localRebuild && completedDirectoryReplicaMoveEligible(&sourceRows[rootIndex], sourceRows)
+		if !localRebuild && !replicaTreeMove {
+			return errPendingDirectoryMoveFallback
+		}
+		treeHoldUntil := now.Add(replicaMoveSourceHoldDelay())
 
 		destinationByPath := make(map[string]int, len(destinationRows))
 		for i := range destinationRows {
@@ -3569,6 +3603,9 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 				destinationRow.SpoolPath = sourceRow.SpoolPath
 			}
 			destinationRow.PayloadSHA1 = sourceRow.PayloadSHA1
+			if !sourceRow.IsDir && destinationRow.PayloadSHA1 == "" && sourceRow.SpoolPath == "" {
+				destinationRow.PayloadSHA1 = canonicalContentSHA1(sourceRow)
+			}
 			destinationRow.MimeType = sourceRow.MimeType
 			destinationRow.CleanupPath = ""
 			destinationRow.LastError = ""
@@ -3579,6 +3616,32 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 			retryAt := now
 			if !sourceRow.IsDir {
 				retryAt = now.Add(cloudSyncSettleDelay(sourceRow.Size))
+			}
+
+			if replicaTreeMove {
+				// Mark the exact generation published by this MOVE. The marker
+				// is not remote evidence because RemoteVerifiedAt stays nil; it
+				// only lets fallback avoid overwriting later Cloud Sync edits.
+				destinationRow.RemoteGeneration = destinationRow.Generation
+				switch {
+				case sourceRow.Path == src:
+					destinationRow.State = StateQueued
+					destinationRow.CleanupPath = src
+					retryAt = now
+				case sourceRow.IsDir:
+					// Keep descendants blocked behind the root MOVE. On provider
+					// success they become COMPLETED without redundant MKCOLs.
+					destinationRow.State = StateQueued
+					retryAt = treeHoldUntil
+				case sourceRow.SpoolPath != "":
+					destinationRow.State = StateQueued
+				default:
+					// No local payload exists, so preserve the canonical file
+					// while root MOVE is pending and suppress background probes.
+					destinationRow.State = StateCompleted
+					destinationRow.CompletedAt = &now
+					retryAt = treeHoldUntil
+				}
 			}
 			destinationRow.RetryAt = &retryAt
 
@@ -3597,6 +3660,10 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 				continue
 			}
 			tombstoneMovedSource(sourceRow, now)
+			if replicaTreeMove {
+				sourceRow.RetryAt = &treeHoldUntil
+				sourceRow.LastError = "waiting for canonical destination directory MOVE"
+			}
 			if err := tx.Save(sourceRow).Error; err != nil {
 				return err
 			}
@@ -3828,6 +3895,9 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		dstRow.State = StateQueued
 		dstRow.SpoolPath = lockedSrc.SpoolPath
 		dstRow.PayloadSHA1 = lockedSrc.PayloadSHA1
+		if dstRow.PayloadSHA1 == "" && lockedSrc.SpoolPath == "" {
+			dstRow.PayloadSHA1 = canonicalContentSHA1(&lockedSrc)
+		}
 		dstRow.MimeType = lockedSrc.MimeType
 		dstRow.CleanupPath = ""
 		dstRow.LastError = ""
@@ -4937,6 +5007,20 @@ func queuedReplicaMove(row *model.WebDAVWritebackObject) bool {
 		row.CleanupPath != ""
 }
 
+func queuedReplicaTreeMove(row *model.WebDAVWritebackObject) bool {
+	return row != nil &&
+		row.IsDir &&
+		row.State == StateQueued &&
+		row.CleanupPath != ""
+}
+
+func stagedReplicaTreeRow(row *model.WebDAVWritebackObject) bool {
+	return row != nil &&
+		row.Generation > 0 &&
+		row.RemoteVerifiedAt == nil &&
+		row.RemoteGeneration == row.Generation
+}
+
 func providerUploadCandidate(row *model.WebDAVWritebackObject) bool {
 	return row != nil &&
 		!row.IsDir &&
@@ -5772,6 +5856,341 @@ func shouldRemoveStaleRemote(uploadedPath string, current *model.WebDAVWriteback
 	return canonicalDeleted(current) || current.Path != uploadedPath
 }
 
+func holdReplicaMoveSourceTree(src string, until time.Time) {
+	src = utils.FixAndCleanPath(src)
+	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("state = ? AND (path = ? OR path LIKE ? ESCAPE '~')", StateDeleted, src, descendantLikePattern(src)).
+		Where("retry_at IS NULL OR retry_at < ?", until).
+		Updates(map[string]any{
+			"retry_at":   &until,
+			"last_error": "waiting for canonical destination directory MOVE",
+		}).Error
+}
+
+func holdReplicaMoveDestinationTree(dst string, until time.Time) {
+	dst = utils.FixAndCleanPath(dst)
+	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("state = ? AND spool_path = '' AND remote_verified_at IS NULL AND remote_generation = generation", StateCompleted).
+		Where("path = ? OR path LIKE ? ESCAPE '~'", dst, descendantLikePattern(dst)).
+		Update("retry_at", &until).Error
+}
+
+func releaseReplicaMoveSourceTree(src string, now time.Time) {
+	src = utils.FixAndCleanPath(src)
+	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("state = ? AND (path = ? OR path LIKE ? ESCAPE '~')", StateDeleted, src, descendantLikePattern(src)).
+		Updates(map[string]any{
+			"retry_at":   &now,
+			"last_error": "",
+		}).Error
+}
+
+func loadReplicaTreeRows(root string) ([]model.WebDAVWritebackObject, error) {
+	root = utils.FixAndCleanPath(root)
+	var rows []model.WebDAVWritebackObject
+	err := db.GetDb().
+		Where("path = ? OR path LIKE ? ESCAPE '~'", root, descendantLikePattern(root)).
+		Order("path asc").
+		Find(&rows).Error
+	return rows, err
+}
+
+func (m *workerManager) replicaTreeProviderState(canonicalRoot, providerRoot string) (providerOperationRemoteState, error) {
+	canonicalRoot = utils.FixAndCleanPath(canonicalRoot)
+	providerRoot = utils.FixAndCleanPath(providerRoot)
+
+	rootListing, err := m.refreshParent(path.Dir(providerRoot))
+	if err != nil {
+		if errs.IsObjectNotFound(err) {
+			return providerOperationRemoteAbsent, nil
+		}
+		return providerOperationRemoteInconclusive, err
+	}
+	remoteRoot := exactRemoteByName(rootListing, path.Base(providerRoot))
+	if remoteRoot == nil {
+		return providerOperationRemoteAbsent, nil
+	}
+	if !remoteRoot.IsDir() {
+		return providerOperationRemoteMismatch, nil
+	}
+
+	rows, err := loadReplicaTreeRows(canonicalRoot)
+	if err != nil {
+		return providerOperationRemoteInconclusive, err
+	}
+	type expectedObject struct {
+		row          model.WebDAVWritebackObject
+		providerPath string
+	}
+	byParent := make(map[string][]expectedObject)
+	for i := range rows {
+		row := &rows[i]
+		if row.Path == canonicalRoot || canonicalDeleted(row) || !stagedReplicaTreeRow(row) {
+			continue
+		}
+		// Pending payloads are intentionally excluded: after the root MOVE they
+		// upload at the destination and overwrite any older provider version.
+		if !row.IsDir && row.SpoolPath != "" {
+			continue
+		}
+		rel := strings.TrimPrefix(row.Path, canonicalRoot)
+		providerPath := utils.FixAndCleanPath(providerRoot + rel)
+		parent := path.Dir(providerPath)
+		byParent[parent] = append(byParent[parent], expectedObject{row: *row, providerPath: providerPath})
+	}
+
+	for parent, expected := range byParent {
+		objs, listErr := m.refreshParent(parent)
+		if listErr != nil {
+			return providerOperationRemoteInconclusive, listErr
+		}
+		for i := range expected {
+			item := &expected[i]
+			remote := exactRemoteByName(objs, path.Base(item.providerPath))
+			if remote == nil {
+				// A force-refreshed miss can still be propagation lag around a
+				// just-finished 115 tree mutation. Never mutate on this evidence.
+				return providerOperationRemoteInconclusive, nil
+			}
+			if item.row.IsDir {
+				if !remote.IsDir() {
+					return providerOperationRemoteMismatch, nil
+				}
+				continue
+			}
+			requireHash := providerRequiresPayloadHash(item.providerPath)
+			switch compareRemoteContent(&item.row, remote, requireHash) {
+			case remoteContentMismatch:
+				return providerOperationRemoteMismatch, nil
+			case remoteContentInconclusive:
+				return providerOperationRemoteInconclusive, nil
+			}
+		}
+	}
+	return providerOperationRemoteMatch, nil
+}
+
+func replicaTreeRetryDelay() time.Duration {
+	seconds := 2
+	if conf.Conf != nil {
+		seconds = max(seconds, max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds))
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (m *workerManager) requeueReplicaTreeMove(row *model.WebDAVWritebackObject, message string) {
+	next := time.Now().Add(replicaTreeRetryDelay())
+	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+		Updates(map[string]any{
+			"state":       StateQueued,
+			"retry_at":    &next,
+			"retry_count": row.RetryCount + 1,
+			"last_error":  message,
+		}).Error
+}
+
+func (m *workerManager) finishReplicaTreeMove(row *model.WebDAVWritebackObject, src string) error {
+	now := time.Now()
+	dst := utils.FixAndCleanPath(row.Path)
+	src = utils.FixAndCleanPath(src)
+	return db.GetDb().Transaction(func(tx *gorm.DB) error {
+		var rows []model.WebDAVWritebackObject
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("path = ? OR path LIKE ? ESCAPE '~'", dst, descendantLikePattern(dst)).
+			Order("id asc").
+			Find(&rows).Error; err != nil {
+			return err
+		}
+		for i := range rows {
+			current := &rows[i]
+			if !stagedReplicaTreeRow(current) || canonicalDeleted(current) {
+				continue
+			}
+			updates := map[string]any{
+				"remote_generation":  0,
+				"remote_verified_at": nil,
+				"last_error":         "",
+			}
+			if current.ID == row.ID && current.Generation == row.Generation {
+				updates["state"] = StateCompleted
+				updates["cleanup_path"] = ""
+				updates["retry_at"] = nil
+				updates["retry_count"] = 0
+				updates["verify_count"] = 0
+				updates["completed_at"] = &now
+			} else if current.IsDir && current.State == StateQueued {
+				updates["state"] = StateCompleted
+				updates["retry_at"] = nil
+				updates["completed_at"] = &now
+			} else if current.State == StateCompleted && current.SpoolPath == "" {
+				updates["retry_at"] = nil
+			}
+			if err := tx.Model(&model.WebDAVWritebackObject{}).
+				Where("id = ? AND generation = ?", current.ID, current.Generation).
+				Updates(updates).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Model(&model.WebDAVWritebackObject{}).
+			Where("state = ? AND (path = ? OR path LIKE ? ESCAPE '~')", StateDeleted, src, descendantLikePattern(src)).
+			Updates(map[string]any{
+				"retry_at":   &now,
+				"last_error": "",
+			}).Error
+	})
+}
+
+func (m *workerManager) fallbackReplicaTreeMove(row *model.WebDAVWritebackObject, src, reason string) error {
+	now := time.Now()
+	dst := utils.FixAndCleanPath(row.Path)
+	src = utils.FixAndCleanPath(src)
+	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		var rows []model.WebDAVWritebackObject
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("path = ? OR path LIKE ? ESCAPE '~'", dst, descendantLikePattern(dst)).
+			Order("id asc").
+			Find(&rows).Error; err != nil {
+			return err
+		}
+		for i := range rows {
+			current := &rows[i]
+			if canonicalDeleted(current) || !stagedReplicaTreeRow(current) {
+				continue
+			}
+			clearRemoteVerification(current)
+			current.CleanupPath = ""
+			current.LastError = reason
+			current.RetryCount = 0
+			current.VerifyCount = 0
+			switch {
+			case current.IsDir:
+				// Rebuild directories through normal MKCOL. Newer rows whose
+				// generation changed after the original MOVE are left untouched.
+				current.State = StateQueued
+				current.RetryAt = &now
+				current.CompletedAt = nil
+			case current.SpoolPath != "":
+				current.State = StateQueued
+				current.RetryAt = &now
+				current.CompletedAt = nil
+			default:
+				// No local payload can reconstruct this unchanged generation.
+				// Hide only that generation so Cloud Sync repairs it with PUT.
+				markCanonicalDeleted(current)
+				current.State = StateDeleted
+				current.RetryAt = &now
+				current.CompletedAt = nil
+			}
+			if err := tx.Save(current).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Model(&model.WebDAVWritebackObject{}).
+			Where("state = ? AND (path = ? OR path LIKE ? ESCAPE '~')", StateDeleted, src, descendantLikePattern(src)).
+			Updates(map[string]any{
+				"retry_at":   &now,
+				"last_error": "",
+			}).Error
+	})
+	if err == nil {
+		wake()
+	}
+	return err
+}
+
+func (m *workerManager) processReplicaTreeMove(row *model.WebDAVWritebackObject) {
+	if row == nil || !queuedReplicaTreeMove(row) {
+		return
+	}
+	src := utils.FixAndCleanPath(row.CleanupPath)
+	if src == "" || src == row.Path {
+		_ = m.fallbackReplicaTreeMove(row, src, "invalid provider directory MOVE source; rebuilding destination")
+		return
+	}
+	recreated, err := replicaMoveSourceRecreated(src)
+	if err != nil {
+		m.failAfter(row, err, 2*time.Second)
+		return
+	}
+	if recreated {
+		_ = m.fallbackReplicaTreeMove(row, src, "directory MOVE source was recreated; rebuilding destination without moving the newer source")
+		return
+	}
+
+	holdUntil := time.Now().Add(replicaMoveSourceHoldDelay())
+	holdReplicaMoveSourceTree(src, holdUntil)
+	holdReplicaMoveDestinationTree(row.Path, holdUntil)
+
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ? AND cleanup_path = ?", row.ID, row.Generation, StateQueued, src).
+		Updates(map[string]any{"state": StateUploading, "retry_at": nil, "last_error": ""})
+	if res.Error != nil || res.RowsAffected == 0 {
+		return
+	}
+
+	dstState, dstErr := m.replicaTreeProviderState(row.Path, row.Path)
+	if dstErr != nil || dstState == providerOperationRemoteInconclusive {
+		if row.RetryCount >= 3 {
+			_ = m.fallbackReplicaTreeMove(row, src, "provider destination directory stayed inconclusive; rebuilding destination")
+			return
+		}
+		m.requeueReplicaTreeMove(row, "provider destination directory is inconclusive; waiting without mutation")
+		return
+	}
+	if dstState == providerOperationRemoteMatch {
+		if err := m.finishReplicaTreeMove(row, src); err != nil {
+			m.failAfter(row, err, 2*time.Second)
+			return
+		}
+		wake()
+		return
+	}
+
+	srcState, srcErr := m.replicaTreeProviderState(row.Path, src)
+	if srcErr != nil || srcState == providerOperationRemoteInconclusive || srcState == providerOperationRemoteAbsent {
+		if row.RetryCount >= 3 {
+			_ = m.fallbackReplicaTreeMove(row, src, "provider source directory could not be proven; rebuilding destination")
+			return
+		}
+		m.requeueReplicaTreeMove(row, "provider source directory is not yet provable; waiting without mutation")
+		return
+	}
+	if srcState == providerOperationRemoteMismatch {
+		_ = m.fallbackReplicaTreeMove(row, src, "provider source directory diverged from canonical evidence; rebuilding destination")
+		return
+	}
+
+	if dstState == providerOperationRemoteMismatch {
+		if err := fs.Remove(m.ctx, row.Path); err != nil && !errs.IsObjectNotFound(err) {
+			m.failAfter(row, err, 2*time.Second)
+			return
+		}
+		absent, absentErr := providerOperationPathAbsent(m.ctx, row.Path)
+		if absentErr != nil || !absent {
+			m.requeueReplicaTreeMove(row, "provider overwrite target is still visible; waiting before directory MOVE")
+			return
+		}
+	}
+
+	if err := moveReplicaExact(m.ctx, src, row.Path); err != nil {
+		if !errs.IsObjectNotFound(err) {
+			m.failAfter(row, err, 2*time.Second)
+			return
+		}
+	}
+	// Verify from a later fresh snapshot. A provider NotFound at this point can
+	// simply mean the MOVE succeeded and destination visibility is lagging.
+	next := time.Now().Add(replicaTreeRetryDelay())
+	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+		Updates(map[string]any{
+			"state":      StateQueued,
+			"retry_at":   &next,
+			"last_error": "provider directory MOVE issued; waiting for destination verification",
+		}).Error
+}
+
 func replicaMoveSourceHoldDelay() time.Duration {
 	seconds := 30
 	if conf.Conf != nil {
@@ -6157,6 +6576,10 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 }
 
 func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
+	if queuedReplicaTreeMove(row) {
+		m.processReplicaTreeMove(row)
+		return
+	}
 	if waiting, err := m.waitForCanonicalParent(row); err != nil {
 		m.failAfter(row, err, 2*time.Second)
 		return
