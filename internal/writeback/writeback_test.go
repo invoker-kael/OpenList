@@ -1365,6 +1365,26 @@ func TestSpoolBacklogAdmissionWeight(t *testing.T) {
 	}
 }
 
+func TestReceiveReservationProgressBytes(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{IncomingReservationChunkMB: 8}}
+	defer func() { conf.Conf = oldConf }()
+
+	chunk := 8 * uint64(utils.MB)
+	if got := receiveReservationProgressBytes(-1, 0); got != chunk {
+		t.Fatalf("initial unknown-length reservation=%d, want %d", got, chunk)
+	}
+	if got := receiveReservationProgressBytes(-1, int64(64*utils.MB)); got != 72*uint64(utils.MB) {
+		t.Fatalf("progress reservation=%d, want %d", got, 72*uint64(utils.MB))
+	}
+	if got := receiveReservationProgressBytes(1234, 500); got != 1234 {
+		t.Fatalf("known-length reservation changed with progress: %d", got)
+	}
+	if got := receiveReservationProgressBytes(-1, int64(^uint64(0)>>1)); got == 0 {
+		t.Fatal("large unknown-length reservation must not wrap to zero")
+	}
+}
+
 func TestMaxPendingSpoolBytes(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{MaxPendingSpoolMB: 1024}}

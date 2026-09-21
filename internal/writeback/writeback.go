@@ -2086,6 +2086,21 @@ func spoolBacklogAdmissionWeight(expected int64) uint64 {
 	return 0
 }
 
+func receiveReservationProgressBytes(expected, received int64) uint64 {
+	if expected >= 0 {
+		return spoolBacklogAdmissionWeight(expected)
+	}
+	chunk := incomingReservationChunkBytes()
+	if received <= 0 {
+		return chunk
+	}
+	value := uint64(received)
+	if value > ^uint64(0)-chunk {
+		return ^uint64(0)
+	}
+	return value + chunk
+}
+
 func pendingSpoolBacklogBytes(tx *gorm.DB, excludePath string) (uint64, error) {
 	query := tx.Model(&model.WebDAVWritebackObject{}).
 		Select("COALESCE(SUM(size), 0) AS bytes").
@@ -2466,10 +2481,13 @@ func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64
 	return sequence, err
 }
 
-func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64) {
+func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64, expected, received int64) {
 	now := time.Now()
 	leaseUntil := now.Add(receiveLeaseDuration)
 	_ = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAdmissionFence(tx); err != nil {
+			return err
+		}
 		if err := tx.Model(&model.WebDAVWritebackReceiveFence{}).
 			Where("path_key = ? AND active_receivers > 0", pathKey(p)).
 			Updates(map[string]any{
@@ -2479,9 +2497,15 @@ func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64) {
 			}).Error; err != nil {
 			return err
 		}
-		return tx.Model(&model.WebDAVWritebackReceiveReservation{}).
-			Where("path_key = ? AND sequence = ?", pathKey(p), sequence).
-			Update("lease_until", leaseUntil).Error
+		reservation := tx.Model(&model.WebDAVWritebackReceiveReservation{}).
+			Where("path_key = ? AND sequence = ?", pathKey(p), sequence)
+		updates := map[string]any{"lease_until": leaseUntil}
+		if expected < 0 {
+			progressBytes := receiveReservationProgressBytes(expected, received)
+			reservation = reservation.Where("bytes < ?", progressBytes)
+			updates["bytes"] = progressBytes
+		}
+		return reservation.Updates(updates).Error
 	})
 }
 
@@ -2661,7 +2685,7 @@ func cloudSyncSettleDelay(size int64) time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
-func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incomingReservation, heartbeat ...func()) (int64, string, error) {
+func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incomingReservation, heartbeat ...func(int64)) (int64, string, error) {
 	buf := make([]byte, 4*utils.MB)
 	payloadHasher := utils.SHA1.NewFunc()
 	writer := io.MultiWriter(dst, payloadHasher)
@@ -2683,7 +2707,7 @@ func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incom
 			sinceCheck += int64(wn)
 			reservation.consume(uint64(wn))
 			if len(heartbeat) > 0 && heartbeat[0] != nil && time.Since(lastHeartbeat) >= receiveHeartbeatEvery {
-				heartbeat[0]()
+				heartbeat[0](total)
 				lastHeartbeat = time.Now()
 			}
 			if writeErr != nil {
@@ -2695,6 +2719,10 @@ func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incom
 			if sinceCheck >= 64*utils.MB {
 				if err := reservation.verifyCapacity(); err != nil {
 					return total, "", err
+				}
+				if expected < 0 && len(heartbeat) > 0 && heartbeat[0] != nil {
+					heartbeat[0](total)
+					lastHeartbeat = time.Now()
 				}
 				sinceCheck = 0
 			}
@@ -2773,8 +2801,8 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		}
 	}()
 
-	actualSize, payloadSHA1, err := copyToSpool(tmp, body, expected, reservation, func() {
-		heartbeatReceiveSequence(receiveCtx, p, receiveSequence)
+	actualSize, payloadSHA1, err := copyToSpool(tmp, body, expected, reservation, func(received int64) {
+		heartbeatReceiveSequence(receiveCtx, p, receiveSequence, expected, received)
 	})
 	if err != nil {
 		if expected >= 0 {
