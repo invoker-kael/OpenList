@@ -3323,7 +3323,12 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			removeSpoolIfUnreferenced(oldSpool)
 		}
 	}
-	wake()
+	// retry_at already carries the Cloud Sync settle window. Waking the
+	// scheduler before that deadline only forces an immediate queue query that
+	// cannot dispatch this row; the existing 2s scheduler tick will pick it up.
+	if !settleAt.After(time.Now()) {
+		wake()
+	}
 	return &saved, created, nil
 }
 
