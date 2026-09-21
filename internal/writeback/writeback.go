@@ -4383,6 +4383,45 @@ type workerJob struct {
 	largeUpload bool
 }
 
+type providerRefreshCall struct {
+	done chan struct{}
+	objs []model.Obj
+	err  error
+}
+
+type providerRefreshGroup struct {
+	mu    sync.Mutex
+	calls map[string]*providerRefreshCall
+}
+
+func (g *providerRefreshGroup) do(stop <-chan struct{}, parent string, refresh func() ([]model.Obj, error)) ([]model.Obj, error) {
+	parent = utils.FixAndCleanPath(parent)
+	g.mu.Lock()
+	if g.calls == nil {
+		g.calls = make(map[string]*providerRefreshCall)
+	}
+	if call := g.calls[parent]; call != nil {
+		g.mu.Unlock()
+		select {
+		case <-call.done:
+			return call.objs, call.err
+		case <-stop:
+			return nil, context.Canceled
+		}
+	}
+	call := &providerRefreshCall{done: make(chan struct{})}
+	g.calls[parent] = call
+	g.mu.Unlock()
+
+	call.objs, call.err = refresh()
+	close(call.done)
+
+	g.mu.Lock()
+	delete(g.calls, parent)
+	g.mu.Unlock()
+	return call.objs, call.err
+}
+
 type workerManager struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -4392,6 +4431,7 @@ type workerManager struct {
 	uploads      chan struct{}
 	largeUploads chan struct{}
 	inflight     sync.Map
+	refreshes    providerRefreshGroup
 	wg           sync.WaitGroup
 }
 
@@ -4442,6 +4482,12 @@ func releaseWorkerSlot(slots chan struct{}, reserved bool) {
 		return
 	}
 	<-slots
+}
+
+func (m *workerManager) refreshParent(parent string) ([]model.Obj, error) {
+	return m.refreshes.do(m.stop, parent, func() ([]model.Obj, error) {
+		return fs.List(m.ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	})
 }
 
 func wake() {
@@ -4633,6 +4679,67 @@ func (m *workerManager) scheduler() {
 	}
 }
 
+func dispatchFilePriority(row *model.WebDAVWritebackObject) int {
+	if row != nil && row.Size > open115MultipartChunkSize {
+		return 1
+	}
+	return 0
+}
+
+func sortDispatchFiles(rows []model.WebDAVWritebackObject) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		return dispatchFilePriority(&rows[i]) < dispatchFilePriority(&rows[j])
+	})
+}
+
+func loadDispatchClass(now time.Time, states []string, isDir *bool, limit int) ([]model.WebDAVWritebackObject, error) {
+	var rows []model.WebDAVWritebackObject
+	query := db.GetDb().
+		Select("id", "path", "size", "is_dir", "state").
+		Where("state IN ? AND (retry_at IS NULL OR retry_at <= ?)", states, now)
+	if isDir != nil {
+		query = query.Where("is_dir = ?", *isDir)
+	}
+	err := query.
+		Order("retry_at asc").
+		Order("updated_at asc").
+		Limit(max(1, limit)).
+		Find(&rows).Error
+	return rows, err
+}
+
+func loadDispatchRows(now time.Time, workers int) ([]model.WebDAVWritebackObject, error) {
+	limit := max(4, workers*2)
+	fileLimit := max(8, workers*4)
+	isDir := true
+	isFile := false
+
+	deleted, err := loadDispatchClass(now, []string{StateDeleted}, nil, limit)
+	if err != nil {
+		return nil, err
+	}
+	verifying, err := loadDispatchClass(now, []string{StateVerifying}, nil, limit)
+	if err != nil {
+		return nil, err
+	}
+	directories, err := loadDispatchClass(now, []string{StateQueued, StateFailed}, &isDir, limit)
+	if err != nil {
+		return nil, err
+	}
+	files, err := loadDispatchClass(now, []string{StateQueued, StateFailed}, &isFile, fileLimit)
+	if err != nil {
+		return nil, err
+	}
+	sortDispatchFiles(files)
+
+	rows := make([]model.WebDAVWritebackObject, 0, len(deleted)+len(verifying)+len(directories)+len(files))
+	rows = append(rows, deleted...)
+	rows = append(rows, verifying...)
+	rows = append(rows, directories...)
+	rows = append(rows, files...)
+	return rows, nil
+}
+
 func (m *workerManager) dispatch() {
 	now := time.Now()
 	// Finite lock-null resources expire with the in-memory lock. Infinite locks
@@ -4642,17 +4749,7 @@ func (m *workerManager) dispatch() {
 		Delete(&model.WebDAVWritebackObject{}).Error; err != nil {
 		log.Errorf("write-back lock-null cleanup failed: %v", err)
 	}
-	var rows []model.WebDAVWritebackObject
-	err := db.GetDb().
-		Select("id", "path", "size", "is_dir", "state").
-		Where("state IN ? AND (retry_at IS NULL OR retry_at <= ?)", []string{StateQueued, StateFailed, StateVerifying, StateDeleted}, now).
-		Order(clause.Expr{
-			SQL:  "CASE WHEN state = ? THEN 0 WHEN state = ? THEN 1 WHEN is_dir = ? THEN 2 WHEN state IN (?, ?) AND size > ? THEN 4 ELSE 3 END ASC",
-			Vars: []any{StateDeleted, StateVerifying, true, StateQueued, StateFailed, open115MultipartChunkSize},
-		}).
-		Order("updated_at asc").
-		Limit(max(8, conf.Conf.WebDAVWriteback.Workers*4)).
-		Find(&rows).Error
+	rows, err := loadDispatchRows(now, max(1, conf.Conf.WebDAVWriteback.Workers))
 	if err != nil {
 		log.Errorf("write-back queue scan failed: %v", err)
 		return
@@ -4769,7 +4866,7 @@ func (m *workerManager) remoteDirectoryExists(row *model.WebDAVWritebackObject) 
 	if existing, err := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true}); err == nil && existing != nil && existing.IsDir() {
 		return true
 	}
-	objs, err := fs.List(m.ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	objs, err := m.refreshParent(row.Parent)
 	if err != nil {
 		return false
 	}
@@ -5058,7 +5155,7 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model
 	// A direct 115 miss/mismatch is never destructive evidence by itself.
 	// Force-refresh the parent. If that refresh fails, return its error instead
 	// of leaking an earlier direct NotFound/mismatch into the retry budget.
-	objs, listErr := fs.List(m.ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	objs, listErr := m.refreshParent(row.Parent)
 	if listErr != nil {
 		return nil, listErr
 	}
@@ -5240,7 +5337,7 @@ func (m *workerManager) remoteDeleteAbsent(row *model.WebDAVWritebackObject) (bo
 		return false, getErr
 	}
 
-	objs, listErr := fs.List(m.ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	objs, listErr := m.refreshParent(row.Parent)
 	if listErr != nil {
 		if deleteParentMissing(listErr) {
 			// A missing parent proves that this child is absent. Directory-tree

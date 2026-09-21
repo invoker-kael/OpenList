@@ -49,6 +49,59 @@ func TestLargeUploadWorkerLimit(t *testing.T) {
 	}
 }
 
+func TestProviderRefreshGroupSharesInflightResult(t *testing.T) {
+	group := &providerRefreshGroup{
+		calls: map[string]*providerRefreshCall{
+			"/encrypted": {done: make(chan struct{})},
+		},
+	}
+	call := group.calls["/encrypted"]
+	result := make(chan []model.Obj, 1)
+	go func() {
+		objs, err := group.do(nil, "/encrypted", func() ([]model.Obj, error) {
+			t.Error("joined refresh unexpectedly executed a second provider call")
+			return nil, nil
+		})
+		if err != nil {
+			t.Errorf("joined refresh returned error: %v", err)
+		}
+		result <- objs
+	}()
+	want := []model.Obj{&model.Object{Name: "file.bin", Size: 123}}
+	call.objs = want
+	close(call.done)
+	got := <-result
+	if len(got) != 1 || got[0].GetName() != "file.bin" {
+		t.Fatalf("joined refresh result = %#v, want shared provider result", got)
+	}
+}
+
+func TestDispatchFilePriority(t *testing.T) {
+	small := &model.WebDAVWritebackObject{Size: open115MultipartChunkSize}
+	large := &model.WebDAVWritebackObject{Size: open115MultipartChunkSize + 1}
+	if dispatchFilePriority(small) != 0 || dispatchFilePriority(large) != 1 {
+		t.Fatal("dispatch file priority must keep small uploads ahead of multipart-sized uploads")
+	}
+	rows := []model.WebDAVWritebackObject{{ID: 1, Size: open115MultipartChunkSize + 1}, {ID: 2, Size: 1}, {ID: 3, Size: open115MultipartChunkSize + 2}}
+	sortDispatchFiles(rows)
+	if rows[0].ID != 2 || rows[1].ID != 1 || rows[2].ID != 3 {
+		t.Fatalf("dispatch file order = %v, want small first with stable large-file order", []uint{rows[0].ID, rows[1].ID, rows[2].ID})
+	}
+}
+
+func TestWritebackDispatchIndex(t *testing.T) {
+	typ := reflect.TypeOf(model.WebDAVWritebackObject{})
+	for _, fieldName := range []string{"State", "IsDir", "RetryAt"} {
+		field, ok := typ.FieldByName(fieldName)
+		if !ok {
+			t.Fatalf("writeback model is missing %s", fieldName)
+		}
+		if !strings.Contains(field.Tag.Get("gorm"), "idx_webdav_writeback_dispatch") {
+			t.Fatalf("%s must participate in dispatch index", fieldName)
+		}
+	}
+}
+
 func TestProviderUploadCandidate(t *testing.T) {
 	row := &model.WebDAVWritebackObject{State: StateQueued}
 	if !providerUploadCandidate(row) {

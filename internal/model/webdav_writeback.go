@@ -14,7 +14,7 @@ type WebDAVWritebackObject struct {
 	Path       string    `json:"path" gorm:"type:text"`
 	Parent     string    `json:"parent" gorm:"type:text"`
 	Name       string    `json:"name" gorm:"size:1024"`
-	IsDir      bool      `json:"is_dir" gorm:"index"`
+	IsDir      bool      `json:"is_dir" gorm:"index;index:idx_webdav_writeback_dispatch,priority:2"`
 	Size       int64     `json:"size"`
 	ModTime    time.Time `json:"mod_time"`
 	CreateTime time.Time `json:"create_time"`
@@ -27,7 +27,7 @@ type WebDAVWritebackObject struct {
 	AckTime          *time.Time `json:"ack_time"`
 	DurableAt        *time.Time `json:"durable_at"`
 	RemoteSyncState  string     `json:"remote_sync_state" gorm:"size:16;index"`
-	State            string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1"`
+	State            string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1"`
 	SpoolPath        string     `json:"spool_path" gorm:"type:text"`
 	PayloadSHA1      string     `json:"payload_sha1" gorm:"size:40"`
 	RemoteObjectID   string     `json:"remote_object_id" gorm:"size:255"`
@@ -39,7 +39,7 @@ type WebDAVWritebackObject struct {
 	LastError        string     `json:"last_error" gorm:"type:text"`
 	RetryCount       int        `json:"retry_count"`
 	VerifyCount      int        `json:"verify_count"`
-	RetryAt          *time.Time `json:"retry_at" gorm:"index;index:idx_webdav_writeback_queue,priority:2"`
+	RetryAt          *time.Time `json:"retry_at" gorm:"index;index:idx_webdav_writeback_queue,priority:2;index:idx_webdav_writeback_dispatch,priority:3"`
 	CompletedAt      *time.Time `json:"completed_at" gorm:"index;index:idx_webdav_writeback_completed,priority:2"`
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at"`
