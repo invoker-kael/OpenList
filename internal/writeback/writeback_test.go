@@ -34,6 +34,27 @@ func TestUploadWorkerLimit(t *testing.T) {
 	}
 }
 
+func TestWorkerQueueNeedsRefillBatchesCompletionWakeups(t *testing.T) {
+	for _, tc := range []struct {
+		queued   int
+		capacity int
+		workers  int
+		want     bool
+	}{
+		{queued: 16, capacity: 16, workers: 4, want: false},
+		{queued: 8, capacity: 16, workers: 4, want: false},
+		{queued: 7, capacity: 16, workers: 4, want: true},
+		{queued: 0, capacity: 16, workers: 4, want: true},
+		{queued: 1, capacity: 4, workers: 1, want: true},
+		{queued: 2, capacity: 4, workers: 1, want: false},
+		{queued: 0, capacity: 0, workers: 4, want: true},
+	} {
+		if got := workerQueueNeedsRefill(tc.queued, tc.capacity, tc.workers); got != tc.want {
+			t.Fatalf("queued=%d capacity=%d workers=%d refill=%v, want %v", tc.queued, tc.capacity, tc.workers, got, tc.want)
+		}
+	}
+}
+
 func TestProviderProbeWorkerLimit(t *testing.T) {
 	for _, tc := range []struct {
 		workers    int

@@ -5297,6 +5297,15 @@ func releaseWorkerSlot(slots chan struct{}, reserved bool) {
 	<-slots
 }
 
+func workerQueueNeedsRefill(queued, capacity, workers int) bool {
+	if capacity <= 0 {
+		return true
+	}
+	workers = max(1, workers)
+	threshold := min(capacity, workers*2)
+	return queued < threshold
+}
+
 func acquireWorkerSlot(slots chan struct{}, stop <-chan struct{}) (bool, error) {
 	if slots == nil {
 		return false, nil
@@ -6085,9 +6094,11 @@ func (m *workerManager) worker() {
 			releaseWorkerSlot(m.uploads, job.upload)
 			m.inflight.Delete(job.id)
 			m.batchCompleted.Delete(job.id)
-			select {
-			case m.wake <- struct{}{}:
-			default:
+			if workerQueueNeedsRefill(len(m.jobs), cap(m.jobs), conf.Conf.WebDAVWriteback.Workers) {
+				select {
+				case m.wake <- struct{}{}:
+				default:
+				}
 			}
 		}
 	}
