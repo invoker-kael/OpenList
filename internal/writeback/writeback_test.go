@@ -1339,6 +1339,69 @@ func TestPendingDirectoryMoveLocalAuthority(t *testing.T) {
 	}
 }
 
+func TestSpoolBacklogAdmissionCurrent(t *testing.T) {
+	current, ok := spoolBacklogAdmissionCurrent(100, 25)
+	if !ok || current != 125 {
+		t.Fatalf("current=%d ok=%v, want 125 true", current, ok)
+	}
+	if current, ok := spoolBacklogAdmissionCurrent(^uint64(0)-5, 10); ok || current != ^uint64(0) {
+		t.Fatalf("overflow current=%d ok=%v, want max false", current, ok)
+	}
+}
+
+func TestSpoolBacklogAdmissionWeight(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{IncomingReservationChunkMB: 8}}
+	defer func() { conf.Conf = oldConf }()
+
+	if got := spoolBacklogAdmissionWeight(1234); got != 1234 {
+		t.Fatalf("known-length backlog weight=%d, want 1234", got)
+	}
+	if got := spoolBacklogAdmissionWeight(0); got != 0 {
+		t.Fatalf("zero-length backlog weight=%d, want 0", got)
+	}
+	if got := spoolBacklogAdmissionWeight(-1); got != 8*uint64(utils.MB) {
+		t.Fatalf("unknown-length backlog weight=%d, want %d", got, 8*uint64(utils.MB))
+	}
+}
+
+func TestMaxPendingSpoolBytes(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{MaxPendingSpoolMB: 1024}}
+	defer func() { conf.Conf = oldConf }()
+	if got := maxPendingSpoolBytes(); got != 1024*uint64(utils.MB) {
+		t.Fatalf("pending spool limit=%d, want %d", got, 1024*uint64(utils.MB))
+	}
+}
+
+func TestIncomingReservationReleasesBacklogBudget(t *testing.T) {
+	spaceMu.Lock()
+	oldReserved := reservedBacklog
+	reservedBacklog = 4096
+	spaceMu.Unlock()
+	defer func() {
+		spaceMu.Lock()
+		reservedBacklog = oldReserved
+		spaceMu.Unlock()
+	}()
+
+	r := &incomingReservation{backlogReserved: 4096}
+	r.release()
+	spaceMu.Lock()
+	got := reservedBacklog
+	spaceMu.Unlock()
+	if got != 0 {
+		t.Fatalf("backlog reservation leaked %d bytes", got)
+	}
+	r.release()
+	spaceMu.Lock()
+	got = reservedBacklog
+	spaceMu.Unlock()
+	if got != 0 {
+		t.Fatalf("double release changed backlog reservation to %d", got)
+	}
+}
+
 func TestSpoolAdmissionRequired(t *testing.T) {
 	required, ok := spoolAdmissionRequired(20, 30, 40)
 	if !ok || required != 90 {
@@ -1498,6 +1561,13 @@ func TestSpoolCapacityErrorSupportsErrorsIs(t *testing.T) {
 	err := &SpoolCapacityError{Free: 1, Required: 2}
 	if !errors.Is(err, ErrSpoolCapacity) {
 		t.Fatal("SpoolCapacityError must unwrap to ErrSpoolCapacity")
+	}
+	backlogErr := &SpoolCapacityError{Backlog: 200, BacklogLimit: 100}
+	if !errors.Is(backlogErr, ErrSpoolCapacity) {
+		t.Fatal("backlog SpoolCapacityError must unwrap to ErrSpoolCapacity")
+	}
+	if !strings.Contains(backlogErr.Error(), "pending_backlog=200") {
+		t.Fatalf("backlog capacity error lacks backlog details: %v", backlogErr)
 	}
 }
 

@@ -115,6 +115,7 @@ type WebDAVWritebackConfig struct {
 	Enabled                     bool   `json:"enabled" env:"ENABLED"`
 	SpoolDir                    string `json:"spool_dir" env:"SPOOL_DIR"`
 	ReserveFreeSpaceMB          uint64 `json:"reserve_free_space_mb" env:"RESERVE_FREE_SPACE_MB"`
+	MaxPendingSpoolMB           uint64 `json:"max_pending_spool_mb" env:"MAX_PENDING_SPOOL_MB"`
 	IncomingReservationChunkMB  uint64 `json:"incoming_reservation_chunk_mb" env:"INCOMING_RESERVATION_CHUNK_MB"`
 	AdmissionRetrySeconds       int    `json:"admission_retry_seconds" env:"ADMISSION_RETRY_SECONDS"`
 	Workers                     int    `json:"workers" env:"WORKERS"`
@@ -280,6 +281,7 @@ func DefaultConfig(dataDir string) *Config {
 			Enabled:                     true,
 			SpoolDir:                    filepath.Join(dataDir, "writeback"),
 			ReserveFreeSpaceMB:          20 * 1024,
+			MaxPendingSpoolMB:           128 * 1024,
 			IncomingReservationChunkMB:  64,
 			AdmissionRetrySeconds:       5,
 			Workers:                     4,

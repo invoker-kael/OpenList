@@ -245,13 +245,18 @@ var (
 )
 
 type SpoolCapacityError struct {
-	Free     uint64
-	Required uint64
+	Free         uint64
+	Required     uint64
+	Backlog      uint64
+	BacklogLimit uint64
 }
 
 func (e *SpoolCapacityError) Error() string {
 	if e == nil {
 		return ErrSpoolCapacity.Error()
+	}
+	if e.BacklogLimit > 0 {
+		return fmt.Sprintf("%s: pending_backlog=%d backlog_limit=%d", ErrSpoolCapacity, e.Backlog, e.BacklogLimit)
 	}
 	return fmt.Sprintf("%s: free=%d required=%d", ErrSpoolCapacity, e.Free, e.Required)
 }
@@ -2045,6 +2050,13 @@ func incomingReservationChunkBytes() uint64 {
 	return megabytesToBytes(mb)
 }
 
+func maxPendingSpoolBytes() uint64 {
+	if conf.Conf == nil {
+		return 0
+	}
+	return megabytesToBytes(conf.Conf.WebDAVWriteback.MaxPendingSpoolMB)
+}
+
 func spoolAdmissionRequired(floor, reserved, additional uint64) (uint64, bool) {
 	maxUint := ^uint64(0)
 	if floor > maxUint-reserved {
@@ -2055,6 +2067,43 @@ func spoolAdmissionRequired(floor, reserved, additional uint64) (uint64, bool) {
 		return 0, false
 	}
 	return required + additional, true
+}
+
+func spoolBacklogAdmissionCurrent(pending, reserved uint64) (uint64, bool) {
+	if pending > ^uint64(0)-reserved {
+		return ^uint64(0), false
+	}
+	return pending + reserved, true
+}
+
+func spoolBacklogAdmissionWeight(expected int64) uint64 {
+	if expected > 0 {
+		return uint64(expected)
+	}
+	if expected < 0 {
+		return incomingReservationChunkBytes()
+	}
+	return 0
+}
+
+func pendingSpoolBacklogBytes(excludePath string) (uint64, error) {
+	query := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Select("COALESCE(SUM(size), 0) AS bytes").
+		Where("spool_path <> ''").
+		Where("state IN ?", []string{StateQueued, StateFailed, StateUploading, StateVerifying})
+	if excludePath != "" {
+		query = query.Where("path_key <> ?", pathKey(excludePath))
+	}
+	var result struct {
+		Bytes int64 `gorm:"column:bytes"`
+	}
+	if err := query.Scan(&result).Error; err != nil {
+		return 0, err
+	}
+	if result.Bytes < 0 {
+		return 0, errors.New("write-back pending spool backlog is negative")
+	}
+	return uint64(result.Bytes), nil
 }
 
 type receivingPathState struct {
@@ -2069,13 +2118,45 @@ type receivingSession struct {
 var (
 	spaceMu          sync.Mutex
 	reservedIncoming uint64
+	reservedBacklog  uint64
 	receivingMu      sync.Mutex
 	receivingPaths   = make(map[string]*receivingPathState)
 )
 
 type incomingReservation struct {
-	remaining uint64
-	released  bool
+	remaining       uint64
+	backlogReserved uint64
+	released        bool
+}
+
+func (r *incomingReservation) reserveBacklog(p string, expected int64) error {
+	if r == nil {
+		return nil
+	}
+	limit := maxPendingSpoolBytes()
+	if limit == 0 {
+		return nil
+	}
+
+	spaceMu.Lock()
+	defer spaceMu.Unlock()
+
+	pending, err := pendingSpoolBacklogBytes(p)
+	if err != nil {
+		return err
+	}
+	current, ok := spoolBacklogAdmissionCurrent(pending, reservedBacklog)
+	if !ok || current >= limit {
+		return &SpoolCapacityError{Backlog: current, BacklogLimit: limit}
+	}
+
+	weight := spoolBacklogAdmissionWeight(expected)
+	if weight > ^uint64(0)-reservedBacklog {
+		return &SpoolCapacityError{Backlog: ^uint64(0), BacklogLimit: limit}
+	}
+	reservedBacklog += weight
+	r.backlogReserved = weight
+	return nil
 }
 
 func completedSpoolPressureReclaimEnabled() bool {
@@ -2235,18 +2316,29 @@ func (r *incomingReservation) release() {
 	} else {
 		reservedIncoming -= r.remaining
 	}
+	if r.backlogReserved > reservedBacklog {
+		reservedBacklog = 0
+	} else {
+		reservedBacklog -= r.backlogReserved
+	}
 	r.remaining = 0
+	r.backlogReserved = 0
 	r.released = true
 }
 
-func reserveIncomingBytes(expected int64) (*incomingReservation, error) {
+func reserveIncomingBytesForPath(p string, expected int64) (*incomingReservation, error) {
 	reservation := &incomingReservation{}
+	if err := reservation.reserveBacklog(p, expected); err != nil {
+		return nil, err
+	}
+
 	var initial uint64
 	switch {
 	case expected > 0:
 		initial = uint64(expected)
 	case expected == 0:
 		if err := reservation.verifyCapacity(); err != nil {
+			reservation.release()
 			return nil, err
 		}
 		return reservation, nil
@@ -2254,9 +2346,14 @@ func reserveIncomingBytes(expected int64) (*incomingReservation, error) {
 		initial = incomingReservationChunkBytes()
 	}
 	if err := reservation.grow(initial); err != nil {
+		reservation.release()
 		return nil, err
 	}
 	return reservation, nil
+}
+
+func reserveIncomingBytes(expected int64) (*incomingReservation, error) {
+	return reserveIncomingBytesForPath("", expected)
 }
 
 func beginReceiving(p string) (*receivingSession, func()) {
@@ -2624,7 +2721,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		return nil, false, err
 	}
 
-	reservation, err := reserveIncomingBytes(expected)
+	reservation, err := reserveIncomingBytesForPath(p, expected)
 	if err != nil {
 		return nil, false, err
 	}
