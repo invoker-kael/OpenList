@@ -585,7 +585,7 @@ func GetProviderOperation(method, src, dst string, depth int) (*model.WebDAVProv
 		return nil, nil
 	}
 	var op model.WebDAVProviderOperation
-	err := db.GetDb().Where("operation_key = ?", providerOperationKey(method, src, dst, depth)).First(&op).Error
+	err := db.GetDb().Where("operation_key = ?", providerOperationKey(method, src, dst, depth)).Take(&op).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
@@ -1144,7 +1144,7 @@ func ObserveProviderOperationRecovery(op *model.WebDAVProviderOperation, recover
 	confirmed := recovery != ProviderOperationInconclusive
 	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var locked model.WebDAVProviderOperation
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&locked, op.ID).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Take(&locked, op.ID).Error; err != nil {
 			return err
 		}
 
@@ -1204,7 +1204,7 @@ func applyProviderOperationDestinationRoot(op *model.WebDAVProviderOperation) er
 	return db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var dst model.WebDAVWritebackObject
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("path_key = ?", pathKey(op.DestinationPath)).First(&dst).Error
+			Where("path_key = ?", pathKey(op.DestinationPath)).Take(&dst).Error
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
@@ -4061,7 +4061,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 	}
 
 	var srcRow model.WebDAVWritebackObject
-	if err := db.GetDb().Where("path_key = ?", srcKey).First(&srcRow).Error; err != nil {
+	if err := db.GetDb().Where("path_key = ?", srcKey).Take(&srcRow).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return false, false, nil
 		}
@@ -4085,7 +4085,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 			return err
 		}
 		var lockedSrc model.WebDAVWritebackObject
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).First(&lockedSrc).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).Take(&lockedSrc).Error; err != nil {
 			return err
 		}
 		if lockedSrc.IsDir || canonicalDeleted(&lockedSrc) ||
@@ -4094,7 +4094,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		}
 
 		var dstRow model.WebDAVWritebackObject
-		dstErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", dstKey).First(&dstRow).Error
+		dstErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", dstKey).Take(&dstRow).Error
 		if dstErr != nil && !errors.Is(dstErr, gorm.ErrRecordNotFound) {
 			return dstErr
 		}
@@ -4191,7 +4191,7 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 		return false, false, nil
 	}
 	var srcRow model.WebDAVWritebackObject
-	if err := db.GetDb().Where("path_key = ?", pathKey(src)).First(&srcRow).Error; err != nil {
+	if err := db.GetDb().Where("path_key = ?", pathKey(src)).Take(&srcRow).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return false, false, nil
 		}
@@ -4214,7 +4214,7 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 			return err
 		}
 		var lockedSrc model.WebDAVWritebackObject
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).First(&lockedSrc).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).Take(&lockedSrc).Error; err != nil {
 			return err
 		}
 		if lockedSrc.IsDir || canonicalDeleted(&lockedSrc) || lockedSrc.SpoolPath == "" {
@@ -4223,7 +4223,7 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 
 		dstKey := pathKey(dst)
 		var dstRow model.WebDAVWritebackObject
-		dstErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", dstKey).First(&dstRow).Error
+		dstErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", dstKey).Take(&dstRow).Error
 		if dstErr != nil && !errors.Is(dstErr, gorm.ErrRecordNotFound) {
 			return dstErr
 		}
@@ -6106,7 +6106,7 @@ func (m *workerManager) worker() {
 
 func (m *workerManager) process(id uint) {
 	var row model.WebDAVWritebackObject
-	if err := db.GetDb().First(&row, id).Error; err != nil {
+	if err := db.GetDb().Take(&row, id).Error; err != nil {
 		return
 	}
 	switch row.State {
@@ -7506,7 +7506,7 @@ func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 	// path. Re-check the generation before touching the provider so a queued old
 	// delete cannot blindly remove a newer canonical generation.
 	var current model.WebDAVWritebackObject
-	if err := db.GetDb().First(&current, row.ID).Error; err != nil {
+	if err := db.GetDb().Take(&current, row.ID).Error; err != nil {
 		return
 	}
 	if current.Generation != row.Generation || !canonicalDeleted(&current) {
@@ -7539,7 +7539,7 @@ func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 	// If a newer generation already reached COMPLETED, the stale delete may
 	// have removed that object after its verification. Re-queue from the local
 	// spool so the newest Cloud Sync payload deterministically wins.
-	if err := db.GetDb().First(&current, row.ID).Error; err != nil {
+	if err := db.GetDb().Take(&current, row.ID).Error; err != nil {
 		return
 	}
 	if current.Generation != row.Generation || !canonicalDeleted(&current) {
@@ -7589,7 +7589,7 @@ func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 
 	// Re-check one final time after the verification request. A PUT may have
 	// recreated the path while we were waiting on the provider listing.
-	if err := db.GetDb().First(&current, row.ID).Error; err != nil {
+	if err := db.GetDb().Take(&current, row.ID).Error; err != nil {
 		return
 	}
 	if current.Generation != row.Generation || !canonicalDeleted(&current) {
