@@ -168,7 +168,7 @@ func TestFilterDispatchExcludedIDsPreservesReadyWindow(t *testing.T) {
 	rows := []model.WebDAVWritebackObject{
 		{ID: 1}, {ID: 2}, {ID: 3}, {ID: 4}, {ID: 5},
 	}
-	got := filterDispatchExcludedIDs(rows, []uint{2, 4}, 3)
+	got := filterDispatchExcludedIDs(rows, map[uint]struct{}{2: {}, 4: {}}, 3)
 	want := []uint{1, 3, 5}
 	if len(got) != len(want) {
 		t.Fatalf("filtered dispatch len=%d, want %d", len(got), len(want))
@@ -180,14 +180,20 @@ func TestFilterDispatchExcludedIDsPreservesReadyWindow(t *testing.T) {
 	}
 }
 
-func TestWorkerManagerInflightIDsAreStable(t *testing.T) {
+func TestWorkerManagerInflightIDSet(t *testing.T) {
 	m := &workerManager{}
 	m.inflight.Store(uint(9), struct{}{})
 	m.inflight.Store(uint(2), struct{}{})
 	m.inflight.Store("ignore", struct{}{})
-	got := m.inflightIDs()
-	if !reflect.DeepEqual(got, []uint{2, 9}) {
-		t.Fatalf("inflight ids = %v, want [2 9]", got)
+	got := m.inflightIDSet()
+	if len(got) != 2 {
+		t.Fatalf("inflight ids = %v, want two uint IDs", got)
+	}
+	if _, ok := got[2]; !ok {
+		t.Fatal("inflight set is missing id 2")
+	}
+	if _, ok := got[9]; !ok {
+		t.Fatal("inflight set is missing id 9")
 	}
 }
 

@@ -364,3 +364,12 @@ The receive path now acquires the singleton admission fence only when `max_pendi
 Dispatch no longer emits a variable `id NOT IN (...)` predicate for the current in-flight worker set. It overfetchs by the small in-flight count, applies the exclusion in memory, and keeps `LoadOrStore` as the final claim. This preserves the ready window while giving MySQL one stable indexed queue-query shape.
 
 Provider-operation protection/conflict scans now share one active-intent query. Abandoned PREPARED rows and non-lifecycle states are filtered in SQL before protection checks, while STARTED/FAILED/APPLIED and fresh PREPARED intents retain the same safety semantics. This reduces rows and duplicate filtering while making the active-intent definition consistent across WebDAV paths.
+
+
+### Fewer database round trips per scheduling and admission decision
+
+The scheduler now snapshots in-flight worker IDs once into a set and reuses that set across DELETE, VERIFY, directory and file scans. This removes the previous sort and repeated slice-to-map conversions while preserving the same overfetch window and final `LoadOrStore` race-safe claim.
+
+Backlog admission now excludes the canonical row being replaced inside the aggregate itself with one conditional SUM. This replaces SUM plus a second path-key lookup, preserves the same pending-state definition, and gives canonical backlog accounting one database snapshot.
+
+When `max_pending_spool_mb` is disabled, receive completion skips the reservation DELETE entirely because that mode never creates reservation rows. Provider-operation conflict and path-protection queries now select only routing/lifecycle columns needed for the exact decision rather than loading recovery evidence and large error fields.

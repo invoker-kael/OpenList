@@ -402,12 +402,14 @@ func activeProviderOperationQuery(now time.Time) *gorm.DB {
 		Where("state <> ? OR updated_at > ?", ProviderOperationPrepared, preparedCutoff)
 }
 
+const providerOperationRoutingColumns = "operation_key, method, source_path, destination_path, depth, state, created_at, updated_at"
+
 func activeProviderOperations() ([]model.WebDAVProviderOperation, error) {
 	var ops []model.WebDAVProviderOperation
 	// Protection checks only need routing/fence fields. Filter inactive and
 	// abandoned intents in SQL and avoid loading recovery snapshots/TEXT errors.
 	if err := activeProviderOperationQuery(time.Now()).
-		Select("method", "source_path", "destination_path", "depth", "state", "created_at", "updated_at").
+		Select(providerOperationRoutingColumns).
 		Order("updated_at asc").
 		Find(&ops).Error; err != nil {
 		return nil, err
@@ -421,6 +423,7 @@ func ProviderOperationConflict(method, src, dst string, depth int) (*model.WebDA
 	}
 	var ops []model.WebDAVProviderOperation
 	if err := activeProviderOperationQuery(time.Now()).
+		Select(providerOperationRoutingColumns).
 		Order("updated_at asc").
 		Find(&ops).Error; err != nil {
 		return nil, err
@@ -440,6 +443,7 @@ func ProviderOperationPathConflict(p string) (*model.WebDAVProviderOperation, er
 	p = utils.FixAndCleanPath(p)
 	var ops []model.WebDAVProviderOperation
 	if err := activeProviderOperationQuery(time.Now()).
+		Select(providerOperationRoutingColumns).
 		Order("updated_at asc").
 		Find(&ops).Error; err != nil {
 		return nil, err
@@ -2252,38 +2256,23 @@ func pendingSpoolBacklogBytes(tx *gorm.DB, excludePath string) (uint64, error) {
 	var result struct {
 		Bytes int64 `gorm:"column:bytes"`
 	}
-	if err := tx.Model(&model.WebDAVWritebackObject{}).
-		Select("COALESCE(SUM(size), 0) AS bytes").
-		Where("state IN ?", []string{StateQueued, legacyStateFailed, StateUploading, StateVerifying}).
-		Scan(&result).Error; err != nil {
+	query := tx.Model(&model.WebDAVWritebackObject{}).
+		Where("state IN ?", []string{StateQueued, legacyStateFailed, StateUploading, StateVerifying})
+	if excludePath == "" {
+		query = query.Select("COALESCE(SUM(size), 0) AS bytes")
+	} else {
+		// PathKey is unique, so excluding the replacing canonical generation in
+		// the aggregate is exactly equivalent to SUM + a second point lookup.
+		// Doing it in one statement also gives admission one database snapshot.
+		query = query.Select("COALESCE(SUM(CASE WHEN path_key = ? THEN 0 ELSE size END), 0) AS bytes", pathKey(excludePath))
+	}
+	if err := query.Scan(&result).Error; err != nil {
 		return 0, err
 	}
 	if result.Bytes < 0 {
 		return 0, errors.New("write-back pending spool backlog is negative")
 	}
-	total := uint64(result.Bytes)
-	if excludePath == "" {
-		return total, nil
-	}
-
-	var excluded model.WebDAVWritebackObject
-	err := tx.Select("path_key", "state", "size").
-		Where("path_key = ?", pathKey(excludePath)).
-		First(&excluded).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return total, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	if !pendingBacklogState(excluded.State) || excluded.Size <= 0 {
-		return total, nil
-	}
-	size := uint64(excluded.Size)
-	if size >= total {
-		return 0, nil
-	}
-	return total - size, nil
+	return uint64(result.Bytes), nil
 }
 
 func activeReceiveBacklogBytes(tx *gorm.DB, now time.Time) (uint64, error) {
@@ -2765,9 +2754,11 @@ func endReceiveSequence(ctx context.Context, p string, sequence uint64) {
 				return err
 			}
 		}
-		if err := tx.Where("path_key = ? AND sequence = ?", pathKey(p), sequence).
-			Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
-			return err
+		if backlogLimited {
+			if err := tx.Where("path_key = ? AND sequence = ?", pathKey(p), sequence).
+				Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
+				return err
+			}
 		}
 
 		var fence model.WebDAVWritebackReceiveFence
@@ -5075,15 +5066,14 @@ func (m *workerManager) consumeBatchCompleted(id uint) bool {
 	return ok
 }
 
-func (m *workerManager) inflightIDs() []uint {
-	ids := make([]uint, 0)
+func (m *workerManager) inflightIDSet() map[uint]struct{} {
+	ids := make(map[uint]struct{})
 	m.inflight.Range(func(key, _ any) bool {
 		if id, ok := key.(uint); ok {
-			ids = append(ids, id)
+			ids[id] = struct{}{}
 		}
 		return true
 	})
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
 }
 
@@ -5347,7 +5337,7 @@ func fairDispatchFiles(rows []model.WebDAVWritebackObject) []model.WebDAVWriteba
 	return out
 }
 
-func filterDispatchExcludedIDs(rows []model.WebDAVWritebackObject, excludedIDs []uint, limit int) []model.WebDAVWritebackObject {
+func filterDispatchExcludedIDs(rows []model.WebDAVWritebackObject, excludedIDs map[uint]struct{}, limit int) []model.WebDAVWritebackObject {
 	if len(rows) == 0 || limit <= 0 {
 		return nil
 	}
@@ -5357,13 +5347,9 @@ func filterDispatchExcludedIDs(rows []model.WebDAVWritebackObject, excludedIDs [
 		}
 		return rows
 	}
-	excluded := make(map[uint]struct{}, len(excludedIDs))
-	for _, id := range excludedIDs {
-		excluded[id] = struct{}{}
-	}
 	filtered := rows[:0]
 	for i := range rows {
-		if _, skip := excluded[rows[i].ID]; skip {
+		if _, skip := excludedIDs[rows[i].ID]; skip {
 			continue
 		}
 		filtered = append(filtered, rows[i])
@@ -5374,7 +5360,7 @@ func filterDispatchExcludedIDs(rows []model.WebDAVWritebackObject, excludedIDs [
 	return filtered
 }
 
-func loadDispatchClass(now time.Time, states []string, isDir *bool, excludedIDs []uint, limit int) ([]model.WebDAVWritebackObject, error) {
+func loadDispatchClass(now time.Time, states []string, isDir *bool, excludedIDs map[uint]struct{}, limit int) ([]model.WebDAVWritebackObject, error) {
 	var rows []model.WebDAVWritebackObject
 	query := db.GetDb().
 		Select("id", "path", "parent_key", "size", "is_dir", "state").
@@ -5536,7 +5522,7 @@ func dispatchRootDeletedRows(rows []model.WebDAVWritebackObject, now time.Time) 
 	return ready, nil
 }
 
-func loadDispatchRows(now time.Time, workers, budget int, excludedIDs []uint) ([]model.WebDAVWritebackObject, error) {
+func loadDispatchRows(now time.Time, workers, budget int, excludedIDs map[uint]struct{}) ([]model.WebDAVWritebackObject, error) {
 	if budget <= 0 {
 		return nil, nil
 	}
@@ -5610,7 +5596,7 @@ func (m *workerManager) dispatch() {
 		return
 	}
 	now := time.Now()
-	rows, err := loadDispatchRows(now, max(1, conf.Conf.WebDAVWriteback.Workers), freeJobs, m.inflightIDs())
+	rows, err := loadDispatchRows(now, max(1, conf.Conf.WebDAVWriteback.Workers), freeJobs, m.inflightIDSet())
 	if err != nil {
 		log.Errorf("write-back queue scan failed: %v", err)
 		return
