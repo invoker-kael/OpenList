@@ -1362,6 +1362,21 @@ func TestSpoolBacklogAdmissionCurrent(t *testing.T) {
 	}
 }
 
+func TestProjectSpoolBacklogAdmission(t *testing.T) {
+	if projected, ok := projectSpoolBacklogAdmission(900, 100, 1000); !ok || projected != 1000 {
+		t.Fatalf("exact-limit projection=%d ok=%v, want 1000 true", projected, ok)
+	}
+	if projected, ok := projectSpoolBacklogAdmission(900, 500, 1000); ok || projected != 1400 {
+		t.Fatalf("over-limit projection=%d ok=%v, want 1400 false", projected, ok)
+	}
+	if projected, ok := projectSpoolBacklogAdmission(^uint64(0)-5, 10, ^uint64(0)); ok || projected != ^uint64(0) {
+		t.Fatalf("overflow projection=%d ok=%v, want max false", projected, ok)
+	}
+	if projected, ok := projectSpoolBacklogAdmission(900, 500, 0); !ok || projected != 1400 {
+		t.Fatalf("disabled-limit projection=%d ok=%v, want 1400 true", projected, ok)
+	}
+}
+
 func TestSpoolBacklogAdmissionWeight(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{IncomingReservationChunkMB: 8}}

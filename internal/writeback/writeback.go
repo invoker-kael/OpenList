@@ -2076,6 +2076,17 @@ func spoolBacklogAdmissionCurrent(pending, reserved uint64) (uint64, bool) {
 	return pending + reserved, true
 }
 
+func projectSpoolBacklogAdmission(current, incoming, limit uint64) (uint64, bool) {
+	projected, ok := spoolBacklogAdmissionCurrent(current, incoming)
+	if !ok {
+		return ^uint64(0), false
+	}
+	if limit > 0 && projected > limit {
+		return projected, false
+	}
+	return projected, true
+}
+
 func spoolBacklogAdmissionWeight(expected int64) uint64 {
 	if expected > 0 {
 		return uint64(expected)
@@ -2456,8 +2467,9 @@ func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64
 			if err != nil {
 				return err
 			}
-			if current >= limit {
-				return &SpoolCapacityError{Backlog: current, BacklogLimit: limit}
+			projected, allowed := projectSpoolBacklogAdmission(current, spoolBacklogAdmissionWeight(expected), limit)
+			if !allowed {
+				return &SpoolCapacityError{Backlog: projected, BacklogLimit: limit}
 			}
 		}
 
@@ -2538,6 +2550,12 @@ func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64, ex
 
 func endReceiveSequence(ctx context.Context, p string, sequence uint64) {
 	_ = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Serialize reservation release with admission/progress updates. Without
+		// the same fence, a concurrent PUT can observe a reservation that this
+		// receive has already finished and return a needless 507 retry.
+		if err := lockAdmissionFence(tx); err != nil {
+			return err
+		}
 		if err := tx.Where("path_key = ? AND sequence = ?", pathKey(p), sequence).
 			Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
 			return err
