@@ -2181,12 +2181,13 @@ func pendingSpoolBacklogBytes(tx *gorm.DB, excludePath string) (uint64, error) {
 	query := tx.Model(&model.WebDAVWritebackObject{}).
 		Where("state IN ?", []string{StateQueued, legacyStateFailed, StateUploading, StateVerifying})
 	if excludePath == "" {
-		query = query.Select("COALESCE(SUM(size), 0) AS bytes")
+		query = query.Select("COALESCE(SUM(CASE WHEN spool_path = '' THEN 0 ELSE size END), 0) AS bytes")
 	} else {
-		// PathKey is unique, so excluding the replacing canonical generation in
-		// the aggregate is exactly equivalent to SUM + a second point lookup.
-		// Doing it in one statement also gives admission one database snapshot.
-		query = query.Select("COALESCE(SUM(CASE WHEN path_key = ? THEN 0 ELSE size END), 0) AS bytes", pathKey(excludePath))
+		// Backlog is durable payload pressure, not metadata-only control work.
+		query = query.Select(
+			"COALESCE(SUM(CASE WHEN spool_path = '' OR path_key = ? THEN 0 ELSE size END), 0) AS bytes",
+			pathKey(excludePath),
+		)
 	}
 	if err := query.Scan(&result).Error; err != nil {
 		return 0, err
@@ -3770,7 +3771,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 	if srcRow.IsDir {
 		return movePendingDirectory(src, dst, overwrite)
 	}
-	if srcRow.SpoolPath == "" {
+	if srcRow.SpoolPath == "" && (srcRow.State != StateCompleted || !canonicalAcked(&srcRow)) {
 		return false, false, nil
 	}
 
@@ -3785,7 +3786,8 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", srcRow.ID).First(&lockedSrc).Error; err != nil {
 			return err
 		}
-		if lockedSrc.IsDir || canonicalDeleted(&lockedSrc) || lockedSrc.SpoolPath == "" {
+		if lockedSrc.IsDir || canonicalDeleted(&lockedSrc) ||
+			(lockedSrc.SpoolPath == "" && (lockedSrc.State != StateCompleted || !canonicalAcked(&lockedSrc))) {
 			return gorm.ErrRecordNotFound
 		}
 
@@ -3834,6 +3836,13 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		clearRemoteVerification(&dstRow)
 		dstRow.RetryAt = &settleAt
 		dstRow.CompletedAt = nil
+		replicaMove := lockedSrc.SpoolPath == ""
+		if replicaMove {
+			// No payload is needed: Cloud Sync sees the destination now while
+			// the old provider path is moved asynchronously by the worker.
+			dstRow.CleanupPath = src
+			dstRow.RetryAt = &now
+		}
 
 		if dstRow.ID == 0 {
 			if err := tx.Create(&dstRow).Error; err != nil {
@@ -3844,6 +3853,11 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		}
 
 		tombstoneMovedSource(&lockedSrc, now)
+		if replicaMove {
+			hold := now.Add(replicaMoveSourceHoldDelay())
+			lockedSrc.RetryAt = &hold
+			lockedSrc.LastError = "waiting for canonical destination replica move"
+		}
 		return tx.Save(&lockedSrc).Error
 	})
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -4915,16 +4929,26 @@ func providerProbeWorkerLimit(workers, configured int) int {
 	return boundedWorkerLimit(workers, configured)
 }
 
+func queuedReplicaMove(row *model.WebDAVWritebackObject) bool {
+	return row != nil &&
+		!row.IsDir &&
+		row.State == StateQueued &&
+		row.SpoolPath == "" &&
+		row.CleanupPath != ""
+}
+
 func providerUploadCandidate(row *model.WebDAVWritebackObject) bool {
 	return row != nil &&
 		!row.IsDir &&
-		row.State == StateQueued
+		row.State == StateQueued &&
+		!queuedReplicaMove(row)
 }
 
 func multipartProviderUploadCandidate(row *model.WebDAVWritebackObject) bool {
 	return row != nil &&
 		!row.IsDir &&
 		row.State == StateQueued &&
+		row.SpoolPath != "" &&
 		row.Size > open115MultipartChunkSize
 }
 
@@ -5748,6 +5772,251 @@ func shouldRemoveStaleRemote(uploadedPath string, current *model.WebDAVWriteback
 	return canonicalDeleted(current) || current.Path != uploadedPath
 }
 
+func replicaMoveSourceHoldDelay() time.Duration {
+	seconds := 30
+	if conf.Conf != nil {
+		seconds = max(seconds, max(1, conf.Conf.WebDAVWriteback.RetryMaxSeconds)*2)
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func holdReplicaMoveSource(src string, until time.Time) {
+	if src == "" {
+		return
+	}
+	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("path_key = ? AND state = ?", pathKey(src), StateDeleted).
+		Where("retry_at IS NULL OR retry_at < ?", until).
+		Update("retry_at", &until).Error
+}
+
+func replicaMoveSourceRecreated(src string) (bool, error) {
+	current, err := getByPath(src)
+	if err != nil || current == nil {
+		return false, err
+	}
+	return !canonicalDeleted(current), nil
+}
+
+func rollbackReplicaMove(ctx context.Context, stagedPath, srcDir, srcName, tempName string) {
+	if path.Dir(stagedPath) != srcDir {
+		if _, err := fs.Move(context.WithValue(ctx, conf.NoTaskKey, struct{}{}), stagedPath, srcDir); err != nil {
+			return
+		}
+		stagedPath = path.Join(srcDir, tempName)
+	}
+	_ = fs.Rename(ctx, stagedPath, srcName)
+}
+
+func moveReplicaExact(ctx context.Context, src, dst string) error {
+	src = utils.FixAndCleanPath(src)
+	dst = utils.FixAndCleanPath(dst)
+	srcDir := path.Dir(src)
+	dstDir := path.Dir(dst)
+	srcName := path.Base(src)
+	dstName := path.Base(dst)
+
+	switch {
+	case srcDir == dstDir:
+		return fs.Rename(ctx, src, dstName)
+	case srcName == dstName:
+		_, err := fs.Move(context.WithValue(ctx, conf.NoTaskKey, struct{}{}), src, dstDir)
+		return err
+	default:
+		tempName := ".openlist-webdav-move-" + uuid.NewString()
+		if err := fs.Rename(ctx, src, tempName); err != nil {
+			return err
+		}
+		tempSrc := path.Join(srcDir, tempName)
+		if _, err := fs.Move(context.WithValue(ctx, conf.NoTaskKey, struct{}{}), tempSrc, dstDir); err != nil {
+			rollbackReplicaMove(ctx, tempSrc, srcDir, srcName, tempName)
+			return err
+		}
+		movedTemp := path.Join(dstDir, tempName)
+		if err := fs.Rename(ctx, movedTemp, dstName); err != nil {
+			rollbackReplicaMove(ctx, movedTemp, srcDir, srcName, tempName)
+			return err
+		}
+		return nil
+	}
+}
+
+func (m *workerManager) replicaMoveSourceObject(src string, requireHash bool) (model.Obj, error) {
+	if requireHash {
+		objs, err := m.refreshParent(path.Dir(src))
+		if err != nil {
+			return nil, err
+		}
+		return exactRemoteByName(objs, path.Base(src)), nil
+	}
+	remote, err := fs.Get(m.ctx, src, &fs.GetArgs{NoLog: true})
+	if err == nil {
+		return remote, nil
+	}
+	if !errs.IsObjectNotFound(err) {
+		return nil, err
+	}
+	objs, listErr := m.refreshParent(path.Dir(src))
+	if listErr != nil {
+		return nil, listErr
+	}
+	return exactRemoteByName(objs, path.Base(src)), nil
+}
+
+func (m *workerManager) abandonReplicaMove(row *model.WebDAVWritebackObject, reason string) {
+	if row == nil {
+		return
+	}
+	now := time.Now()
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state IN ? AND spool_path = '' AND cleanup_path <> ''",
+			row.ID, row.Generation, []string{StateQueued, StateUploading, StateVerifying}).
+		Updates(map[string]any{
+			"canonical_state":    CanonicalStateDeleted,
+			"state":              StateDeleted,
+			"cleanup_path":       "",
+			"retry_at":           &now,
+			"last_error":         reason,
+			"retry_count":        0,
+			"verify_count":       0,
+			"completed_at":       nil,
+			"remote_object_id":   "",
+			"remote_sha1":        "",
+			"remote_generation":  0,
+			"remote_verified_at": nil,
+		})
+	if res.Error == nil && res.RowsAffected > 0 {
+		wake()
+	}
+}
+
+func (m *workerManager) enterReplicaMoveVerification(row *model.WebDAVWritebackObject, message string) {
+	now := time.Now()
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+		Updates(map[string]any{
+			"state":        StateVerifying,
+			"retry_at":     &now,
+			"verify_count": 0,
+			"last_error":   message,
+		})
+	if res.Error == nil && res.RowsAffected > 0 {
+		row.State = StateVerifying
+		row.RetryAt = &now
+		m.processVerify(row)
+	}
+}
+
+func (m *workerManager) processReplicaMove(row *model.WebDAVWritebackObject) {
+	if row == nil || !queuedReplicaMove(row) {
+		return
+	}
+	src := utils.FixAndCleanPath(row.CleanupPath)
+	if src == "" || src == row.Path {
+		m.abandonReplicaMove(row, "invalid provider MOVE source; forcing Cloud Sync repair")
+		return
+	}
+
+	recreated, err := replicaMoveSourceRecreated(src)
+	if err != nil {
+		m.failAfter(row, err, 2*time.Second)
+		return
+	}
+	if recreated {
+		m.abandonReplicaMove(row, "MOVE source was recreated before provider convergence; forcing destination re-upload")
+		return
+	}
+
+	holdUntil := time.Now().Add(replicaMoveSourceHoldDelay())
+	holdReplicaMoveSource(src, holdUntil)
+
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ? AND spool_path = '' AND cleanup_path = ?",
+			row.ID, row.Generation, StateQueued, src).
+		Updates(map[string]any{"state": StateUploading, "retry_at": nil, "last_error": ""})
+	if res.Error != nil || res.RowsAffected == 0 {
+		return
+	}
+
+	requireHash := providerRequiresPayloadHash(row.Path)
+	remote, verifyErr := m.remoteForVerify(row)
+	verification := classifyRemoteVerification(row, remote, verifyErr, requireHash)
+	switch verification {
+	case remoteVerificationMatch:
+		m.completeRemoteVerification(row, remote, []string{StateUploading}, requireHash)
+		return
+	case remoteVerificationInconclusive:
+		next := time.Now().Add(remoteVerificationInconclusiveDelay())
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+			Updates(map[string]any{
+				"state":      StateQueued,
+				"retry_at":   &next,
+				"last_error": "provider MOVE destination identity is inconclusive; waiting without mutation",
+			}).Error
+		return
+	}
+
+	if remote != nil {
+		if err := fs.Remove(m.ctx, row.Path); err != nil && !errs.IsObjectNotFound(err) {
+			m.failAfter(row, err, 2*time.Second)
+			return
+		}
+		absent, absentErr := m.remoteDeleteAbsent(row)
+		if absentErr != nil {
+			m.failAfter(row, absentErr, 2*time.Second)
+			return
+		}
+		if !absent {
+			m.failAfter(row, errors.New("provider MOVE destination is still visible after overwrite cleanup"), 2*time.Second)
+			return
+		}
+	}
+
+	sourceRemote, sourceErr := m.replicaMoveSourceObject(src, requireHash)
+	if sourceErr != nil {
+		m.failAfter(row, sourceErr, 2*time.Second)
+		return
+	}
+	if sourceRemote == nil {
+		// Source disappearance can mean a previous MOVE succeeded while the
+		// destination is still propagating. Verify first; only after repeated
+		// full verification cycles do we force Cloud Sync to re-PUT.
+		if row.RetryCount >= 2 {
+			m.abandonReplicaMove(row, "provider MOVE source and destination stayed absent; forcing destination re-upload")
+			return
+		}
+		m.enterReplicaMoveVerification(row, "provider MOVE source is absent; checking destination propagation")
+		return
+	}
+
+	switch compareRemoteContent(row, sourceRemote, requireHash) {
+	case remoteContentMismatch:
+		m.abandonReplicaMove(row, "provider MOVE source no longer matches the canonical generation; forcing destination re-upload")
+		return
+	case remoteContentInconclusive:
+		next := time.Now().Add(remoteVerificationInconclusiveDelay())
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+			Updates(map[string]any{
+				"state":      StateQueued,
+				"retry_at":   &next,
+				"last_error": "provider MOVE source identity is inconclusive; waiting without mutation",
+			}).Error
+		return
+	}
+
+	if err := moveReplicaExact(m.ctx, src, row.Path); err != nil {
+		if errs.IsObjectNotFound(err) {
+			m.enterReplicaMoveVerification(row, "provider MOVE source disappeared during mutation; checking destination propagation")
+			return
+		}
+		m.failAfter(row, err, 2*time.Second)
+		return
+	}
+	m.enterReplicaMoveVerification(row, "")
+}
+
 func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	if waiting, err := m.waitForCanonicalParent(row); err != nil {
 		m.failAfter(row, err, 2*time.Second)
@@ -5768,6 +6037,10 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued}).
 			Update("retry_at", &next).Error
+		return
+	}
+	if queuedReplicaMove(row) {
+		m.processReplicaMove(row)
 		return
 	}
 	if row.RetryCount > 0 {
@@ -6171,6 +6444,9 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 }
 
 func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
+	if row.CleanupPath != "" && row.SpoolPath == "" {
+		holdReplicaMoveSource(row.CleanupPath, time.Now().Add(replicaMoveSourceHoldDelay()))
+	}
 	if row.IsDir {
 		now := time.Now()
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).

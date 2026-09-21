@@ -391,3 +391,12 @@ The synchronous WebDAV path now follows the observed Synology Cloud Sync sequenc
 Directory PROPFIND is now a pure merge. Provider-only names remain visible, canonical tombstones hide stale provider names, and every live canonical name overrides provider size, mtime and ETag/type-facing metadata. A lagging 115 listing therefore cannot turn a successful large PUT into a different verification snapshot and trigger retransmission.
 
 Remote-replica health is decoupled into a dedicated background loop. Every 30 seconds it scans at most 32 completed no-spool rows whose evidence is due, under the existing provider-probe concurrency limit, and applies the existing conservative two-observation reconciliation rules. Remote loss can still be surfaced for one-way repair, but provider GET/LIST/SHA-1 latency and eventual consistency are no longer on Cloud Sync's client-visible correctness path.
+
+
+### Canonical-first MOVE after spool release
+
+Tracked completed files now keep the fast Cloud Sync MOVE path after their local spool cache is released. The MOVE transaction publishes the destination canonical snapshot and source tombstone atomically, then returns to the client; the destination keeps only the old provider path as a background replica-move pointer.
+
+That metadata-only MOVE does not count as spool backlog and does not consume payload-upload or large-multipart slots. For 115, both destination and source identity decisions use force-refreshed parent listings and require the canonical SHA-1 evidence before mutation. A matching destination is treated as crash/retry recovery, an inconclusive view waits without mutation, and only a conclusive mismatch may be removed as an authorized overwrite.
+
+The source tombstone is held while the destination MOVE is queued or verifying so DELETE priority cannot erase the provider source first. If the source canonical path is recreated, the worker refuses to move it; if the old provider payload can no longer be proven, the destination becomes a tombstone so Cloud Sync repairs it with PUT instead of risking movement of a newer file.

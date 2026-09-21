@@ -245,13 +245,23 @@ func TestProviderUploadCandidate(t *testing.T) {
 	if providerUploadCandidate(row) {
 		t.Fatal("directory creation must stay on the control path")
 	}
+	row.IsDir = false
+	row.SpoolPath = ""
+	row.CleanupPath = "/old/file.bin"
+	if providerUploadCandidate(row) {
+		t.Fatal("metadata-only replica MOVE must not consume a provider-upload slot")
+	}
+	if !queuedReplicaMove(row) {
+		t.Fatal("completed-file MOVE without spool must use the replica MOVE control path")
+	}
 }
 
 func TestLargeProviderUploadCandidate(t *testing.T) {
 	large := &model.WebDAVWritebackObject{
-		State: StateQueued,
-		Size:  open115MultipartChunkSize + 1,
-		Path:  "/large.bin",
+		State:     StateQueued,
+		Size:      open115MultipartChunkSize + 1,
+		Path:      "/large.bin",
+		SpoolPath: "/spool/large.data",
 	}
 	calls := 0
 	requireHash := func(p string) bool {
@@ -288,6 +298,17 @@ func TestLargeProviderUploadCandidate(t *testing.T) {
 	large.RetryCount = 2
 	if largeProviderUploadCandidate(large, func(string) bool { return false }) {
 		t.Fatal("large retry on a provider without required payload hash should not be throttled")
+	}
+
+	large.RetryCount = 0
+	large.SpoolPath = ""
+	large.CleanupPath = "/old/large.bin"
+	calls = 0
+	if largeProviderUploadCandidate(large, requireHash) {
+		t.Fatal("large metadata-only MOVE must not consume the multipart upload slot")
+	}
+	if calls != 0 {
+		t.Fatalf("replica MOVE unexpectedly resolved provider capability %d times", calls)
 	}
 }
 
@@ -1441,6 +1462,35 @@ func TestIsPathOrDescendant(t *testing.T) {
 				t.Fatalf("isPathOrDescendant(%q, %q) = %v, want %v", tt.candidate, tt.root, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestQueuedReplicaMoveClassification(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		State:       StateQueued,
+		CleanupPath: "/encrypted/old.bin",
+	}
+	if !queuedReplicaMove(row) {
+		t.Fatal("queued no-spool file with old provider path must be a replica MOVE")
+	}
+	row.SpoolPath = "/spool/file.data"
+	if queuedReplicaMove(row) {
+		t.Fatal("spooled file must stay on the normal upload path")
+	}
+	row.SpoolPath = ""
+	row.CleanupPath = ""
+	if queuedReplicaMove(row) {
+		t.Fatal("missing-spool row without an old provider path is not a MOVE")
+	}
+}
+
+func TestReplicaMoveSourceHoldDelayCoversRetryWindow(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{RetryMaxSeconds: 20}}
+	defer func() { conf.Conf = oldConf }()
+
+	if got := replicaMoveSourceHoldDelay(); got < 40*time.Second {
+		t.Fatalf("source tombstone hold=%v, want at least twice retry max", got)
 	}
 }
 
