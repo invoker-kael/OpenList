@@ -6353,7 +6353,7 @@ func (m *workerManager) failDeleted(row *model.WebDAVWritebackObject, err error)
 }
 
 const (
-	completedCleanupBatchSize = 256
+	completedCleanupBatchSize  = 256
 	completedCleanupMaxBatches = 8
 )
 
