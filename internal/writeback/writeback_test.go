@@ -49,6 +49,41 @@ func TestLargeUploadWorkerLimit(t *testing.T) {
 	}
 }
 
+func TestMatchingVerificationRowsUsesOneParentSnapshot(t *testing.T) {
+	shaA := strings.Repeat("a", 40)
+	shaB := strings.Repeat("b", 40)
+	rows := []model.WebDAVWritebackObject{
+		{ID: 1, State: StateVerifying, Name: "a.bin", Size: 10, PayloadSHA1: shaA},
+		{ID: 2, State: StateVerifying, Name: "b.bin", Size: 20, PayloadSHA1: shaB},
+		{ID: 3, State: StateQueued, Name: "queued.bin", Size: 30, PayloadSHA1: strings.Repeat("c", 40)},
+	}
+	remotes := []model.Obj{
+		&model.Object{Name: "a.bin", Size: 10, HashInfo: utils.NewHashInfo(utils.SHA1, shaA)},
+		&model.Object{Name: "b.bin", Size: 999, HashInfo: utils.NewHashInfo(utils.SHA1, shaB)},
+		&model.Object{Name: "queued.bin", Size: 30, HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("c", 40))},
+	}
+	matches := matchingVerificationRows(rows, remotes, 0, true)
+	if len(matches) != 1 || matches[0].row.ID != 1 {
+		t.Fatalf("verification matches = %#v, want only a.bin", matches)
+	}
+	if got := matchingVerificationRows(rows, remotes, 1, true); len(got) != 0 {
+		t.Fatalf("trigger row must be skipped, got %#v", got)
+	}
+}
+
+func TestWritebackParentStateIndex(t *testing.T) {
+	typ := reflect.TypeOf(model.WebDAVWritebackObject{})
+	for _, fieldName := range []string{"ParentKey", "State"} {
+		field, ok := typ.FieldByName(fieldName)
+		if !ok {
+			t.Fatalf("writeback model is missing %s", fieldName)
+		}
+		if !strings.Contains(field.Tag.Get("gorm"), "idx_webdav_writeback_parent_state") {
+			t.Fatalf("%s must participate in parent/state verification index", fieldName)
+		}
+	}
+}
+
 func TestProviderRefreshGroupSharesInflightResult(t *testing.T) {
 	group := &providerRefreshGroup{
 		calls: map[string]*providerRefreshCall{

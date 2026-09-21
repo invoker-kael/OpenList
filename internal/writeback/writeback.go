@@ -5145,16 +5145,78 @@ func remoteVerificationInconclusiveDelay() time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+const verificationSiblingBatchLimit = 64
+
+type verificationBatchMatch struct {
+	row    model.WebDAVWritebackObject
+	remote model.Obj
+}
+
+func matchingVerificationRows(rows []model.WebDAVWritebackObject, remotes []model.Obj, skipID uint, requireHash bool) []verificationBatchMatch {
+	if len(rows) == 0 || len(remotes) == 0 {
+		return nil
+	}
+	byName := make(map[string]model.Obj, len(remotes))
+	for _, remote := range remotes {
+		if remote != nil {
+			byName[remote.GetName()] = remote
+		}
+	}
+	matches := make([]verificationBatchMatch, 0, min(len(rows), len(remotes)))
+	for i := range rows {
+		row := &rows[i]
+		if row.ID == skipID || row.IsDir || row.State != StateVerifying {
+			continue
+		}
+		remote := byName[row.Name]
+		if remoteMatchesCanonical(row, remote, requireHash) {
+			matches = append(matches, verificationBatchMatch{row: *row, remote: remote})
+		}
+	}
+	return matches
+}
+
+func (m *workerManager) completeMatchingVerifySiblings(trigger *model.WebDAVWritebackObject, remotes []model.Obj, requireHash bool) {
+	if trigger == nil || !requireHash || len(remotes) == 0 {
+		return
+	}
+	var rows []model.WebDAVWritebackObject
+	if err := db.GetDb().
+		Where("parent_key = ? AND state = ? AND is_dir = ? AND id <> ?", pathKey(trigger.Parent), StateVerifying, false, trigger.ID).
+		Order("retry_at asc").
+		Limit(verificationSiblingBatchLimit).
+		Find(&rows).Error; err != nil {
+		log.Errorf("write-back sibling verification scan failed for %s: %v", trigger.Parent, err)
+		return
+	}
+	for _, match := range matchingVerificationRows(rows, remotes, trigger.ID, requireHash) {
+		m.completeRemoteVerification(&match.row, match.remote, []string{StateVerifying})
+	}
+}
+
 func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model.Obj, error) {
 	requireHash := providerRequiresPayloadHash(row.Path)
-	remote, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true})
-	if getErr == nil && remoteMatchesCanonical(row, remote, requireHash) {
-		return remote, nil
+	if requireHash {
+		// 115 directory listings already carry size and SHA-1. Use one fresh
+		// parent snapshot as the verification authority instead of issuing a
+		// single-object GET for every completed upload. The same snapshot also
+		// completes matching VERIFYING siblings in bounded batches.
+		objs, listErr := m.refreshParent(row.Parent)
+		if listErr != nil {
+			return nil, listErr
+		}
+		m.completeMatchingVerifySiblings(row, objs, true)
+		return exactRemoteByName(objs, row.Name), nil
 	}
 
-	// A direct 115 miss/mismatch is never destructive evidence by itself.
-	// Force-refresh the parent. If that refresh fails, return its error instead
-	// of leaking an earlier direct NotFound/mismatch into the retry budget.
+	remote, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true})
+	if getErr == nil && remoteMatchesCanonical(row, remote, false) {
+		return remote, nil
+	}
+	if getErr != nil && !errs.IsObjectNotFound(getErr) {
+		return nil, getErr
+	}
+
 	objs, listErr := m.refreshParent(row.Parent)
 	if listErr != nil {
 		return nil, listErr
@@ -5162,8 +5224,6 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model
 	if obj := exactRemoteByName(objs, row.Name); obj != nil {
 		return obj, nil
 	}
-	// A successful refreshed parent listing with no exact name is the only
-	// absence representation consumed by classifyRemoteVerification.
 	return nil, nil
 }
 

@@ -10,7 +10,7 @@ import "time"
 type WebDAVWritebackObject struct {
 	ID         uint      `json:"id" gorm:"primaryKey"`
 	PathKey    string    `json:"path_key" gorm:"size:64;uniqueIndex"`
-	ParentKey  string    `json:"parent_key" gorm:"size:64;index"`
+	ParentKey  string    `json:"parent_key" gorm:"size:64;index;index:idx_webdav_writeback_parent_state,priority:1"`
 	Path       string    `json:"path" gorm:"type:text"`
 	Parent     string    `json:"parent" gorm:"type:text"`
 	Name       string    `json:"name" gorm:"size:1024"`
@@ -27,7 +27,7 @@ type WebDAVWritebackObject struct {
 	AckTime          *time.Time `json:"ack_time"`
 	DurableAt        *time.Time `json:"durable_at"`
 	RemoteSyncState  string     `json:"remote_sync_state" gorm:"size:16;index"`
-	State            string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1"`
+	State            string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1;index:idx_webdav_writeback_parent_state,priority:2"`
 	SpoolPath        string     `json:"spool_path" gorm:"type:text"`
 	PayloadSHA1      string     `json:"payload_sha1" gorm:"size:40"`
 	RemoteObjectID   string     `json:"remote_object_id" gorm:"size:255"`
