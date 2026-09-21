@@ -2636,7 +2636,7 @@ func beginDurableReceiveSequence(ctx context.Context, p string, expected int64) 
 	backlogWeight := spoolBacklogAdmissionWeight(expected)
 	backlogLimited := receiveAdmissionNeedsGlobalFence(limit) && backlogWeight > 0
 	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if backlogReserved {
+		if backlogLimited {
 			if err := lockAdmissionFence(tx); err != nil {
 				return err
 			}
@@ -2660,7 +2660,7 @@ func beginDurableReceiveSequence(ctx context.Context, p string, expected int64) 
 			fence.ActiveReceivers = 0
 		}
 
-		if backlogReserved {
+		if backlogLimited {
 			current, err := durableBacklogAdmissionCurrent(tx, p, now)
 			if err != nil {
 				return err
