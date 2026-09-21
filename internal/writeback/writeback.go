@@ -6040,7 +6040,7 @@ func canonicalParentBlocksChild(parent *model.WebDAVWritebackObject) bool {
 }
 
 func (m *workerManager) waitForCanonicalParent(row *model.WebDAVWritebackObject) (bool, error) {
-	parent, err := getByPath(row.Parent)
+	parent, err := getCanonicalByPath(row.Parent)
 	if err != nil {
 		return false, err
 	}
