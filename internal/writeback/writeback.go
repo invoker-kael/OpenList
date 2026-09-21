@@ -6945,6 +6945,13 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 	return true
 }
 
+func verifyingUpdates(currentState string, updates map[string]any) map[string]any {
+	if currentState != StateVerifying {
+		updates["state"] = StateVerifying
+	}
+	return updates
+}
+
 func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObject, currentState string, requireHash bool) {
 	remote, err := m.remoteForVerify(row, requireHash)
 	verification := classifyRemoteVerification(row, remote, err, requireHash)
@@ -6979,12 +6986,10 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 		}
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
-			Updates(map[string]any{
-				"state":        StateVerifying,
-				"retry_at":     &next,
-				"verify_count": row.VerifyCount,
-				"last_error":   msg,
-			}).Error
+			Updates(verifyingUpdates(currentState, map[string]any{
+				"retry_at":   &next,
+				"last_error": msg,
+			})).Error
 		return
 	}
 
@@ -6995,12 +7000,11 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 			next := time.Now().Add(repeatedLargeProviderVerifyDelay(row))
 			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
-				Updates(map[string]any{
-					"state":        StateVerifying,
+				Updates(verifyingUpdates(currentState, map[string]any{
 					"retry_at":     &next,
 					"verify_count": max(0, attempts-1),
 					"last_error":   "115 multipart upload remains divergent after one repair upload; preserving durable spool and continuing low-frequency verification without another automatic reupload",
-				}).Error
+				})).Error
 			return
 		}
 		next := time.Now().Add(retryDelay(row.RetryCount + 1))
@@ -7032,12 +7036,11 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 	}
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
-		Updates(map[string]any{
-			"state":        StateVerifying,
+		Updates(verifyingUpdates(currentState, map[string]any{
 			"retry_at":     &next,
 			"verify_count": nextCount,
 			"last_error":   msg,
-		}).Error
+		})).Error
 }
 
 func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
@@ -7060,6 +7063,7 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 	requireHash := providerRequiresPayloadHash(row.Path)
 	m.processRemoteVerification(row, StateVerifying, requireHash)
 }
+
 func deleteParentMissing(err error) bool {
 	return err != nil && errs.IsObjectNotFound(err)
 }
