@@ -1479,7 +1479,7 @@ func CommitLockNull(ctx context.Context, p string, now time.Time, duration time.
 
 	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var row model.WebDAVWritebackObject
-		findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", key).First(&row).Error
+		findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", key).Take(&row).Error
 		if findErr != nil && !errors.Is(findErr, gorm.ErrRecordNotFound) {
 			return findErr
 		}
@@ -2346,7 +2346,7 @@ func lockAdmissionFence(tx *gorm.DB) error {
 		return err
 	}
 	var fence model.WebDAVWritebackAdmissionFence
-	return tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&fence, 1).Error
+	return tx.Clauses(clause.Locking{Strength: "UPDATE"}).Take(&fence, 1).Error
 }
 
 type receivingPathState struct {
@@ -2616,8 +2616,9 @@ func lockOrCreateReceiveFence(tx *gorm.DB, p string) (*model.WebDAVWritebackRece
 
 	var fence model.WebDAVWritebackReceiveFence
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id", "path_key", "path", "next_sequence", "last_committed_sequence", "active_receivers", "receive_lease_until").
 		Where("path_key = ?", key).
-		First(&fence).Error; err != nil {
+		Take(&fence).Error; err != nil {
 		return nil, err
 	}
 	return &fence, nil
@@ -2812,8 +2813,9 @@ func endReceiveSequence(ctx context.Context, p string, sequence uint64, backlogR
 
 		var fence model.WebDAVWritebackReceiveFence
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "last_committed_sequence", "active_receivers", "receive_lease_until").
 			Where("path_key = ?", pathKey(p)).
-			First(&fence).Error; err != nil {
+			Take(&fence).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil
 			}
@@ -2831,7 +2833,7 @@ func durableReceiving(p string, now time.Time) (bool, error) {
 	err := db.GetDb().
 		Select("id", "active_receivers", "receive_lease_until").
 		Where("path_key = ?", pathKey(p)).
-		First(&fence).Error
+		Take(&fence).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
 	}
@@ -3231,7 +3233,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			return err
 		}
 		var row model.WebDAVWritebackObject
-		findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", key).First(&row).Error
+		findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", key).Take(&row).Error
 		if findErr != nil && !errors.Is(findErr, gorm.ErrRecordNotFound) {
 			return findErr
 		}
@@ -3389,7 +3391,7 @@ func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*m
 			return err
 		}
 		var row model.WebDAVWritebackObject
-		findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", key).First(&row).Error
+		findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("path_key = ?", key).Take(&row).Error
 		if findErr != nil && !errors.Is(findErr, gorm.ErrRecordNotFound) {
 			return findErr
 		}
