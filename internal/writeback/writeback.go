@@ -2101,24 +2101,51 @@ func receiveReservationProgressBytes(expected, received int64) uint64 {
 	return value + chunk
 }
 
-func pendingSpoolBacklogBytes(tx *gorm.DB, excludePath string) (uint64, error) {
-	query := tx.Model(&model.WebDAVWritebackObject{}).
-		Select("COALESCE(SUM(size), 0) AS bytes").
-		Where("spool_path <> ''").
-		Where("state IN ?", []string{StateQueued, StateFailed, StateUploading, StateVerifying})
-	if excludePath != "" {
-		query = query.Where("path_key <> ?", pathKey(excludePath))
+func pendingBacklogState(state string) bool {
+	switch state {
+	case StateQueued, StateFailed, StateUploading, StateVerifying:
+		return true
+	default:
+		return false
 	}
+}
+
+func pendingSpoolBacklogBytes(tx *gorm.DB, excludePath string) (uint64, error) {
 	var result struct {
 		Bytes int64 `gorm:"column:bytes"`
 	}
-	if err := query.Scan(&result).Error; err != nil {
+	if err := tx.Model(&model.WebDAVWritebackObject{}).
+		Select("COALESCE(SUM(size), 0) AS bytes").
+		Where("state IN ?", []string{StateQueued, StateFailed, StateUploading, StateVerifying}).
+		Scan(&result).Error; err != nil {
 		return 0, err
 	}
 	if result.Bytes < 0 {
 		return 0, errors.New("write-back pending spool backlog is negative")
 	}
-	return uint64(result.Bytes), nil
+	total := uint64(result.Bytes)
+	if excludePath == "" {
+		return total, nil
+	}
+
+	var excluded model.WebDAVWritebackObject
+	err := tx.Select("path_key", "state", "size").
+		Where("path_key = ?", pathKey(excludePath)).
+		First(&excluded).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return total, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !pendingBacklogState(excluded.State) || excluded.Size <= 0 {
+		return total, nil
+	}
+	size := uint64(excluded.Size)
+	if size >= total {
+		return 0, nil
+	}
+	return total - size, nil
 }
 
 func activeReceiveBacklogBytes(tx *gorm.DB, now time.Time) (uint64, error) {

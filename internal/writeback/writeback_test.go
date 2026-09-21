@@ -1339,6 +1339,19 @@ func TestPendingDirectoryMoveLocalAuthority(t *testing.T) {
 	}
 }
 
+func TestPendingBacklogState(t *testing.T) {
+	for _, state := range []string{StateQueued, StateFailed, StateUploading, StateVerifying} {
+		if !pendingBacklogState(state) {
+			t.Fatalf("state %q must contribute to pending backlog", state)
+		}
+	}
+	for _, state := range []string{StateCompleted, StateDeleted, StateLockNull, ""} {
+		if pendingBacklogState(state) {
+			t.Fatalf("state %q must not contribute to pending backlog", state)
+		}
+	}
+}
+
 func TestSpoolBacklogAdmissionCurrent(t *testing.T) {
 	current, ok := spoolBacklogAdmissionCurrent(100, 25)
 	if !ok || current != 125 {

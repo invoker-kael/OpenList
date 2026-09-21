@@ -15,7 +15,7 @@ type WebDAVWritebackObject struct {
 	Parent     string    `json:"parent" gorm:"type:text"`
 	Name       string    `json:"name" gorm:"size:1024"`
 	IsDir      bool      `json:"is_dir" gorm:"index;index:idx_webdav_writeback_dispatch,priority:2"`
-	Size       int64     `json:"size"`
+	Size       int64     `json:"size" gorm:"index:idx_webdav_writeback_state_size,priority:2"`
 	ModTime    time.Time `json:"mod_time"`
 	CreateTime time.Time `json:"create_time"`
 	ETag       string    `json:"etag" gorm:"size:160"`
@@ -27,7 +27,7 @@ type WebDAVWritebackObject struct {
 	AckTime          *time.Time `json:"ack_time"`
 	DurableAt        *time.Time `json:"durable_at"`
 	RemoteSyncState  string     `json:"remote_sync_state" gorm:"size:16;index"`
-	State            string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1;index:idx_webdav_writeback_parent_state,priority:2"`
+	State            string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1;index:idx_webdav_writeback_parent_state,priority:2;index:idx_webdav_writeback_state_size,priority:1"`
 	SpoolPath        string     `json:"spool_path" gorm:"type:text"`
 	PayloadSHA1      string     `json:"payload_sha1" gorm:"size:40"`
 	RemoteObjectID   string     `json:"remote_object_id" gorm:"size:255"`
@@ -80,8 +80,8 @@ type WebDAVWritebackReceiveReservation struct {
 	ID         uint      `json:"id" gorm:"primaryKey"`
 	PathKey    string    `json:"path_key" gorm:"size:64;uniqueIndex:idx_webdav_writeback_receive_reservation,priority:1"`
 	Sequence   uint64    `json:"sequence" gorm:"uniqueIndex:idx_webdav_writeback_receive_reservation,priority:2"`
-	Bytes      uint64    `json:"bytes"`
-	LeaseUntil time.Time `json:"lease_until" gorm:"index"`
+	Bytes      uint64    `json:"bytes" gorm:"index:idx_webdav_writeback_receive_lease_bytes,priority:2"`
+	LeaseUntil time.Time `json:"lease_until" gorm:"index;index:idx_webdav_writeback_receive_lease_bytes,priority:1"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }
