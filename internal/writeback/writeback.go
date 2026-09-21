@@ -2529,29 +2529,59 @@ func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64
 	return sequence, err
 }
 
+func receiveHeartbeatNeedsAdmission(expected, received int64, backlogLimited bool) bool {
+	return backlogLimited && expected < 0 && received > 0
+}
+
+func refreshReceiveLease(tx *gorm.DB, key string, sequence uint64, leaseUntil time.Time) error {
+	if err := tx.Model(&model.WebDAVWritebackReceiveFence{}).
+		Where("path_key = ? AND active_receivers > 0", key).
+		Update("receive_lease_until", &leaseUntil).Error; err != nil {
+		return err
+	}
+	if maxPendingSpoolBytes() == 0 {
+		return nil
+	}
+	return tx.Model(&model.WebDAVWritebackReceiveReservation{}).
+		Where("path_key = ? AND sequence = ?", key, sequence).
+		Update("lease_until", leaseUntil).Error
+}
+
 func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64, expected, received int64) {
-	now := time.Now()
-	leaseUntil := now.Add(receiveLeaseDuration)
+	leaseUntil := time.Now().Add(receiveLeaseDuration)
+	key := pathKey(p)
+	backlogLimited := maxPendingSpoolBytes() > 0
+
+	if !receiveHeartbeatNeedsAdmission(expected, received, backlogLimited) {
+		// Known-length PUTs already reserved their complete declared size.
+		// Periodic heartbeats (including received=0 for unknown-length bodies)
+		// only extend per-path leases, so they must not serialize unrelated PUTs
+		// through the singleton admission fence.
+		_ = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			return refreshReceiveLease(tx, key, sequence, leaseUntil)
+		})
+		return
+	}
+
+	// Unknown-length progress increases the durable reservation and therefore
+	// participates in global backlog accounting. Keep only this path behind the
+	// admission fence so concurrent admissions see a consistent total.
 	_ = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := lockAdmissionFence(tx); err != nil {
 			return err
 		}
 		if err := tx.Model(&model.WebDAVWritebackReceiveFence{}).
-			Where("path_key = ? AND active_receivers > 0", pathKey(p)).
-			Updates(map[string]any{
-				"receive_lease_until": &leaseUntil,
-			}).Error; err != nil {
+			Where("path_key = ? AND active_receivers > 0", key).
+			Update("receive_lease_until", &leaseUntil).Error; err != nil {
 			return err
 		}
-		reservation := tx.Model(&model.WebDAVWritebackReceiveReservation{}).
-			Where("path_key = ? AND sequence = ?", pathKey(p), sequence)
-		updates := map[string]any{"lease_until": leaseUntil}
-		if expected < 0 {
-			progressBytes := receiveReservationProgressBytes(expected, received)
-			reservation = reservation.Where("bytes < ?", progressBytes)
-			updates["bytes"] = progressBytes
-		}
-		return reservation.Updates(updates).Error
+		progressBytes := receiveReservationProgressBytes(expected, received)
+		return tx.Model(&model.WebDAVWritebackReceiveReservation{}).
+			Where("path_key = ? AND sequence = ? AND bytes < ?", key, sequence, progressBytes).
+			Updates(map[string]any{
+				"lease_until": leaseUntil,
+				"bytes":       progressBytes,
+			}).Error
 	})
 }
 
@@ -5117,7 +5147,7 @@ func fairDispatchFiles(rows []model.WebDAVWritebackObject) []model.WebDAVWriteba
 func loadDispatchClass(now time.Time, states []string, isDir *bool, excludedIDs []uint, limit int) ([]model.WebDAVWritebackObject, error) {
 	var rows []model.WebDAVWritebackObject
 	query := db.GetDb().
-		Select("id", "path", "size", "is_dir", "state").
+		Select("id", "path", "parent_key", "size", "is_dir", "state").
 		Where("state IN ? AND (retry_at IS NULL OR retry_at <= ?)", states, now)
 	if isDir != nil {
 		query = query.Where("is_dir = ?", *isDir)
@@ -5143,6 +5173,63 @@ func appendDispatchRows(rows, incoming []model.WebDAVWritebackObject, remaining 
 	}
 	rows = append(rows, incoming...)
 	return rows, remaining - len(incoming)
+}
+
+func filterDispatchReadyParents(rows, parents []model.WebDAVWritebackObject) []model.WebDAVWritebackObject {
+	if len(rows) == 0 || len(parents) == 0 {
+		return rows
+	}
+	byKey := make(map[string]*model.WebDAVWritebackObject, len(parents))
+	for i := range parents {
+		parent := &parents[i]
+		byKey[parent.PathKey] = parent
+	}
+	ready := rows[:0]
+	for i := range rows {
+		row := rows[i]
+		parent := byKey[row.ParentKey]
+		if parent == nil {
+			// No canonical parent means the backing provider remains the
+			// authority for the parent path, matching the worker fallback.
+			ready = append(ready, row)
+			continue
+		}
+		if parent.IsDir && !canonicalDeleted(parent) && parent.State == StateCompleted {
+			ready = append(ready, row)
+		}
+	}
+	return ready
+}
+
+func dispatchReadyParents(rows []model.WebDAVWritebackObject) ([]model.WebDAVWritebackObject, error) {
+	if len(rows) == 0 {
+		return rows, nil
+	}
+	keys := make([]string, 0, len(rows))
+	seen := make(map[string]struct{}, len(rows))
+	for i := range rows {
+		key := rows[i].ParentKey
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return rows, nil
+	}
+
+	var parents []model.WebDAVWritebackObject
+	if err := db.GetDb().
+		Select("path_key", "is_dir", "state", "canonical_state").
+		Where("path_key IN ?", keys).
+		Find(&parents).Error; err != nil {
+		return nil, err
+	}
+	return filterDispatchReadyParents(rows, parents), nil
 }
 
 func loadDispatchRows(now time.Time, workers, budget int, excludedIDs []uint) ([]model.WebDAVWritebackObject, error) {
@@ -5177,7 +5264,12 @@ func loadDispatchRows(now time.Time, workers, budget int, excludedIDs []uint) ([
 		return rows, nil
 	}
 
-	directories, err := loadClass([]string{StateQueued}, &isDir)
+	directoryScanLimit := max(min(remaining, classLimit), min(classLimit*4, max(remaining, workers*4)))
+	directories, err := loadDispatchClass(now, []string{StateQueued}, &isDir, excludedIDs, directoryScanLimit)
+	if err != nil {
+		return nil, err
+	}
+	directories, err = dispatchReadyParents(directories)
 	if err != nil {
 		return nil, err
 	}
@@ -5191,6 +5283,10 @@ func loadDispatchRows(now time.Time, workers, budget int, excludedIDs []uint) ([
 	// never enqueue more work than the job channel can accept.
 	fileScanLimit := max(remaining, remaining*(dispatchSmallBurst+1))
 	files, err := loadDispatchClass(now, []string{StateQueued}, &isFile, excludedIDs, fileScanLimit)
+	if err != nil {
+		return nil, err
+	}
+	files, err = dispatchReadyParents(files)
 	if err != nil {
 		return nil, err
 	}

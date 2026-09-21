@@ -22,7 +22,7 @@ type WebDAVWritebackObject struct {
 	Generation uint64    `json:"generation"`
 	// CanonicalState is the client-visible lifecycle. State below is retained as
 	// the provider-replication lifecycle so ACKed WebDAV identity cannot flap as
-	// the backing provider moves through queued/uploading/verifying/failed.
+	// the backing provider moves through queued/uploading/verifying/completed.
 	CanonicalState   string     `json:"canonical_state" gorm:"size:24"`
 	AckTime          *time.Time `json:"ack_time"`
 	DurableAt        *time.Time `json:"durable_at"`

@@ -323,3 +323,10 @@ The former `remote_sync_state` model field duplicated `state` and is no longer r
 Receive ownership is derived from `active_receivers` plus the crash-expiring `receive_lease_until`. The redundant `receive_state` and `receive_updated_at` model fields are no longer used; normal `updated_at` remains available for diagnostics. This reduces transition and heartbeat write amplification.
 
 Client-visible canonical state remains compact and independent: `durable_acked`, `deleted`, and `lock_null`. The historical `acked` value is accepted only for upgrade compatibility.
+
+
+### Receive and scheduler hot-path performance
+
+Lease-only receive heartbeats no longer acquire the singleton backlog admission fence. Known-length PUTs reserve their complete declared size at admission, and periodic unknown-length heartbeats with no new progress only extend the per-path fence/reservation lease. The global admission lock is now reserved for unknown-length progress checkpoints that actually increase durable reserved bytes. This prevents several simultaneous large uploads from serializing unrelated PUT admission once per heartbeat interval.
+
+Queued directory/file dispatch also filters canonical parent readiness before consuming a worker slot. A bounded candidate batch performs one indexed parent-key lookup and suppresses children while their canonical parent directory is still pending, deleted, or a file. The worker-side parent check remains as a race-safe final guard. This removes the previous cycle where large directory bursts repeatedly consumed workers, selected the same parent, updated child retry timestamps, and returned without provider work.

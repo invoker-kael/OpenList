@@ -1319,6 +1319,26 @@ func TestCanonicalParentBlocksChild(t *testing.T) {
 	}
 }
 
+func TestFilterDispatchReadyParents(t *testing.T) {
+	rows := []model.WebDAVWritebackObject{
+		{ID: 1, ParentKey: "missing"},
+		{ID: 2, ParentKey: "ready"},
+		{ID: 3, ParentKey: "pending"},
+		{ID: 4, ParentKey: "deleted"},
+		{ID: 5, ParentKey: "file"},
+	}
+	parents := []model.WebDAVWritebackObject{
+		{PathKey: "ready", IsDir: true, State: StateCompleted, CanonicalState: CanonicalStateAcked},
+		{PathKey: "pending", IsDir: true, State: StateQueued, CanonicalState: CanonicalStateAcked},
+		{PathKey: "deleted", IsDir: true, State: StateDeleted, CanonicalState: CanonicalStateDeleted},
+		{PathKey: "file", IsDir: false, State: StateCompleted, CanonicalState: CanonicalStateAcked},
+	}
+	got := filterDispatchReadyParents(rows, parents)
+	if len(got) != 2 || got[0].ID != 1 || got[1].ID != 2 {
+		t.Fatalf("ready parent filter returned ids=%v, want [1 2]", []uint{got[0].ID, got[1].ID})
+	}
+}
+
 func TestPendingDirectoryMoveLocalAuthority(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = &conf.Config{
@@ -1487,6 +1507,27 @@ func TestReceiveFenceActive(t *testing.T) {
 func TestReceiveRetrySeconds(t *testing.T) {
 	if got := ReceiveRetrySeconds(); got < 1 || got > 10 {
 		t.Fatalf("receive retry interval=%d, want a short bounded retry", got)
+	}
+}
+
+func TestReceiveHeartbeatAdmissionOnlyForUnknownProgress(t *testing.T) {
+	tests := []struct {
+		name           string
+		expected       int64
+		received       int64
+		backlogLimited bool
+		want           bool
+	}{
+		{name: "known length lease only", expected: 1024, received: 512, backlogLimited: true, want: false},
+		{name: "known length periodic lease", expected: 1024, received: 0, backlogLimited: true, want: false},
+		{name: "unknown periodic lease", expected: -1, received: 0, backlogLimited: true, want: false},
+		{name: "unknown progress grows reservation", expected: -1, received: 64 * int64(utils.MB), backlogLimited: true, want: true},
+		{name: "disabled backlog has no global accounting", expected: -1, received: 64 * int64(utils.MB), backlogLimited: false, want: false},
+	}
+	for _, tc := range tests {
+		if got := receiveHeartbeatNeedsAdmission(tc.expected, tc.received, tc.backlogLimited); got != tc.want {
+			t.Fatalf("%s: admission=%v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 
