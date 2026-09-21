@@ -1384,6 +1384,55 @@ func Canonical(p string) (obj model.Obj, found bool, deleted bool, err error) {
 	return toObject(row), true, false, nil
 }
 
+type CanonicalSnapshot struct {
+	Object  model.Obj
+	Found   bool
+	Deleted bool
+}
+
+func CanonicalBatch(paths ...string) (map[string]CanonicalSnapshot, error) {
+	snapshots := make(map[string]CanonicalSnapshot, len(paths))
+	if !Enabled() || len(paths) == 0 {
+		return snapshots, nil
+	}
+
+	pathByKey := make(map[string]string, len(paths))
+	keys := make([]string, 0, len(paths))
+	for _, p := range paths {
+		clean := utils.FixAndCleanPath(p)
+		key := pathKey(clean)
+		if _, exists := pathByKey[key]; exists {
+			continue
+		}
+		pathByKey[key] = clean
+		keys = append(keys, key)
+		snapshots[clean] = CanonicalSnapshot{}
+	}
+
+	var rows []model.WebDAVWritebackObject
+	if err := db.GetDb().
+		Select(canonicalReadColumns).
+		Where("path_key IN ?", keys).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		row := &rows[i]
+		clean, ok := pathByKey[row.PathKey]
+		if !ok {
+			continue
+		}
+		snapshot := CanonicalSnapshot{Found: true}
+		if canonicalDeleted(row) {
+			snapshot.Deleted = true
+		} else {
+			snapshot.Object = toObject(row)
+		}
+		snapshots[clean] = snapshot
+	}
+	return snapshots, nil
+}
+
 func lockNullRetryAt(now time.Time, duration time.Duration) *time.Time {
 	if duration < 0 {
 		return nil

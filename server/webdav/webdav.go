@@ -574,14 +574,17 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	if !common.CanWrite(user, parentMeta, parentPath) {
 		return http.StatusForbidden, errs.PermissionDenied
 	}
+	var canonicalTarget writeback.CanonicalSnapshot
 	if writeback.Enabled() {
-		parentObj, parentFound, parentDeleted, wbErr := writeback.Canonical(parentPath)
+		canonical, wbErr := writeback.CanonicalBatch(parentPath, reqPath)
 		if wbErr != nil {
 			return http.StatusInternalServerError, wbErr
 		}
-		if parentFound && (parentDeleted || parentObj == nil || !parentObj.IsDir()) {
+		parent := canonical[parentPath]
+		if parent.Found && (parent.Deleted || parent.Object == nil || !parent.Object.IsDir()) {
 			return http.StatusConflict, errs.ObjectNotFound
 		}
+		canonicalTarget = canonical[reqPath]
 	}
 
 	// Cloud Sync normally relies on the immediate PROPFIND result, but WebDAV
@@ -595,12 +598,9 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	if ifMatch != "" || ifNoneMatch != "" || ifUnmodifiedSince != "" {
 		var current model.Obj
 		exists := false
-		current, found, deleted, wbErr := writeback.Canonical(reqPath)
-		if wbErr != nil {
-			return http.StatusInternalServerError, wbErr
-		}
-		if found {
-			exists = !deleted && current != nil
+		if canonicalTarget.Found {
+			current = canonicalTarget.Object
+			exists = !canonicalTarget.Deleted && current != nil
 		} else {
 			current, err = fs.Get(ctx, reqPath, &fs.GetArgs{})
 			if err == nil {
@@ -628,12 +628,12 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 		}
 	}
 
-	if writeback.Enabled() {
-		if current, found, deleted, wbErr := writeback.Canonical(reqPath); wbErr != nil {
-			return http.StatusInternalServerError, wbErr
-		} else if found && !deleted && current != nil && current.IsDir() {
-			return http.StatusMethodNotAllowed, nil
-		}
+	if writeback.Enabled() &&
+		canonicalTarget.Found &&
+		!canonicalTarget.Deleted &&
+		canonicalTarget.Object != nil &&
+		canonicalTarget.Object.IsDir() {
+		return http.StatusMethodNotAllowed, nil
 	}
 
 	mimeType := r.Header.Get("Content-Type")
@@ -736,14 +736,16 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 	// RFC 4918 9.3.1: MKCOL can only create an unmapped URL. In write-back
 	// mode the canonical shadow is authoritative while the provider catches up.
 	if writeback.Enabled() {
-		fi, found, deleted, wbErr := writeback.Canonical(reqPath)
+		parentPath := path.Dir(reqPath)
+		canonical, wbErr := writeback.CanonicalBatch(reqPath, parentPath)
 		if wbErr != nil {
 			return http.StatusInternalServerError, wbErr
 		}
-		if found && !deleted && fi != nil {
+		target := canonical[reqPath]
+		if target.Found && !target.Deleted && target.Object != nil {
 			return http.StatusMethodNotAllowed, nil
 		}
-		if !found {
+		if !target.Found {
 			if _, getErr := fs.Get(ctx, reqPath, &fs.GetArgs{}); getErr == nil {
 				return http.StatusMethodNotAllowed, nil
 			} else if !errs.IsObjectNotFound(getErr) {
@@ -751,15 +753,11 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 			}
 		}
 
-		parentPath := path.Dir(reqPath)
 		parentOK := false
-		parentObj, parentFound, parentDeleted, wbErr := writeback.Canonical(parentPath)
-		if wbErr != nil {
-			return http.StatusInternalServerError, wbErr
-		}
-		if parentFound && !parentDeleted && parentObj != nil {
-			parentOK = parentObj.IsDir()
-		} else if !parentFound {
+		parent := canonical[parentPath]
+		if parent.Found && !parent.Deleted && parent.Object != nil {
+			parentOK = parent.Object.IsDir()
+		} else if !parent.Found {
 			parentObj, getErr := fs.Get(ctx, parentPath, &fs.GetArgs{})
 			if getErr == nil {
 				parentOK = parentObj.IsDir()
