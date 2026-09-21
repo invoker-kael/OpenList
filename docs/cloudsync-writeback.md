@@ -337,3 +337,12 @@ Queued directory/file dispatch also filters canonical parent readiness before co
 For 115-backed completed files whose local spool has already been released, direct reconciliation now uses a force-refreshed parent listing as the health authority instead of issuing one object GET per stale file. Concurrent requests for the same parent share the refresh, and a matching snapshot refreshes up to 128 stale completed siblings in the same directory. Suspicious results still preserve the two-observation divergence rule: the first refreshed mismatch only arms a later confirmation, and only a separately claimed refreshed snapshot may remove canonical metadata.
 
 Completed spool cleanup now drains up to 256 eligible rows per batch and up to eight batches per maintenance pass. Cleared immutable spool paths are deduplicated, checked for remaining COPY/shared references with one batched database query, and only then unlinked. This replaces the former per-file reference COUNT query and lets large small-file bursts converge much faster without sacrificing shared-spool safety.
+
+
+### Scheduler and maintenance query reduction
+
+LOCK-NULL expiry cleanup is no longer executed on every scheduler wake. Worker completions and new PUTs can wake the scheduler many times per second, so the old placement issued a DELETE query even when no lock-null resource existed. Expiry cleanup now runs only on the fixed scheduler tick; startup recovery still removes stale process-local lock shadows.
+
+DELETE dispatch now scans a bounded wider tombstone window, resolves all candidate ancestor keys with one indexed query, and sends only root tombstones to workers. Descendants under a live tombstone ancestor receive one batched retry deferral and are later removed by the existing confirmed subtree cleanup. The worker-side ancestor check remains as a race-safe guard.
+
+Provider COPY/MOVE maintenance now filters candidates in SQL before loading its 64-row recovery batch. APPLIED intents remain immediately eligible, expired PREPARED intents use a dedicated state+updated_at index, and other recovery work is selected only when last_checked_at is due. The existing Go due checks remain as a safety guard, but fresh intents no longer occupy the maintenance scan window.

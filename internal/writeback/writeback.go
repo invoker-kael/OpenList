@@ -4721,13 +4721,41 @@ func recordProviderOperationError(id uint, err error) {
 	}).Error
 }
 
-func (m *workerManager) maintainProviderOperations() {
+func providerOperationMaintenanceDue(op *model.WebDAVProviderOperation, now time.Time) bool {
+	return op != nil &&
+		(op.State == ProviderOperationApplied ||
+			providerOperationPreparedExpired(op, now) ||
+			providerOperationRecoveryDue(op, now))
+}
+
+func loadProviderOperationMaintenanceCandidates(now time.Time, limit int) ([]model.WebDAVProviderOperation, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	recoveryCutoff := now.Add(-providerOperationConfirmationDelay())
+	preparedCutoff := now.Add(-providerOperationPreparedAbandonAfter)
 	var ops []model.WebDAVProviderOperation
-	if err := db.GetDb().
+	err := db.GetDb().
+		Where(
+			"state = ? OR (state = ? AND updated_at <= ?) OR (state <> ? AND (last_checked_at IS NULL OR last_checked_at <= ?))",
+			ProviderOperationApplied,
+			ProviderOperationPrepared,
+			preparedCutoff,
+			ProviderOperationApplied,
+			recoveryCutoff,
+		).
 		Order("CASE state WHEN 'applied' THEN 0 WHEN 'prepared' THEN 1 ELSE 2 END").
-		Order("COALESCE(last_checked_at, created_at) asc").
-		Limit(64).
-		Find(&ops).Error; err != nil {
+		Order("last_checked_at asc").
+		Order("id asc").
+		Limit(limit).
+		Find(&ops).Error
+	return ops, err
+}
+
+func (m *workerManager) maintainProviderOperations() {
+	now := time.Now()
+	ops, err := loadProviderOperationMaintenanceCandidates(now, 64)
+	if err != nil {
 		log.Errorf("write-back provider operation scan failed: %v", err)
 		return
 	}
@@ -4735,7 +4763,6 @@ func (m *workerManager) maintainProviderOperations() {
 		return
 	}
 
-	now := time.Now()
 	recovered := 0
 	retired := 0
 	for i := range ops {
@@ -5183,6 +5210,14 @@ func (m *workerManager) recoverInterrupted() error {
 	})
 }
 
+func cleanupExpiredLockNull(now time.Time) {
+	if err := db.GetDb().
+		Where("state = ? AND retry_at IS NOT NULL AND retry_at <= ?", StateLockNull, now).
+		Delete(&model.WebDAVWritebackObject{}).Error; err != nil {
+		log.Errorf("write-back lock-null cleanup failed: %v", err)
+	}
+}
+
 func (m *workerManager) scheduler() {
 	ticker := time.NewTicker(2 * time.Second)
 	providerTicker := time.NewTicker(providerOperationMaintenanceEvery)
@@ -5196,7 +5231,8 @@ func (m *workerManager) scheduler() {
 		case <-m.stop:
 			return
 		case <-m.wake:
-		case <-ticker.C:
+		case now := <-ticker.C:
+			cleanupExpiredLockNull(now)
 		case <-providerTicker.C:
 			m.maintainProviderOperations()
 		case <-cleanupTicker.C:
@@ -5337,6 +5373,75 @@ func dispatchReadyParents(rows []model.WebDAVWritebackObject) ([]model.WebDAVWri
 	return filterDispatchReadyParents(rows, parents), nil
 }
 
+func filterRootDeletedRows(rows []model.WebDAVWritebackObject, deletedAncestorKeys map[string]struct{}) (ready []model.WebDAVWritebackObject, blockedIDs []uint) {
+	if len(rows) == 0 || len(deletedAncestorKeys) == 0 {
+		return rows, nil
+	}
+	ready = make([]model.WebDAVWritebackObject, 0, len(rows))
+	blockedIDs = make([]uint, 0)
+	for i := range rows {
+		row := rows[i]
+		blocked := false
+		for _, key := range ancestorPathKeys(row.Path) {
+			if _, ok := deletedAncestorKeys[key]; ok {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			blockedIDs = append(blockedIDs, row.ID)
+			continue
+		}
+		ready = append(ready, row)
+	}
+	return ready, blockedIDs
+}
+
+func dispatchRootDeletedRows(rows []model.WebDAVWritebackObject, now time.Time) ([]model.WebDAVWritebackObject, error) {
+	if len(rows) == 0 {
+		return rows, nil
+	}
+	ancestorKeys := make([]string, 0, len(rows)*2)
+	seen := make(map[string]struct{}, len(rows)*2)
+	for i := range rows {
+		for _, key := range ancestorPathKeys(rows[i].Path) {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			ancestorKeys = append(ancestorKeys, key)
+		}
+	}
+	if len(ancestorKeys) == 0 {
+		return rows, nil
+	}
+
+	var ancestors []model.WebDAVWritebackObject
+	if err := db.GetDb().
+		Select("path_key").
+		Where("state = ? AND path_key IN ?", StateDeleted, ancestorKeys).
+		Find(&ancestors).Error; err != nil {
+		return nil, err
+	}
+	deletedAncestorKeys := make(map[string]struct{}, len(ancestors))
+	for i := range ancestors {
+		deletedAncestorKeys[ancestors[i].PathKey] = struct{}{}
+	}
+	ready, blockedIDs := filterRootDeletedRows(rows, deletedAncestorKeys)
+	if len(blockedIDs) > 0 {
+		next := now.Add(deleteAncestorWaitDelay())
+		if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id IN ? AND state = ?", blockedIDs, StateDeleted).
+			Updates(map[string]any{
+				"retry_at":   &next,
+				"last_error": "waiting for deleted ancestor to remove provider subtree",
+			}).Error; err != nil {
+			return nil, err
+		}
+	}
+	return ready, nil
+}
+
 func loadDispatchRows(now time.Time, workers, budget int, excludedIDs []uint) ([]model.WebDAVWritebackObject, error) {
 	if budget <= 0 {
 		return nil, nil
@@ -5351,7 +5456,12 @@ func loadDispatchRows(now time.Time, workers, budget int, excludedIDs []uint) ([
 		return loadDispatchClass(now, states, dir, excludedIDs, min(remaining, classLimit))
 	}
 
-	deleted, err := loadClass([]string{StateDeleted}, nil)
+	deleteScanLimit := max(min(remaining, classLimit), min(classLimit*4, max(remaining, workers*4)))
+	deleted, err := loadDispatchClass(now, []string{StateDeleted}, nil, excludedIDs, deleteScanLimit)
+	if err != nil {
+		return nil, err
+	}
+	deleted, err = dispatchRootDeletedRows(deleted, now)
 	if err != nil {
 		return nil, err
 	}
@@ -5406,11 +5516,6 @@ func (m *workerManager) dispatch() {
 		return
 	}
 	now := time.Now()
-	if err := db.GetDb().
-		Where("state = ? AND retry_at IS NOT NULL AND retry_at <= ?", StateLockNull, now).
-		Delete(&model.WebDAVWritebackObject{}).Error; err != nil {
-		log.Errorf("write-back lock-null cleanup failed: %v", err)
-	}
 	rows, err := loadDispatchRows(now, max(1, conf.Conf.WebDAVWriteback.Workers), freeJobs, m.inflightIDs())
 	if err != nil {
 		log.Errorf("write-back queue scan failed: %v", err)

@@ -119,12 +119,12 @@ type WebDAVProviderOperation struct {
 	Overwrite                     bool       `json:"overwrite"`
 	Depth                         int        `json:"depth"`
 	DestinationExisted            bool       `json:"destination_existed"`
-	State                         string     `json:"state" gorm:"size:16;index;index:idx_webdav_provider_recovery,priority:1"`
+	State                         string     `json:"state" gorm:"size:16;index;index:idx_webdav_provider_recovery,priority:1;index:idx_webdav_provider_prepared_expiry,priority:1"`
 	RecoveryCount                 int        `json:"recovery_count"`
 	LastRecovery                  string     `json:"last_recovery" gorm:"size:24"`
 	LastError                     string     `json:"last_error" gorm:"type:text"`
 	LastCheckedAt                 *time.Time `json:"last_checked_at" gorm:"index:idx_webdav_provider_recovery,priority:2"`
 	AppliedAt                     *time.Time `json:"applied_at"`
 	CreatedAt                     time.Time  `json:"created_at"`
-	UpdatedAt                     time.Time  `json:"updated_at"`
+	UpdatedAt                     time.Time  `json:"updated_at" gorm:"index:idx_webdav_provider_prepared_expiry,priority:2"`
 }

@@ -356,6 +356,30 @@ func TestProviderOperationRecoveryDue(t *testing.T) {
 	}
 }
 
+func TestProviderOperationMaintenanceDue(t *testing.T) {
+	now := time.Now()
+	recent := now.Add(-providerOperationConfirmationDelay() / 2)
+	oldPrepared := now.Add(-providerOperationPreparedAbandonAfter - time.Second)
+
+	if providerOperationMaintenanceDue(&model.WebDAVProviderOperation{
+		State:         ProviderOperationStarted,
+		LastCheckedAt: &recent,
+	}, now) {
+		t.Fatal("recently checked STARTED operation should stay out of maintenance")
+	}
+	if !providerOperationMaintenanceDue(&model.WebDAVProviderOperation{
+		State: ProviderOperationApplied,
+	}, now) {
+		t.Fatal("APPLIED operation must always be eligible for metadata retirement")
+	}
+	if !providerOperationMaintenanceDue(&model.WebDAVProviderOperation{
+		State:     ProviderOperationPrepared,
+		UpdatedAt: oldPrepared,
+	}, now) {
+		t.Fatal("expired PREPARED operation must be eligible for retirement")
+	}
+}
+
 func TestNotAppliedConfirmationStates(t *testing.T) {
 	for _, state := range []string{ProviderOperationStarted, ProviderOperationFailed} {
 		if !providerOperationNeedsNotAppliedConfirmation(state) {
@@ -491,11 +515,16 @@ func TestProviderOperationRecoveryIndex(t *testing.T) {
 	typ := reflect.TypeOf(model.WebDAVProviderOperation{})
 	state, _ := typ.FieldByName("State")
 	lastChecked, _ := typ.FieldByName("LastCheckedAt")
+	updated, _ := typ.FieldByName("UpdatedAt")
 	if !strings.Contains(state.Tag.Get("gorm"), "idx_webdav_provider_recovery") {
 		t.Fatal("provider operation State must lead recovery index")
 	}
 	if !strings.Contains(lastChecked.Tag.Get("gorm"), "idx_webdav_provider_recovery") {
 		t.Fatal("LastCheckedAt must participate in recovery index")
+	}
+	if !strings.Contains(state.Tag.Get("gorm"), "idx_webdav_provider_prepared_expiry") ||
+		!strings.Contains(updated.Tag.Get("gorm"), "idx_webdav_provider_prepared_expiry") {
+		t.Fatal("PREPARED expiry must have a state+updated_at composite index")
 	}
 }
 
@@ -2490,6 +2519,24 @@ func TestDeleteAncestorWaitDelayTracksVerificationCadence(t *testing.T) {
 	conf.Conf.WebDAVWriteback.VerifyIntervalSeconds = 0
 	if got := deleteAncestorWaitDelay(); got != 2*time.Second {
 		t.Fatalf("minimum ancestor wait=%v, want 2s", got)
+	}
+}
+
+func TestFilterRootDeletedRows(t *testing.T) {
+	rows := []model.WebDAVWritebackObject{
+		{ID: 1, Path: "/old", State: StateDeleted},
+		{ID: 2, Path: "/old/a.bin", State: StateDeleted},
+		{ID: 3, Path: "/old/sub/b.bin", State: StateDeleted},
+		{ID: 4, Path: "/other.bin", State: StateDeleted},
+	}
+	ready, blocked := filterRootDeletedRows(rows, map[string]struct{}{
+		pathKey("/old"): {},
+	})
+	if len(ready) != 2 || ready[0].ID != 1 || ready[1].ID != 4 {
+		t.Fatalf("root tombstones=%v, want [1 4]", []uint{ready[0].ID, ready[1].ID})
+	}
+	if !reflect.DeepEqual(blocked, []uint{2, 3}) {
+		t.Fatalf("blocked descendant tombstones=%v, want [2 3]", blocked)
 	}
 }
 
