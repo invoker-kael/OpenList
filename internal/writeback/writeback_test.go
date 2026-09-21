@@ -1461,6 +1461,47 @@ func TestReceiveSequenceSuperseded(t *testing.T) {
 	}
 }
 
+func TestReceiveFenceFinalizeUpdatesCommitsAndReleases(t *testing.T) {
+	lease := time.Now().Add(time.Minute)
+	fence := &model.WebDAVWritebackReceiveFence{
+		LastCommittedSequence: 4,
+		ActiveReceivers:       1,
+		ReceiveLeaseUntil:     &lease,
+	}
+	updates, err := receiveFenceFinalizeUpdates(fence, 5, true)
+	if err != nil {
+		t.Fatalf("finalize receive fence: %v", err)
+	}
+	if fence.LastCommittedSequence != 5 || fence.ActiveReceivers != 0 || fence.ReceiveLeaseUntil != nil {
+		t.Fatalf("finalized fence = committed:%d active:%d lease:%v", fence.LastCommittedSequence, fence.ActiveReceivers, fence.ReceiveLeaseUntil)
+	}
+	if updates["last_committed_sequence"] != uint64(5) || updates["active_receivers"] != 0 {
+		t.Fatalf("unexpected finalize updates: %#v", updates)
+	}
+}
+
+func TestReceiveFenceFinalizeUpdatesPreservesNewerMutation(t *testing.T) {
+	lease := time.Now().Add(time.Minute)
+	fence := &model.WebDAVWritebackReceiveFence{
+		LastCommittedSequence: 8,
+		ActiveReceivers:       1,
+		ReceiveLeaseUntil:     &lease,
+	}
+	updates, err := receiveFenceFinalizeUpdates(fence, 7, true)
+	if err != nil {
+		t.Fatalf("finalize superseded receive fence: %v", err)
+	}
+	if fence.LastCommittedSequence != 8 {
+		t.Fatalf("superseded receive moved fence backward to %d", fence.LastCommittedSequence)
+	}
+	if _, ok := updates["last_committed_sequence"]; ok {
+		t.Fatalf("superseded receive must not persist an older committed sequence: %#v", updates)
+	}
+	if fence.ActiveReceivers != 0 || fence.ReceiveLeaseUntil != nil {
+		t.Fatal("superseded receive must still release its active lease")
+	}
+}
+
 func TestReceiveFenceSchemaKeepsPathOrderingDurable(t *testing.T) {
 	typ := reflect.TypeOf(model.WebDAVWritebackReceiveFence{})
 	pathKeyField, ok := typ.FieldByName("PathKey")

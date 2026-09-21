@@ -2624,6 +2624,10 @@ func receiveAdmissionNeedsGlobalFence(limit uint64) bool {
 	return limit > 0
 }
 
+func receiveBacklogLimited(expected int64) bool {
+	return receiveAdmissionNeedsGlobalFence(maxPendingSpoolBytes()) && spoolBacklogAdmissionWeight(expected) > 0
+}
+
 func beginDurableReceiveSequence(ctx context.Context, p string, expected int64) (uint64, error) {
 	p = utils.FixAndCleanPath(p)
 	// The caller has already claimed the in-process receive slot atomically.
@@ -2726,7 +2730,7 @@ func refreshReceiveLease(tx *gorm.DB, key string, sequence uint64, leaseUntil ti
 func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64, expected, received int64) {
 	leaseUntil := time.Now().Add(receiveLeaseDuration)
 	key := pathKey(p)
-	backlogLimited := maxPendingSpoolBytes() > 0 && spoolBacklogAdmissionWeight(expected) > 0
+	backlogLimited := receiveBacklogLimited(expected)
 
 	if !receiveHeartbeatNeedsAdmission(expected, received, backlogLimited) {
 		// Known-length PUTs already reserved their complete declared size.
@@ -2762,6 +2766,9 @@ func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64, ex
 }
 
 func startReceiveLeaseHeartbeat(ctx context.Context, p string, sequence uint64, expected int64) func() {
+	if expected == 0 {
+		return func() {}
+	}
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -2790,19 +2797,11 @@ func startReceiveLeaseHeartbeat(ctx context.Context, p string, sequence uint64, 
 }
 
 func endReceiveSequence(ctx context.Context, p string, sequence uint64, expected int64) {
-	backlogLimited := receiveAdmissionNeedsGlobalFence(maxPendingSpoolBytes()) && spoolBacklogAdmissionWeight(expected) > 0
+	backlogLimited := receiveBacklogLimited(expected)
 	_ = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Reservation release only needs the global admission fence when backlog
-		// accounting is active. Without a configured high-water mark, same-path
-		// fencing is sufficient and unrelated PUT completions stay independent.
+		// Failure cleanup keeps the same global->path lock order as admission.
 		if backlogLimited {
 			if err := lockAdmissionFence(tx); err != nil {
-				return err
-			}
-		}
-		if backlogLimited {
-			if err := tx.Where("path_key = ? AND sequence = ?", pathKey(p), sequence).
-				Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
 				return err
 			}
 		}
@@ -2816,17 +2815,7 @@ func endReceiveSequence(ctx context.Context, p string, sequence uint64, expected
 			}
 			return err
 		}
-		if fence.ActiveReceivers <= 1 {
-			return tx.Model(&model.WebDAVWritebackReceiveFence{}).
-				Where("id = ?", fence.ID).
-				Updates(map[string]any{
-					"active_receivers":    0,
-					"receive_lease_until": nil,
-				}).Error
-		}
-		return tx.Model(&model.WebDAVWritebackReceiveFence{}).
-			Where("id = ?", fence.ID).
-			Update("active_receivers", fence.ActiveReceivers-1).Error
+		return finalizeReceiveSequenceTx(tx, p, &fence, sequence, expected, false)
 	})
 }
 
@@ -2973,20 +2962,41 @@ func advanceMutationFenceTrees(tx *gorm.DB, roots ...string) error {
 	return nil
 }
 
-func advanceReceiveFence(tx *gorm.DB, fence *model.WebDAVWritebackReceiveFence, sequence uint64) error {
+func receiveFenceFinalizeUpdates(fence *model.WebDAVWritebackReceiveFence, sequence uint64, committed bool) (map[string]any, error) {
 	if fence == nil || sequence == 0 {
-		return errors.New("write-back receive fence is missing")
+		return nil, errors.New("write-back receive fence is missing")
 	}
-	if receiveSequenceSuperseded(fence.LastCommittedSequence, sequence) {
-		return errors.New("cannot move receive fence backwards")
+	updates := make(map[string]any, 3)
+	if committed && !receiveSequenceSuperseded(fence.LastCommittedSequence, sequence) && fence.LastCommittedSequence != sequence {
+		fence.LastCommittedSequence = sequence
+		updates["last_committed_sequence"] = sequence
 	}
-	if fence.LastCommittedSequence == sequence {
-		return nil
+	if fence.ActiveReceivers <= 1 {
+		fence.ActiveReceivers = 0
+		fence.ReceiveLeaseUntil = nil
+		updates["active_receivers"] = 0
+		updates["receive_lease_until"] = nil
+	} else {
+		fence.ActiveReceivers--
+		updates["active_receivers"] = fence.ActiveReceivers
 	}
-	fence.LastCommittedSequence = sequence
+	return updates, nil
+}
+
+func finalizeReceiveSequenceTx(tx *gorm.DB, p string, fence *model.WebDAVWritebackReceiveFence, sequence uint64, expected int64, committed bool) error {
+	if receiveBacklogLimited(expected) {
+		if err := tx.Where("path_key = ? AND sequence = ?", pathKey(p), sequence).
+			Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
+			return err
+		}
+	}
+	updates, err := receiveFenceFinalizeUpdates(fence, sequence, committed)
+	if err != nil {
+		return err
+	}
 	return tx.Model(&model.WebDAVWritebackReceiveFence{}).
-		Where("id = ? AND last_committed_sequence <= ?", fence.ID, sequence).
-		Update("last_committed_sequence", sequence).Error
+		Where("id = ?", fence.ID).
+		Updates(updates).Error
 }
 
 func isReceiving(p string) bool {
@@ -3108,9 +3118,12 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	}
 	receiveCtx := durableCommitContext(ctx)
 	stopLeaseHeartbeat := startReceiveLeaseHeartbeat(receiveCtx, p, receiveSequence, expected)
+	receiveFinalized := false
 	defer func() {
 		stopLeaseHeartbeat()
-		endReceiveSequence(receiveCtx, p, receiveSequence, expected)
+		if !receiveFinalized {
+			endReceiveSequence(receiveCtx, p, receiveSequence, expected)
+		}
 	}()
 	spoolDir := conf.Conf.WebDAVWriteback.SpoolDir
 	actualSize := int64(0)
@@ -3195,6 +3208,11 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	commitCtx := receiveCtx
 	superseded := false
 	err = db.GetDb().WithContext(commitCtx).Transaction(func(tx *gorm.DB) error {
+		if receiveBacklogLimited(expected) {
+			if err := lockAdmissionFence(tx); err != nil {
+				return err
+			}
+		}
 		fence, err := lockReceiveFence(tx, p)
 		if err != nil {
 			return err
@@ -3210,7 +3228,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			}
 			superseded = true
 			saved = row
-			return nil
+			return finalizeReceiveSequenceTx(tx, p, fence, receiveSequence, expected, true)
 		}
 		if findErr == nil {
 			if canCoalesceDuplicatePut(&row, actualSize, payloadSHA1) {
@@ -3232,7 +3250,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 						return err
 					}
 					saved = row
-					return advanceReceiveFence(tx, fence, receiveSequence)
+					return finalizeReceiveSequenceTx(tx, p, fence, receiveSequence, expected, true)
 				}
 			}
 			if canCoalesceCompletedDuplicatePut(&row, actualSize, payloadSHA1) {
@@ -3252,7 +3270,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 					return err
 				}
 				saved = row
-				return advanceReceiveFence(tx, fence, receiveSequence)
+				return finalizeReceiveSequenceTx(tx, p, fence, receiveSequence, expected, true)
 			}
 			oldSpool = row.SpoolPath
 			if canonicalDeleted(&row) {
@@ -3295,7 +3313,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			return err
 		}
 		saved = row
-		return advanceReceiveFence(tx, fence, receiveSequence)
+		return finalizeReceiveSequenceTx(tx, p, fence, receiveSequence, expected, true)
 	})
 	if err != nil {
 		if finalName != "" {
@@ -3303,6 +3321,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		}
 		return nil, false, err
 	}
+	receiveFinalized = true
 	if superseded {
 		if finalName != "" {
 			_ = os.Remove(finalName)
