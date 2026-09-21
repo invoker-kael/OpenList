@@ -5304,6 +5304,12 @@ func ProviderListForWebDAV(ctx context.Context, parent string) ([]model.Obj, boo
 		return objs, true, nil
 	}
 	objs, err := providerParentSnapshots.do(ctx.Done(), parent, func() ([]model.Obj, error) {
+		slots := currentProviderProbeSlots()
+		reserved, err := acquireWorkerSlot(slots, ctx.Done())
+		if err != nil {
+			return nil, err
+		}
+		defer releaseWorkerSlot(slots, reserved)
 		return fs.List(ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
 	})
 	return objs, false, err
@@ -5325,6 +5331,16 @@ type workerManager struct {
 	inflight       sync.Map
 	batchCompleted sync.Map
 	wg             sync.WaitGroup
+}
+
+func currentProviderProbeSlots() chan struct{} {
+	managerMu.Lock()
+	m := manager
+	managerMu.Unlock()
+	if m == nil {
+		return nil
+	}
+	return m.providerProbes
 }
 
 func boundedWorkerLimit(workers, configured int) int {
@@ -5481,12 +5497,12 @@ func Start() {
 	if !Enabled() {
 		return
 	}
-	providerParentSnapshots.clear()
 	managerMu.Lock()
 	if manager != nil {
 		managerMu.Unlock()
 		return
 	}
+	providerParentSnapshots.clear()
 	workerCtx, cancel := context.WithCancel(context.Background())
 	workers := max(1, conf.Conf.WebDAVWriteback.Workers)
 	uploadWorkers := uploadWorkerLimit(workers, conf.Conf.WebDAVWriteback.UploadWorkers)

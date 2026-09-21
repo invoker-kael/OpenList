@@ -208,6 +208,23 @@ func TestProviderSnapshotTTLDefaultsConservatively(t *testing.T) {
 	}
 }
 
+func TestProviderSnapshotRefreshSharesWorkerProbeBudget(t *testing.T) {
+	slots := make(chan struct{}, 2)
+	managerMu.Lock()
+	oldManager := manager
+	manager = &workerManager{providerProbes: slots}
+	managerMu.Unlock()
+	defer func() {
+		managerMu.Lock()
+		manager = oldManager
+		managerMu.Unlock()
+	}()
+
+	if got := currentProviderProbeSlots(); got != slots {
+		t.Fatal("WebDAV provider snapshot refresh must share the worker provider-probe semaphore")
+	}
+}
+
 func TestDispatchFilePriority(t *testing.T) {
 	small := &model.WebDAVWritebackObject{Size: open115MultipartChunkSize}
 	large := &model.WebDAVWritebackObject{Size: open115MultipartChunkSize + 1}
