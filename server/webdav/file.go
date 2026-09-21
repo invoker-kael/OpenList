@@ -36,18 +36,14 @@ func slashClean(name string) string {
 
 func resourceObject(ctx context.Context, name string) (model.Obj, error) {
 	if writeback.Enabled() {
-		missing, err := writeback.ReconcileDirect(ctx, name)
-		if err != nil {
-			return nil, err
-		}
-		if missing {
-			return nil, errs.ObjectNotFound
-		}
 		obj, found, deleted, err := writeback.Canonical(name)
 		if err != nil {
 			return nil, err
 		}
 		if found {
+			// Cloud Sync verifies a successful PUT with an immediate PROPFIND.
+			// Once a generation is durably ACKed, provider propagation must not
+			// alter this client-visible snapshot.
 			if deleted || obj == nil {
 				return nil, errs.ObjectNotFound
 			}

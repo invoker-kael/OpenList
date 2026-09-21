@@ -976,6 +976,113 @@ func TestSplitOverlayRowsIncludesParentWithoutListingItAsAChild(t *testing.T) {
 	}
 }
 
+func TestMergeCanonicalOverlayKeepsCloudSyncSnapshotStable(t *testing.T) {
+	modTime := time.Date(2026, time.September, 20, 8, 0, 0, 0, time.UTC)
+	size := int64(8 * 1024 * 1024 * 1024)
+	rows := []model.WebDAVWritebackObject{
+		{
+			ID:             1,
+			Path:           "/encrypted/large.bin",
+			Name:           "large.bin",
+			Size:           size,
+			ModTime:        modTime,
+			Generation:     7,
+			ETag:           canonicalETag(pathKey("/encrypted/large.bin"), 7, size),
+			CanonicalState: CanonicalStateAcked,
+			State:          StateUploading,
+		},
+		{
+			ID:             2,
+			Path:           "/encrypted/deleted.bin",
+			Name:           "deleted.bin",
+			CanonicalState: CanonicalStateDeleted,
+			State:          StateDeleted,
+		},
+	}
+	remote := []model.Obj{
+		&model.Object{Name: "large.bin", Size: 0, Modified: modTime.Add(-time.Hour)},
+		&model.Object{Name: "deleted.bin", Size: 123},
+		&model.Object{Name: "remote-only.bin", Size: 55},
+	}
+
+	got := mergeCanonicalOverlay(remote, rows)
+	if len(got) != 2 {
+		t.Fatalf("overlay object count=%d, want 2", len(got))
+	}
+	byName := map[string]model.Obj{}
+	for _, obj := range got {
+		byName[obj.GetName()] = obj
+	}
+	large := byName["large.bin"]
+	if large == nil || large.GetSize() != size || !large.ModTime().Equal(modTime) {
+		t.Fatalf("canonical large-file snapshot was polluted by provider metadata: %#v", large)
+	}
+	if _, ok := large.(*CanonicalObject); !ok {
+		t.Fatal("Cloud Sync-visible object must remain canonical after Durable ACK")
+	}
+	if _, ok := byName["deleted.bin"]; ok {
+		t.Fatal("canonical tombstone must hide stale provider object")
+	}
+	if byName["remote-only.bin"] == nil {
+		t.Fatal("provider-only object should remain visible when canonical has no opinion")
+	}
+}
+
+func TestCompletedCanonicalReconcileDueIsBackgroundOnly(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{
+		DirectoryGraceSeconds:       60,
+		VerifyIntervalSeconds:       5,
+		CompletedRemoteProbeSeconds: 300,
+	}}
+	defer func() { conf.Conf = oldConf }()
+
+	now := time.Now()
+	completed := now.Add(-2 * time.Minute)
+	staleVerified := now.Add(-10 * time.Minute)
+	freshVerified := now.Add(-time.Minute)
+
+	staleFile := &model.WebDAVWritebackObject{
+		State:            StateCompleted,
+		CanonicalState:   CanonicalStateAcked,
+		Generation:       4,
+		RemoteGeneration: 4,
+		RemoteVerifiedAt: &staleVerified,
+		CompletedAt:      &completed,
+	}
+	if !completedCanonicalReconcileDue(staleFile, now) {
+		t.Fatal("stale completed replica should be reconciled in background")
+	}
+
+	freshFile := *staleFile
+	freshFile.RemoteVerifiedAt = &freshVerified
+	if completedCanonicalReconcileDue(&freshFile, now) {
+		t.Fatal("fresh replica evidence must not trigger background provider I/O")
+	}
+
+	cached := *staleFile
+	cached.SpoolPath = "/spool/large.data"
+	if completedCanonicalReconcileDue(&cached, now) {
+		t.Fatal("locally cached completed payload must stay canonical without replica probing")
+	}
+
+	freshDirTime := now.Add(-30 * time.Second)
+	freshDir := &model.WebDAVWritebackObject{
+		IsDir:          true,
+		State:          StateCompleted,
+		CanonicalState: CanonicalStateAcked,
+		CompletedAt:    &freshDirTime,
+	}
+	if completedCanonicalReconcileDue(freshDir, now) {
+		t.Fatal("fresh canonical directory must stay stable through consistency grace")
+	}
+	oldDir := *freshDir
+	oldDir.CompletedAt = &completed
+	if !completedCanonicalReconcileDue(&oldDir, now) {
+		t.Fatal("expired directory shadow should hand off to background reconciliation")
+	}
+}
+
 func TestSplitOverlayRowsExcludesRootSelfReference(t *testing.T) {
 	parent := "/"
 	parentKey := pathKey(parent)

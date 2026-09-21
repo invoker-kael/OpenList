@@ -382,3 +382,12 @@ Strict hash providers now require a trustworthy canonical SHA-1 as well as a pro
 Upload completion and completed-object evidence refresh now pass through a defensive exact-content gate before persisting remote verification evidence. This keeps the state invariant inside the write function rather than relying only on callers to classify the provider object correctly.
 
 Completed verification cooldown also rejects internally contradictory evidence when the persisted remote SHA-1 disagrees with the canonical payload SHA-1 for the same generation, forcing reconciliation instead of suppressing it.
+
+
+### Trace-driven Cloud Sync canonical authority
+
+The synchronous WebDAV path now follows the observed Synology Cloud Sync sequence directly: PROPFIND -> PUT -> PROPFIND verify. Once PUT commits the durable spool and canonical MySQL generation, that canonical snapshot is authoritative to Cloud Sync. PROPFIND/resource lookup and GET/HEAD metadata no longer run provider reconciliation before returning it.
+
+Directory PROPFIND is now a pure merge. Provider-only names remain visible, canonical tombstones hide stale provider names, and every live canonical name overrides provider size, mtime and ETag/type-facing metadata. A lagging 115 listing therefore cannot turn a successful large PUT into a different verification snapshot and trigger retransmission.
+
+Remote-replica health is decoupled into a dedicated background loop. Every 30 seconds it scans at most 32 completed no-spool rows whose evidence is due, under the existing provider-probe concurrency limit, and applies the existing conservative two-observation reconciliation rules. Remote loss can still be surfaced for one-way repair, but provider GET/LIST/SHA-1 latency and eventual consistency are no longer on Cloud Sync's client-visible correctness path.

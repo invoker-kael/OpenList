@@ -2028,23 +2028,13 @@ func OverlayListState(ctx context.Context, parent string, remote []model.Obj, re
 	return overlaid, hasWriteback, canonicalParent, err
 }
 
-func overlayListRows(ctx context.Context, parent string, remote []model.Obj, remoteReliable bool, rows []model.WebDAVWritebackObject) ([]model.Obj, bool, error) {
-	if len(rows) == 0 {
-		return remote, false, nil
-	}
-	now := time.Now()
-	var activeOps []model.WebDAVProviderOperation
-	if overlayRowsNeedProviderOperationProtection(rows, remoteReliable, now) {
-		var err error
-		activeOps, err = activeProviderOperations()
-		if err != nil {
-			return nil, false, err
-		}
-	}
-
+func mergeCanonicalOverlay(remote []model.Obj, rows []model.WebDAVWritebackObject) []model.Obj {
 	byName := make(map[string]model.Obj, len(remote)+len(rows))
 	order := make([]string, 0, len(remote)+len(rows))
 	for _, obj := range remote {
+		if obj == nil {
+			continue
+		}
 		name := obj.GetName()
 		if _, ok := byName[name]; !ok {
 			order = append(order, name)
@@ -2052,107 +2042,17 @@ func overlayListRows(ctx context.Context, parent string, remote []model.Obj, rem
 		byName[name] = obj
 	}
 
-	var freshByName map[string]model.Obj
-	freshLoaded := false
-	freshReliable := false
-	loadFresh := func() {
-		if freshLoaded {
-			return
-		}
-		freshLoaded = true
-		objs, listErr := fs.List(ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
-		if listErr != nil {
-			return
-		}
-		freshReliable = true
-		freshByName = make(map[string]model.Obj, len(objs))
-		for _, obj := range objs {
-			if obj != nil {
-				freshByName[obj.GetName()] = obj
-			}
-		}
-	}
-
 	for i := range rows {
 		row := &rows[i]
-		protectedByProviderOperation := providerOperationProtectsCanonicalPath(activeOps, row.Path, now)
-		requireHash := false
-		if !row.IsDir {
-			requireHash = providerRequiresPayloadHash(row.Path)
-		}
 		if canonicalDeleted(row) {
 			delete(byName, row.Name)
 			continue
 		}
-		remoteObj, remotePresent := byName[row.Name]
-		if row.IsDir {
-			if !protectedByProviderOperation && remoteReliable && directoryShadowExpired(row, now) {
-				res := db.GetDb().
-					Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateCompleted).
-					Delete(&model.WebDAVWritebackObject{})
-				if res.Error != nil {
-					return nil, false, res.Error
-				}
-				// After the grace window, hand the name back to the provider. If
-				// it is missing, remove the shadowed name; if it exists with either
-				// directory or file type, leave the real provider object visible.
-				if !remotePresent {
-					delete(byName, row.Name)
-				}
-				continue
-			}
-		}
-		if !protectedByProviderOperation && row.State == StateCompleted && !row.IsDir && row.SpoolPath == "" && remoteReliable && remoteObj != nil &&
-			compareRemoteContent(row, remoteObj, requireHash) == remoteContentMatch {
-			if clearErr := clearCompletedFileDivergence(row); clearErr != nil {
-				return nil, false, clearErr
-			}
-		}
-		if !protectedByProviderOperation &&
-			shouldDropCanonicalAfterRemoteList(row, remoteReliable, remoteObj, now, requireHash) {
-			ready, observeErr := observeCompletedFileDivergenceWithOps(row, now, activeOps)
-			if observeErr != nil {
-				return nil, false, observeErr
-			}
-			if ready {
-				loadFresh()
-				if freshReliable {
-					freshObj, freshPresent := freshByName[row.Name]
-					freshComparison := remoteContentMismatch
-					if freshPresent {
-						freshComparison = compareRemoteContent(row, freshObj, requireHash)
-					}
-					switch freshComparison {
-					case remoteContentMatch:
-						if clearErr := clearCompletedFileDivergence(row); clearErr != nil {
-							return nil, false, clearErr
-						}
-					case remoteContentInconclusive:
-						// A force-refreshed 115 listing still lacks enough identity
-						// evidence. Preserve canonical metadata and retry later.
-					default:
-						deleted, delErr := deleteCompletedCanonical(row)
-						if delErr != nil {
-							return nil, false, delErr
-						}
-						if deleted {
-							if freshPresent {
-								if _, ok := byName[row.Name]; !ok {
-									order = append(order, row.Name)
-								}
-								byName[row.Name] = freshObj
-							} else {
-								delete(byName, row.Name)
-							}
-							continue
-						}
-					}
-				}
-			}
-		}
-		if !remotePresent {
+		if _, ok := byName[row.Name]; !ok {
 			order = append(order, row.Name)
 		}
+		// Durable canonical metadata is Cloud Sync's verification authority.
+		// Lagging provider size/mtime/hash/type metadata cannot replace it.
 		byName[row.Name] = toObject(row)
 	}
 
@@ -2162,7 +2062,14 @@ func overlayListRows(ctx context.Context, parent string, remote []model.Obj, rem
 			out = append(out, obj)
 		}
 	}
-	return out, true, nil
+	return out
+}
+
+func overlayListRows(ctx context.Context, parent string, remote []model.Obj, remoteReliable bool, rows []model.WebDAVWritebackObject) ([]model.Obj, bool, error) {
+	if len(rows) == 0 {
+		return remote, false, nil
+	}
+	return mergeCanonicalOverlay(remote, rows), true, nil
 }
 
 func megabytesToBytes(mb uint64) uint64 {
@@ -5161,6 +5068,8 @@ func Start() {
 			m.wg.Add(1)
 			go m.worker()
 		}
+		m.wg.Add(1)
+		go m.completedCanonicalLoop()
 		m.scheduler()
 	}()
 }
@@ -5266,6 +5175,95 @@ func (m *workerManager) recoverInterrupted() error {
 				"last_error":   "resuming remote verification after interrupted upload",
 			}).Error
 	})
+}
+
+const (
+	completedCanonicalReconcileEvery      = 30 * time.Second
+	completedCanonicalReconcileBatchLimit = 32
+)
+
+func completedCanonicalReconcileDue(row *model.WebDAVWritebackObject, now time.Time) bool {
+	if row == nil ||
+		row.State != StateCompleted ||
+		row.SpoolPath != "" ||
+		!canonicalAcked(row) {
+		return false
+	}
+	if row.RetryAt != nil && now.Before(*row.RetryAt) {
+		return false
+	}
+	if row.IsDir {
+		return directoryShadowExpired(row, now)
+	}
+	return !completedRemoteVerificationFresh(row, now)
+}
+
+func loadCompletedCanonicalReconcileCandidates(now time.Time, limit int) ([]model.WebDAVWritebackObject, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	probeCutoff := now.Add(-completedRemoteVerificationInterval())
+	graceSeconds := 1
+	if conf.Conf != nil {
+		graceSeconds = max(1, conf.Conf.WebDAVWriteback.DirectoryGraceSeconds)
+	}
+	directoryCutoff := now.Add(-time.Duration(graceSeconds) * time.Second)
+
+	var rows []model.WebDAVWritebackObject
+	err := db.GetDb().
+		Where("state = ? AND spool_path = ''", StateCompleted).
+		Where("(canonical_state = ? OR canonical_state = '' OR canonical_state IS NULL)", CanonicalStateAcked).
+		Where("(retry_at IS NULL OR retry_at <= ?)", now).
+		Where(
+			"(is_dir = ? AND completed_at IS NOT NULL AND completed_at <= ?) OR "+
+				"(is_dir = ? AND (remote_verified_at IS NULL OR remote_verified_at <= ? OR remote_generation <> generation OR verify_count <> 0 OR last_error <> ''))",
+			true, directoryCutoff,
+			false, probeCutoff,
+		).
+		Order("retry_at asc").
+		Order("remote_verified_at asc").
+		Order("id asc").
+		Limit(limit).
+		Find(&rows).Error
+	return rows, err
+}
+
+func (m *workerManager) maintainCompletedCanonical() {
+	now := time.Now()
+	rows, err := loadCompletedCanonicalReconcileCandidates(now, completedCanonicalReconcileBatchLimit)
+	if err != nil {
+		log.Errorf("write-back completed canonical reconcile scan failed: %v", err)
+		return
+	}
+	for i := range rows {
+		row := &rows[i]
+		if !completedCanonicalReconcileDue(row, now) {
+			continue
+		}
+		reserved, slotErr := acquireWorkerSlot(m.providerProbes, m.stop)
+		if slotErr != nil {
+			return
+		}
+		_, reconcileErr := ReconcileDirect(m.ctx, row.Path)
+		releaseWorkerSlot(m.providerProbes, reserved)
+		if reconcileErr != nil && !errors.Is(reconcileErr, context.Canceled) {
+			log.Errorf("write-back background canonical reconcile failed for %s: %v", row.Path, reconcileErr)
+		}
+	}
+}
+
+func (m *workerManager) completedCanonicalLoop() {
+	defer m.wg.Done()
+	ticker := time.NewTicker(completedCanonicalReconcileEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.stop:
+			return
+		case <-ticker.C:
+			m.maintainCompletedCanonical()
+		}
+	}
 }
 
 func cleanupExpiredLockNull(now time.Time) {

@@ -321,15 +321,6 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 	if !common.CanAccess(user, meta, reqPath, password) {
 		return http.StatusForbidden, errs.PermissionDenied
 	}
-	if writeback.Enabled() {
-		missing, wbErr := writeback.ReconcileDirect(ctx, reqPath)
-		if wbErr != nil {
-			return http.StatusInternalServerError, wbErr
-		}
-		if missing {
-			return http.StatusNotFound, errs.ObjectNotFound
-		}
-	}
 	fi, found, deleted, wbErr := writeback.Canonical(reqPath)
 	if wbErr != nil {
 		return http.StatusInternalServerError, wbErr
@@ -1527,15 +1518,6 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 	}
 	if !common.CanAccess(user, meta, reqPath, password) {
 		return http.StatusForbidden, errs.PermissionDenied
-	}
-	if writeback.Enabled() {
-		missing, wbErr := writeback.ReconcileDirect(ctx, reqPath)
-		if wbErr != nil {
-			return http.StatusInternalServerError, wbErr
-		}
-		if missing {
-			return http.StatusNotFound, errs.ObjectNotFound
-		}
 	}
 	fi, found, deleted, wbErr := writeback.Canonical(reqPath)
 	if wbErr != nil {
