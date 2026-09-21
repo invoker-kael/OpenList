@@ -154,6 +154,15 @@ func TestFairDispatchFilesPreventsLargeStarvation(t *testing.T) {
 	}
 }
 
+func TestAppendDispatchRowsHonorsQueueBudget(t *testing.T) {
+	rows := []model.WebDAVWritebackObject{{ID: 1}}
+	incoming := []model.WebDAVWritebackObject{{ID: 2}, {ID: 3}, {ID: 4}}
+	got, remaining := appendDispatchRows(rows, incoming, 2)
+	if remaining != 0 || len(got) != 3 || got[1].ID != 2 || got[2].ID != 3 {
+		t.Fatalf("budgeted dispatch rows=%v remaining=%d", []uint{got[0].ID, got[1].ID, got[2].ID}, remaining)
+	}
+}
+
 func TestWorkerManagerInflightIDsAreStable(t *testing.T) {
 	m := &workerManager{}
 	m.inflight.Store(uint(9), struct{}{})
@@ -183,7 +192,7 @@ func TestBatchCompletedOnlyMarksInflightJobs(t *testing.T) {
 
 func TestWritebackDispatchIndex(t *testing.T) {
 	typ := reflect.TypeOf(model.WebDAVWritebackObject{})
-	for _, fieldName := range []string{"State", "IsDir", "RetryAt"} {
+	for _, fieldName := range []string{"State", "IsDir", "RetryAt", "UpdatedAt"} {
 		field, ok := typ.FieldByName(fieldName)
 		if !ok {
 			t.Fatalf("writeback model is missing %s", fieldName)
@@ -218,21 +227,42 @@ func TestLargeProviderUploadCandidate(t *testing.T) {
 	large := &model.WebDAVWritebackObject{
 		State: StateQueued,
 		Size:  open115MultipartChunkSize + 1,
+		Path:  "/large.bin",
 	}
-	if !largeProviderUploadCandidate(large, true) {
+	calls := 0
+	requireHash := func(p string) bool {
+		calls++
+		return p == "/large.bin"
+	}
+	if !largeProviderUploadCandidate(large, requireHash) {
 		t.Fatal("large queued 115 upload should consume a large-upload slot")
 	}
-	if largeProviderUploadCandidate(large, false) {
-		t.Fatal("large upload on a provider without required payload hash should not be throttled")
+	if calls != 1 {
+		t.Fatalf("large provider classification calls=%d, want 1", calls)
 	}
+
+	calls = 0
+	small := *large
+	small.Size = open115MultipartChunkSize
+	if largeProviderUploadCandidate(&small, requireHash) {
+		t.Fatal("single-part-sized upload should stay on the normal worker pool")
+	}
+	if calls != 0 {
+		t.Fatalf("small upload unexpectedly resolved provider hash capability %d times", calls)
+	}
+
+	calls = 0
 	large.State = StateVerifying
-	if largeProviderUploadCandidate(large, true) {
+	if largeProviderUploadCandidate(large, requireHash) {
 		t.Fatal("verification must not consume a large-upload transfer slot")
 	}
+	if calls != 0 {
+		t.Fatalf("verification unexpectedly resolved provider hash capability %d times", calls)
+	}
+
 	large.State = StateFailed
-	large.Size = open115MultipartChunkSize
-	if largeProviderUploadCandidate(large, true) {
-		t.Fatal("single-part-sized upload should stay on the normal worker pool")
+	if largeProviderUploadCandidate(large, func(string) bool { return false }) {
+		t.Fatal("large upload on a provider without required payload hash should not be throttled")
 	}
 }
 

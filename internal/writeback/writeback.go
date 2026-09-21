@@ -4841,12 +4841,18 @@ func providerUploadCandidate(row *model.WebDAVWritebackObject) bool {
 		(row.State == StateQueued || row.State == StateFailed)
 }
 
-func largeProviderUploadCandidate(row *model.WebDAVWritebackObject, requireHash bool) bool {
+func multipartProviderUploadCandidate(row *model.WebDAVWritebackObject) bool {
 	return row != nil &&
-		requireHash &&
 		!row.IsDir &&
 		(row.State == StateQueued || row.State == StateFailed) &&
 		row.Size > open115MultipartChunkSize
+}
+
+func largeProviderUploadCandidate(row *model.WebDAVWritebackObject, requireHash func(string) bool) bool {
+	if !multipartProviderUploadCandidate(row) {
+		return false
+	}
+	return requireHash != nil && requireHash(row.Path)
 }
 
 func tryReserveWorkerSlot(slots chan struct{}) (reserved bool, allowed bool) {
@@ -5172,45 +5178,80 @@ func loadDispatchClass(now time.Time, states []string, isDir *bool, excludedIDs 
 	err := query.
 		Order("retry_at asc").
 		Order("updated_at asc").
+		Order("id asc").
 		Limit(max(1, limit)).
 		Find(&rows).Error
 	return rows, err
 }
 
-func loadDispatchRows(now time.Time, workers int, excludedIDs []uint) ([]model.WebDAVWritebackObject, error) {
-	limit := max(4, workers*2)
-	fileLimit := max(8, workers*4)
+func appendDispatchRows(rows, incoming []model.WebDAVWritebackObject, remaining int) ([]model.WebDAVWritebackObject, int) {
+	if remaining <= 0 || len(incoming) == 0 {
+		return rows, remaining
+	}
+	if len(incoming) > remaining {
+		incoming = incoming[:remaining]
+	}
+	rows = append(rows, incoming...)
+	return rows, remaining - len(incoming)
+}
+
+func loadDispatchRows(now time.Time, workers, budget int, excludedIDs []uint) ([]model.WebDAVWritebackObject, error) {
+	if budget <= 0 {
+		return nil, nil
+	}
+	classLimit := max(4, workers*2)
 	isDir := true
 	isFile := false
+	rows := make([]model.WebDAVWritebackObject, 0, budget)
+	remaining := budget
 
-	deleted, err := loadDispatchClass(now, []string{StateDeleted}, nil, excludedIDs, limit)
+	loadClass := func(states []string, dir *bool) ([]model.WebDAVWritebackObject, error) {
+		return loadDispatchClass(now, states, dir, excludedIDs, min(remaining, classLimit))
+	}
+
+	deleted, err := loadClass([]string{StateDeleted}, nil)
 	if err != nil {
 		return nil, err
 	}
-	verifying, err := loadDispatchClass(now, []string{StateVerifying}, nil, excludedIDs, limit)
+	rows, remaining = appendDispatchRows(rows, deleted, remaining)
+	if remaining == 0 {
+		return rows, nil
+	}
+
+	verifying, err := loadClass([]string{StateVerifying}, nil)
 	if err != nil {
 		return nil, err
 	}
-	directories, err := loadDispatchClass(now, []string{StateQueued, StateFailed}, &isDir, excludedIDs, limit)
+	rows, remaining = appendDispatchRows(rows, verifying, remaining)
+	if remaining == 0 {
+		return rows, nil
+	}
+
+	directories, err := loadClass([]string{StateQueued, StateFailed}, &isDir)
 	if err != nil {
 		return nil, err
 	}
-	files, err := loadDispatchClass(now, []string{StateQueued, StateFailed}, &isFile, excludedIDs, fileLimit)
+	rows, remaining = appendDispatchRows(rows, directories, remaining)
+	if remaining == 0 {
+		return rows, nil
+	}
+
+	// Fetch a wider file window than the remaining queue capacity so the
+	// 3-small:1-large fairness pass can still see multipart candidates, but
+	// never enqueue more work than the job channel can accept.
+	fileScanLimit := max(remaining, remaining*(dispatchSmallBurst+1))
+	files, err := loadDispatchClass(now, []string{StateQueued, StateFailed}, &isFile, excludedIDs, fileScanLimit)
 	if err != nil {
 		return nil, err
 	}
 	files = fairDispatchFiles(files)
-
-	rows := make([]model.WebDAVWritebackObject, 0, len(deleted)+len(verifying)+len(directories)+len(files))
-	rows = append(rows, deleted...)
-	rows = append(rows, verifying...)
-	rows = append(rows, directories...)
-	rows = append(rows, files...)
+	rows, _ = appendDispatchRows(rows, files, remaining)
 	return rows, nil
 }
 
 func (m *workerManager) dispatch() {
-	if len(m.jobs) >= cap(m.jobs) {
+	freeJobs := cap(m.jobs) - len(m.jobs)
+	if freeJobs <= 0 {
 		return
 	}
 	now := time.Now()
@@ -5219,7 +5260,7 @@ func (m *workerManager) dispatch() {
 		Delete(&model.WebDAVWritebackObject{}).Error; err != nil {
 		log.Errorf("write-back lock-null cleanup failed: %v", err)
 	}
-	rows, err := loadDispatchRows(now, max(1, conf.Conf.WebDAVWriteback.Workers), m.inflightIDs())
+	rows, err := loadDispatchRows(now, max(1, conf.Conf.WebDAVWriteback.Workers), freeJobs, m.inflightIDs())
 	if err != nil {
 		log.Errorf("write-back queue scan failed: %v", err)
 		return
@@ -5238,7 +5279,7 @@ func (m *workerManager) dispatch() {
 				continue
 			}
 			job.upload = reserved
-			if largeProviderUploadCandidate(row, providerRequiresPayloadHash(row.Path)) {
+			if largeProviderUploadCandidate(row, providerRequiresPayloadHash) {
 				largeReserved, largeAllowed := tryReserveWorkerSlot(m.largeUploads)
 				if !largeAllowed {
 					releaseWorkerSlot(m.uploads, job.upload)

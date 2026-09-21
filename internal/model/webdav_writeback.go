@@ -42,7 +42,7 @@ type WebDAVWritebackObject struct {
 	RetryAt          *time.Time `json:"retry_at" gorm:"index;index:idx_webdav_writeback_queue,priority:2;index:idx_webdav_writeback_dispatch,priority:3"`
 	CompletedAt      *time.Time `json:"completed_at" gorm:"index;index:idx_webdav_writeback_completed,priority:2"`
 	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	UpdatedAt        time.Time  `json:"updated_at" gorm:"index:idx_webdav_writeback_dispatch,priority:4"`
 }
 
 // WebDAVWritebackReceiveFence serializes same-path PUT publication through
