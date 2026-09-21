@@ -1342,12 +1342,29 @@ func toObject(row *model.WebDAVWritebackObject) model.Obj {
 	}
 }
 
+const canonicalReadColumns = "id, path_key, parent_key, path, name, is_dir, size, mod_time, create_time, etag, payload_sha1, canonical_state, state"
+
 func getByPath(p string) (*model.WebDAVWritebackObject, error) {
 	if !Enabled() {
 		return nil, nil
 	}
 	var row model.WebDAVWritebackObject
-	err := db.GetDb().Where("path_key = ?", pathKey(p)).First(&row).Error
+	err := db.GetDb().Where("path_key = ?", pathKey(p)).Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	return &row, err
+}
+
+func getCanonicalByPath(p string) (*model.WebDAVWritebackObject, error) {
+	if !Enabled() {
+		return nil, nil
+	}
+	var row model.WebDAVWritebackObject
+	err := db.GetDb().
+		Select(canonicalReadColumns).
+		Where("path_key = ?", pathKey(p)).
+		Take(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
@@ -1357,7 +1374,7 @@ func getByPath(p string) (*model.WebDAVWritebackObject, error) {
 // Canonical returns the stable WebDAV object for a path. found remains true for
 // tombstones so callers can hide a remotely-stale object while delete is pending.
 func Canonical(p string) (obj model.Obj, found bool, deleted bool, err error) {
-	row, err := getByPath(p)
+	row, err := getCanonicalByPath(p)
 	if err != nil || row == nil {
 		return nil, false, false, err
 	}
@@ -1967,14 +1984,12 @@ func splitOverlayRows(parent, parentKey string, candidates []model.WebDAVWriteba
 	return rows, canonicalParent
 }
 
-const overlaySelectColumns = "id, path_key, parent_key, path, name, is_dir, size, mod_time, create_time, etag, canonical_state, state"
-
 func loadOverlayRows(parent string) ([]model.WebDAVWritebackObject, bool, error) {
 	parent = utils.FixAndCleanPath(parent)
 	key := pathKey(parent)
 	var candidates []model.WebDAVWritebackObject
 	if err := db.GetDb().
-		Select(overlaySelectColumns).
+		Select(canonicalReadColumns).
 		Where("parent_key = ? OR path_key = ?", key, key).
 		Find(&candidates).Error; err != nil {
 		return nil, false, err
@@ -1987,7 +2002,7 @@ func loadOverlayChildRows(parent string) ([]model.WebDAVWritebackObject, error) 
 	parent = utils.FixAndCleanPath(parent)
 	var rows []model.WebDAVWritebackObject
 	if err := db.GetDb().
-		Select(overlaySelectColumns).
+		Select(canonicalReadColumns).
 		Where("parent_key = ?", pathKey(parent)).
 		Find(&rows).Error; err != nil {
 		return nil, err
