@@ -242,7 +242,12 @@ var (
 	ErrProviderOperationConflict = errors.New("conflicting provider COPY/MOVE intent is still unresolved")
 	ErrProviderOperationStale    = errors.New("provider COPY/MOVE source generation was superseded")
 	ErrSpoolCapacity             = errors.New("write-back spool capacity unavailable")
+	ErrReceiveInProgress         = errors.New("write-back receive already in progress")
 )
+
+func ReceiveRetrySeconds() int {
+	return 2
+}
 
 type SpoolCapacityError struct {
 	Free         uint64
@@ -2448,6 +2453,13 @@ func lockOrCreateReceiveFence(tx *gorm.DB, p string) (*model.WebDAVWritebackRece
 	return &fence, nil
 }
 
+func receiveFenceActive(fence *model.WebDAVWritebackReceiveFence, now time.Time) bool {
+	return fence != nil &&
+		fence.ActiveReceivers > 0 &&
+		fence.ReceiveLeaseUntil != nil &&
+		now.Before(*fence.ReceiveLeaseUntil)
+}
+
 func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64, error) {
 	p = utils.FixAndCleanPath(p)
 	var sequence uint64
@@ -2459,6 +2471,24 @@ func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64
 		}
 		if err := tx.Where("lease_until <= ?", now).Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
 			return err
+		}
+
+		fence, err := lockOrCreateReceiveFence(tx, p)
+		if err != nil {
+			return err
+		}
+		if receiveFenceActive(fence, now) {
+			// A duplicate Cloud Sync PUT for the same path should not consume a
+			// second request body while the first receive is still live. Return a
+			// transient response before reading the body; once the first PUT is
+			// durably ACKed, the next PROPFIND sees canonical state and the retry
+			// can converge without a parallel full-file receive.
+			return ErrReceiveInProgress
+		}
+		if fence.ActiveReceivers > 0 {
+			// A crashed process can leave an active count behind. An expired
+			// receive lease is stale and may be reclaimed by this new receiver.
+			fence.ActiveReceivers = 0
 		}
 
 		limit := maxPendingSpoolBytes()
@@ -2473,15 +2503,6 @@ func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64
 			}
 		}
 
-		fence, err := lockOrCreateReceiveFence(tx, p)
-		if err != nil {
-			return err
-		}
-		if fence.ActiveReceivers > 0 && (fence.ReceiveLeaseUntil == nil || !now.Before(*fence.ReceiveLeaseUntil)) {
-			// A crashed process can leave an active count behind. Once its lease
-			// expires there is no live receiver entitled to keep blocking workers.
-			fence.ActiveReceivers = 0
-		}
 		fence.NextSequence++
 		fence.ActiveReceivers++
 		fence.Path = p
@@ -2546,6 +2567,34 @@ func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64, ex
 		}
 		return reservation.Updates(updates).Error
 	})
+}
+
+func startReceiveLeaseHeartbeat(ctx context.Context, p string, sequence uint64, expected int64) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(receiveHeartbeatEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				// received=0 intentionally refreshes only the lease for
+				// unknown-length bodies. Progress checkpoints in copyToSpool
+				// monotonically grow the durable byte reservation separately.
+				heartbeatReceiveSequence(ctx, p, sequence, expected, 0)
+			case <-stop:
+				return
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+		})
+	}
 }
 
 func endReceiveSequence(ctx context.Context, p string, sequence uint64) {
@@ -2618,6 +2667,22 @@ func durableReceiving(p string, now time.Time) (bool, error) {
 			"receive_updated_at":  &now,
 		}).Error
 	return false, nil
+}
+
+func Receiving(p string) (bool, error) {
+	return durableReceiving(utils.FixAndCleanPath(p), time.Now())
+}
+
+func ReceivingTree(root string) (bool, error) {
+	root = utils.FixAndCleanPath(root)
+	now := time.Now()
+	var count int64
+	err := db.GetDb().Model(&model.WebDAVWritebackReceiveFence{}).
+		Where("active_receivers > 0 AND receive_lease_until > ?", now).
+		Where("path = ? OR path LIKE ? ESCAPE '~'", root, descendantLikePattern(root)).
+		Limit(1).
+		Count(&count).Error
+	return count > 0, err
 }
 
 func lockReceiveFence(tx *gorm.DB, p string) (*model.WebDAVWritebackReceiveFence, error) {
@@ -2821,7 +2886,11 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		return nil, false, err
 	}
 	receiveCtx := durableCommitContext(ctx)
-	defer endReceiveSequence(receiveCtx, p, receiveSequence)
+	stopLeaseHeartbeat := startReceiveLeaseHeartbeat(receiveCtx, p, receiveSequence, expected)
+	defer func() {
+		stopLeaseHeartbeat()
+		endReceiveSequence(receiveCtx, p, receiveSequence)
+	}()
 	spoolDir := conf.Conf.WebDAVWriteback.SpoolDir
 	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
 		return nil, false, err

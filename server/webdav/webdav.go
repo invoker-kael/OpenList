@@ -450,6 +450,11 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 		} else if blocked {
 			return http.StatusServiceUnavailable, nil
 		}
+		if blocked, blockErr := receivePathBlocked(w, reqPath, true); blockErr != nil {
+			return http.StatusInternalServerError, blockErr
+		} else if blocked {
+			return http.StatusServiceUnavailable, nil
+		}
 	}
 	// TODO: return MultiStatus where appropriate.
 	if writeback.Enabled() {
@@ -653,6 +658,12 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 		writebackCreateTime := h.getWritebackHeaderTime(r, "X-OC-Ctime")
 		row, created, wbErr := writeback.Commit(ctx, reqPath, r.Body, size, writebackModTime, writebackCreateTime, mimeType)
 		if wbErr != nil {
+			if errors.Is(wbErr, writeback.ErrReceiveInProgress) {
+				drainBody = false
+				r.Close = true
+				w.Header().Set("Retry-After", strconv.Itoa(writeback.ReceiveRetrySeconds()))
+				return http.StatusServiceUnavailable, wbErr
+			}
 			if errors.Is(wbErr, writeback.ErrSpoolCapacity) {
 				drainBody = false
 				r.Close = true
@@ -716,6 +727,11 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 	}
 	if writeback.Enabled() {
 		if blocked, blockErr := providerOperationPathBlocked(w, reqPath); blockErr != nil {
+			return http.StatusInternalServerError, blockErr
+		} else if blocked {
+			return http.StatusServiceUnavailable, nil
+		}
+		if blocked, blockErr := receivePathBlocked(w, reqPath, false); blockErr != nil {
 			return http.StatusInternalServerError, blockErr
 		} else if blocked {
 			return http.StatusServiceUnavailable, nil
@@ -812,6 +828,26 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 		return http.StatusMethodNotAllowed, err
 	}
 	return http.StatusCreated, nil
+}
+
+func receivePathBlocked(w http.ResponseWriter, p string, recursive bool) (bool, error) {
+	var (
+		busy bool
+		err  error
+	)
+	if recursive {
+		busy, err = writeback.ReceivingTree(p)
+	} else {
+		busy, err = writeback.Receiving(p)
+	}
+	if err != nil {
+		return false, err
+	}
+	if !busy {
+		return false, nil
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(writeback.ReceiveRetrySeconds()))
+	return true, nil
 }
 
 func providerOperationPathBlocked(w http.ResponseWriter, p string) (bool, error) {
@@ -1024,6 +1060,19 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 		}
 		defer release()
 
+		if writeback.Enabled() {
+			if blocked, blockErr := receivePathBlocked(w, src, true); blockErr != nil {
+				return http.StatusInternalServerError, blockErr
+			} else if blocked {
+				return http.StatusServiceUnavailable, nil
+			}
+			if blocked, blockErr := receivePathBlocked(w, dst, true); blockErr != nil {
+				return http.StatusInternalServerError, blockErr
+			} else if blocked {
+				return http.StatusServiceUnavailable, nil
+			}
+		}
+
 		depth := infiniteDepth
 		if hdr := r.Header.Get("Depth"); hdr != "" {
 			depth = parseDepth(hdr)
@@ -1147,6 +1196,19 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 		return status, err
 	}
 	defer release()
+
+	if writeback.Enabled() {
+		if blocked, blockErr := receivePathBlocked(w, src, true); blockErr != nil {
+			return http.StatusInternalServerError, blockErr
+		} else if blocked {
+			return http.StatusServiceUnavailable, nil
+		}
+		if blocked, blockErr := receivePathBlocked(w, dst, true); blockErr != nil {
+			return http.StatusInternalServerError, blockErr
+		} else if blocked {
+			return http.StatusServiceUnavailable, nil
+		}
+	}
 
 	if hdr := r.Header.Get("Depth"); hdr != "" && parseDepth(hdr) != infiniteDepth {
 		return http.StatusBadRequest, errInvalidDepth
@@ -1565,6 +1627,11 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request) (statu
 	}
 	if writeback.Enabled() {
 		if blocked, blockErr := providerOperationPathBlocked(w, reqPath); blockErr != nil {
+			return http.StatusInternalServerError, blockErr
+		} else if blocked {
+			return http.StatusServiceUnavailable, nil
+		}
+		if blocked, blockErr := receivePathBlocked(w, reqPath, false); blockErr != nil {
 			return http.StatusInternalServerError, blockErr
 		} else if blocked {
 			return http.StatusServiceUnavailable, nil

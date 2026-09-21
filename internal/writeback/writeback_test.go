@@ -1422,6 +1422,35 @@ func TestMaxPendingSpoolBytes(t *testing.T) {
 	}
 }
 
+func TestReceiveFenceActive(t *testing.T) {
+	now := time.Now()
+	future := now.Add(time.Minute)
+	past := now.Add(-time.Minute)
+	if !receiveFenceActive(&model.WebDAVWritebackReceiveFence{
+		ActiveReceivers:   1,
+		ReceiveLeaseUntil: &future,
+	}, now) {
+		t.Fatal("live receive lease must block a duplicate same-path PUT")
+	}
+	if receiveFenceActive(&model.WebDAVWritebackReceiveFence{
+		ActiveReceivers:   1,
+		ReceiveLeaseUntil: &past,
+	}, now) {
+		t.Fatal("expired receive lease must not block a replacement PUT")
+	}
+	if receiveFenceActive(&model.WebDAVWritebackReceiveFence{
+		ActiveReceivers: 1,
+	}, now) {
+		t.Fatal("receiver without a durable lease must not remain busy")
+	}
+}
+
+func TestReceiveRetrySeconds(t *testing.T) {
+	if got := ReceiveRetrySeconds(); got < 1 || got > 10 {
+		t.Fatalf("receive retry interval=%d, want a short bounded retry", got)
+	}
+}
+
 func TestReceiveReservationIdentityUsesPathAndSequence(t *testing.T) {
 	first := model.WebDAVWritebackReceiveReservation{
 		PathKey:  "same-path",
