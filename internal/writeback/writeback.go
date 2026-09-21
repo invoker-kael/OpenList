@@ -3005,11 +3005,11 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 				if err := tx.Model(&model.WebDAVWritebackObject{}).
 					Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateCompleted).
 					Updates(map[string]any{
-						"mod_time":          row.ModTime,
-						"create_time":       row.CreateTime,
-						"mime_type":         row.MimeType,
-						"canonical_state":   row.CanonicalState,
-						"ack_time":          row.AckTime,
+						"mod_time":        row.ModTime,
+						"create_time":     row.CreateTime,
+						"mime_type":       row.MimeType,
+						"canonical_state": row.CanonicalState,
+						"ack_time":        row.AckTime,
 						"durable_at":      row.DurableAt,
 					}).Error; err != nil {
 					return err
@@ -5030,20 +5030,20 @@ func (m *workerManager) recoverInterrupted() error {
 		if err := tx.Model(&model.WebDAVWritebackObject{}).
 			Where("state = ? AND is_dir = ?", StateUploading, true).
 			Updates(map[string]any{
-				"state":             StateQueued,
-				"retry_at":          &now,
-				"verify_count":      0,
-				"last_error":        "re-queued interrupted directory creation",
+				"state":        StateQueued,
+				"retry_at":     &now,
+				"verify_count": 0,
+				"last_error":   "re-queued interrupted directory creation",
 			}).Error; err != nil {
 			return err
 		}
 		return tx.Model(&model.WebDAVWritebackObject{}).
 			Where("state = ? AND is_dir = ?", StateUploading, false).
 			Updates(map[string]any{
-				"state":             StateVerifying,
-				"retry_at":          &now,
-				"verify_count":      0,
-				"last_error":        "resuming remote verification after interrupted upload",
+				"state":        StateVerifying,
+				"retry_at":     &now,
+				"verify_count": 0,
+				"last_error":   "resuming remote verification after interrupted upload",
 			}).Error
 	})
 }
@@ -5391,10 +5391,10 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 				Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued}).
 				Updates(map[string]any{
-					"state":             StateVerifying,
-					"retry_at":          &next,
-					"verify_count":      0,
-					"last_error":        msg,
+					"state":        StateVerifying,
+					"retry_at":     &next,
+					"verify_count": 0,
+					"last_error":   msg,
 				}).Error
 			return
 		}
@@ -5470,10 +5470,10 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
 			Updates(map[string]any{
-				"state":             StateVerifying,
-				"retry_at":          &next,
-				"verify_count":      0,
-				"last_error":        fmt.Sprintf("provider upload succeeded but verification state persistence failed: %v", res.Error),
+				"state":        StateVerifying,
+				"retry_at":     &next,
+				"verify_count": 0,
+				"last_error":   fmt.Sprintf("provider upload succeeded but verification state persistence failed: %v", res.Error),
 			}).Error
 		log.Errorf("write-back failed to enter verifying state for %s: %v", row.Path, res.Error)
 		return
@@ -5511,11 +5511,11 @@ func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
 	res = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND is_dir = ?", row.ID, row.Generation, true).
 		Updates(map[string]any{
-			"state":             StateCompleted,
-			"completed_at":      &now,
-			"retry_at":          nil,
-			"last_error":        "",
-			"retry_count":       0,
+			"state":        StateCompleted,
+			"completed_at": &now,
+			"retry_at":     nil,
+			"last_error":   "",
+			"retry_count":  0,
 		})
 	if res.Error != nil || res.RowsAffected == 0 {
 		return
@@ -5767,10 +5767,10 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
 			Updates(map[string]any{
-				"state":             StateQueued,
-				"retry_at":          &now,
-				"verify_count":      0,
-				"last_error":        "directory verification state repaired to queued",
+				"state":        StateQueued,
+				"retry_at":     &now,
+				"verify_count": 0,
+				"last_error":   "directory verification state repaired to queued",
 			}).Error
 		return
 	}
@@ -5795,10 +5795,10 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
 			Updates(map[string]any{
-				"state":             StateVerifying,
-				"retry_at":          &next,
-				"verify_count":      row.VerifyCount,
-				"last_error":        msg,
+				"state":        StateVerifying,
+				"retry_at":     &next,
+				"verify_count": row.VerifyCount,
+				"last_error":   msg,
 			}).Error
 		return
 	}
@@ -5811,10 +5811,10 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
 				Updates(map[string]any{
-					"state":             StateVerifying,
-					"retry_at":          &next,
-					"verify_count":      max(0, attempts-1),
-					"last_error":        "115 multipart upload remains divergent after one repair upload; preserving durable spool and continuing low-frequency verification without another automatic reupload",
+					"state":        StateVerifying,
+					"retry_at":     &next,
+					"verify_count": max(0, attempts-1),
+					"last_error":   "115 multipart upload remains divergent after one repair upload; preserving durable spool and continuing low-frequency verification without another automatic reupload",
 				}).Error
 			return
 		}
@@ -5822,11 +5822,11 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
 			Updates(map[string]any{
-				"state":             StateQueued,
-				"retry_at":          &next,
-				"retry_count":       row.RetryCount + 1,
-				"verify_count":      0,
-				"last_error":        "fresh provider evidence stayed divergent through the verification window",
+				"state":        StateQueued,
+				"retry_at":     &next,
+				"retry_count":  row.RetryCount + 1,
+				"verify_count": 0,
+				"last_error":   "fresh provider evidence stayed divergent through the verification window",
 			}).Error
 		return
 	}
@@ -5848,10 +5848,10 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
 		Updates(map[string]any{
-			"state":             StateVerifying,
-			"retry_at":          &next,
-			"verify_count":      nextCount,
-			"last_error":        msg,
+			"state":        StateVerifying,
+			"retry_at":     &next,
+			"verify_count": nextCount,
+			"last_error":   msg,
 		}).Error
 }
 
@@ -6051,10 +6051,10 @@ func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 			res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 				Where("id = ? AND generation = ? AND state = ?", current.ID, current.Generation, StateCompleted).
 				Updates(map[string]any{
-					"state":             StateQueued,
-					"retry_at":          &now,
-					"completed_at":      nil,
-					"last_error":        "re-queued because an older delete overlapped this generation",
+					"state":        StateQueued,
+					"retry_at":     &now,
+					"completed_at": nil,
+					"last_error":   "re-queued because an older delete overlapped this generation",
 				})
 			if res.Error == nil && res.RowsAffected > 0 {
 				wake()
