@@ -34,17 +34,17 @@ const (
 	StateUploading = "uploading"
 	StateVerifying = "verifying"
 	StateCompleted = "completed"
-	StateFailed    = "failed"
 	StateDeleted   = "deleted"
 	StateLockNull  = "lock_null"
 
-	CanonicalStateReceiving = "receiving"
 	CanonicalStateAcked     = "durable_acked"
 	canonicalStateLegacyAck = "acked"
 	CanonicalStateDeleted   = "deleted"
 	CanonicalStateLockNull  = "lock_null"
 
-	ReceiveStateInterrupted = "interrupted"
+	// Read only for upgrade compatibility. Runtime failures remain queued and
+	// are represented by retry_count, retry_at and last_error.
+	legacyStateFailed = "failed"
 
 	receiveLeaseDuration  = 15 * time.Minute
 	receiveHeartbeatEvery = time.Minute
@@ -160,29 +160,6 @@ func clearRemoteVerification(row *model.WebDAVWritebackObject) {
 	row.RemoteSHA1 = ""
 	row.RemoteGeneration = 0
 	row.RemoteVerifiedAt = nil
-}
-
-func remoteSyncState(row *model.WebDAVWritebackObject) string {
-	if row == nil {
-		return ""
-	}
-	if row.RemoteSyncState != "" {
-		return row.RemoteSyncState
-	}
-	switch row.State {
-	case StateQueued, StateUploading, StateVerifying, StateFailed, StateCompleted:
-		return row.State
-	default:
-		return ""
-	}
-}
-
-func markRemoteSyncState(row *model.WebDAVWritebackObject, state string) {
-	if row == nil {
-		return
-	}
-	row.RemoteSyncState = state
-	row.State = state
 }
 
 func canonicalContentSHA1(row *model.WebDAVWritebackObject) string {
@@ -2126,7 +2103,7 @@ func receiveReservationProgressBytes(expected, received int64) uint64 {
 
 func pendingBacklogState(state string) bool {
 	switch state {
-	case StateQueued, StateFailed, StateUploading, StateVerifying:
+	case StateQueued, legacyStateFailed, StateUploading, StateVerifying:
 		return true
 	default:
 		return false
@@ -2139,7 +2116,7 @@ func pendingSpoolBacklogBytes(tx *gorm.DB, excludePath string) (uint64, error) {
 	}
 	if err := tx.Model(&model.WebDAVWritebackObject{}).
 		Select("COALESCE(SUM(size), 0) AS bytes").
-		Where("state IN ?", []string{StateQueued, StateFailed, StateUploading, StateVerifying}).
+		Where("state IN ?", []string{StateQueued, legacyStateFailed, StateUploading, StateVerifying}).
 		Scan(&result).Error; err != nil {
 		return 0, err
 	}
@@ -2524,8 +2501,6 @@ func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64
 		fence.LatestExpectedSize = expected
 		fence.LatestStartedAt = &now
 		fence.ReceiveLeaseUntil = &leaseUntil
-		fence.ReceiveState = CanonicalStateReceiving
-		fence.ReceiveUpdatedAt = &now
 		sequence = fence.NextSequence
 		if err := tx.Model(&model.WebDAVWritebackReceiveFence{}).
 			Where("id = ?", fence.ID).
@@ -2536,8 +2511,6 @@ func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64
 				"latest_expected_size": expected,
 				"latest_started_at":    &now,
 				"receive_lease_until":  &leaseUntil,
-				"receive_state":        CanonicalStateReceiving,
-				"receive_updated_at":   &now,
 			}).Error; err != nil {
 			return err
 		}
@@ -2567,8 +2540,6 @@ func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64, ex
 			Where("path_key = ? AND active_receivers > 0", pathKey(p)).
 			Updates(map[string]any{
 				"receive_lease_until": &leaseUntil,
-				"receive_state":       CanonicalStateReceiving,
-				"receive_updated_at":  &now,
 			}).Error; err != nil {
 			return err
 		}
@@ -2640,8 +2611,6 @@ func endReceiveSequence(ctx context.Context, p string, sequence uint64) {
 				Updates(map[string]any{
 					"active_receivers":    0,
 					"receive_lease_until": nil,
-					"receive_state":       "",
-					"receive_updated_at":  gorm.Expr("CURRENT_TIMESTAMP"),
 				}).Error
 		}
 		return tx.Model(&model.WebDAVWritebackReceiveFence{}).
@@ -2678,8 +2647,6 @@ func durableReceiving(p string, now time.Time) (bool, error) {
 		Updates(map[string]any{
 			"active_receivers":    0,
 			"receive_lease_until": nil,
-			"receive_state":       ReceiveStateInterrupted,
-			"receive_updated_at":  &now,
 		}).Error
 	return false, nil
 }
@@ -3035,9 +3002,6 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 				duplicate = true
 				applyDuplicatePutMetadata(&row, modTime, createTime, mime, modTimeProvided, createTimeProvided)
 				markCanonicalAcked(&row, time.Now())
-				if row.RemoteSyncState == "" {
-					row.RemoteSyncState = StateCompleted
-				}
 				if err := tx.Model(&model.WebDAVWritebackObject{}).
 					Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateCompleted).
 					Updates(map[string]any{
@@ -3046,8 +3010,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 						"mime_type":         row.MimeType,
 						"canonical_state":   row.CanonicalState,
 						"ack_time":          row.AckTime,
-						"durable_at":        row.DurableAt,
-						"remote_sync_state": row.RemoteSyncState,
+						"durable_at":      row.DurableAt,
 					}).Error; err != nil {
 					return err
 				}
@@ -3076,7 +3039,6 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		row.ETag = canonicalETag(key, row.Generation, actualSize)
 		markCanonicalAcked(&row, time.Now())
 		row.State = StateQueued
-		row.RemoteSyncState = StateQueued
 		row.SpoolPath = finalName
 		row.PayloadSHA1 = payloadSHA1
 		row.MimeType = mime
@@ -3173,7 +3135,6 @@ func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*m
 		row.ETag = canonicalETag(key, row.Generation, 0)
 		markCanonicalAcked(&row, now)
 		row.State = StateQueued
-		row.RemoteSyncState = StateQueued
 		row.SpoolPath = ""
 		row.PayloadSHA1 = ""
 		row.MimeType = ""
@@ -3514,7 +3475,6 @@ func movePendingDirectory(src, dst string, overwrite bool) (handled bool, overwr
 			destinationRow.ETag = canonicalETag(destinationRow.PathKey, destinationRow.Generation, sourceRow.Size)
 			markCanonicalAcked(&destinationRow, now)
 			destinationRow.State = StateQueued
-			destinationRow.RemoteSyncState = StateQueued
 			if sourceRow.IsDir {
 				destinationRow.SpoolPath = ""
 			} else {
@@ -3777,7 +3737,6 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		dstRow.ETag = canonicalETag(dstKey, dstRow.Generation, lockedSrc.Size)
 		markCanonicalAcked(&dstRow, now)
 		dstRow.State = StateQueued
-		dstRow.RemoteSyncState = StateQueued
 		dstRow.SpoolPath = lockedSrc.SpoolPath
 		dstRow.PayloadSHA1 = lockedSrc.PayloadSHA1
 		dstRow.MimeType = lockedSrc.MimeType
@@ -3890,7 +3849,6 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 		dstRow.ETag = canonicalETag(dstKey, dstRow.Generation, lockedSrc.Size)
 		markCanonicalAcked(&dstRow, time.Now())
 		dstRow.State = StateQueued
-		dstRow.RemoteSyncState = StateQueued
 		dstRow.SpoolPath = lockedSrc.SpoolPath
 		dstRow.PayloadSHA1 = lockedSrc.PayloadSHA1
 		dstRow.MimeType = lockedSrc.MimeType
@@ -3936,7 +3894,6 @@ func refreshUnknownProviderOverwrite(row *model.WebDAVWritebackObject, now time.
 	row.ETag = canonicalETag(pathKey(row.Path), row.Generation, row.Size)
 	markCanonicalAcked(row, now)
 	row.State = StateCompleted
-	row.RemoteSyncState = StateCompleted
 	row.SpoolPath = ""
 	row.CleanupPath = ""
 	row.LastError = ""
@@ -3966,7 +3923,6 @@ func setProviderCompletedRoot(row *model.WebDAVWritebackObject, dst string, sour
 	row.ETag = canonicalETag(row.PathKey, row.Generation, row.Size)
 	markCanonicalAcked(row, now)
 	row.State = StateCompleted
-	row.RemoteSyncState = StateCompleted
 	row.SpoolPath = ""
 	row.PayloadSHA1 = source.GetHash().GetHash(utils.SHA1)
 	if row.IsDir {
@@ -4026,12 +3982,10 @@ func setMovedDestinationFromSource(row, source *model.WebDAVWritebackObject, dst
 		row.CompletedAt = nil
 	case source.State == StateCompleted && source.SpoolPath == "":
 		row.State = StateCompleted
-		row.RemoteSyncState = StateCompleted
 		row.RetryAt = nil
 		row.CompletedAt = &now
 	default:
 		row.State = StateQueued
-		row.RemoteSyncState = StateQueued
 		row.RetryAt = &now
 		row.CompletedAt = nil
 	}
@@ -4241,12 +4195,10 @@ func CopyTreeMetadata(src, dst string, sourceRoot model.Obj) error {
 				destinationRow.CompletedAt = nil
 			case sourceRow.State == StateCompleted:
 				destinationRow.State = StateCompleted
-				destinationRow.RemoteSyncState = StateCompleted
 				destinationRow.RetryAt = nil
 				destinationRow.CompletedAt = &now
 			default:
 				destinationRow.State = StateQueued
-				destinationRow.RemoteSyncState = StateQueued
 				destinationRow.RetryAt = &now
 				destinationRow.CompletedAt = nil
 			}
@@ -4838,13 +4790,13 @@ func providerProbeWorkerLimit(workers, configured int) int {
 func providerUploadCandidate(row *model.WebDAVWritebackObject) bool {
 	return row != nil &&
 		!row.IsDir &&
-		(row.State == StateQueued || row.State == StateFailed)
+		row.State == StateQueued
 }
 
 func multipartProviderUploadCandidate(row *model.WebDAVWritebackObject) bool {
 	return row != nil &&
 		!row.IsDir &&
-		(row.State == StateQueued || row.State == StateFailed) &&
+		row.State == StateQueued &&
 		row.Size > open115MultipartChunkSize
 }
 
@@ -5024,9 +4976,11 @@ func (m *workerManager) recoverInterrupted() error {
 		return err
 	}
 	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("remote_sync_state = '' OR remote_sync_state IS NULL").
-		Where("state IN ?", []string{StateQueued, StateUploading, StateVerifying, StateFailed, StateCompleted}).
-		Update("remote_sync_state", gorm.Expr("state")).Error; err != nil {
+		Where("state = ?", legacyStateFailed).
+		Updates(map[string]any{
+			"state":    StateQueued,
+			"retry_at": gorm.Expr("COALESCE(retry_at, CURRENT_TIMESTAMP)"),
+		}).Error; err != nil {
 		return err
 	}
 	if err := db.GetDb().Model(&model.WebDAVWritebackReceiveFence{}).
@@ -5034,8 +4988,6 @@ func (m *workerManager) recoverInterrupted() error {
 		Updates(map[string]any{
 			"active_receivers":    0,
 			"receive_lease_until": nil,
-			"receive_state":       ReceiveStateInterrupted,
-			"receive_updated_at":  gorm.Expr("CURRENT_TIMESTAMP"),
 		}).Error; err != nil {
 		return err
 	}
@@ -5079,7 +5031,6 @@ func (m *workerManager) recoverInterrupted() error {
 			Where("state = ? AND is_dir = ?", StateUploading, true).
 			Updates(map[string]any{
 				"state":             StateQueued,
-				"remote_sync_state": StateQueued,
 				"retry_at":          &now,
 				"verify_count":      0,
 				"last_error":        "re-queued interrupted directory creation",
@@ -5090,7 +5041,6 @@ func (m *workerManager) recoverInterrupted() error {
 			Where("state = ? AND is_dir = ?", StateUploading, false).
 			Updates(map[string]any{
 				"state":             StateVerifying,
-				"remote_sync_state": StateVerifying,
 				"retry_at":          &now,
 				"verify_count":      0,
 				"last_error":        "resuming remote verification after interrupted upload",
@@ -5227,7 +5177,7 @@ func loadDispatchRows(now time.Time, workers, budget int, excludedIDs []uint) ([
 		return rows, nil
 	}
 
-	directories, err := loadClass([]string{StateQueued, StateFailed}, &isDir)
+	directories, err := loadClass([]string{StateQueued}, &isDir)
 	if err != nil {
 		return nil, err
 	}
@@ -5240,7 +5190,7 @@ func loadDispatchRows(now time.Time, workers, budget int, excludedIDs []uint) ([
 	// 3-small:1-large fairness pass can still see multipart candidates, but
 	// never enqueue more work than the job channel can accept.
 	fileScanLimit := max(remaining, remaining*(dispatchSmallBurst+1))
-	files, err := loadDispatchClass(now, []string{StateQueued, StateFailed}, &isFile, excludedIDs, fileScanLimit)
+	files, err := loadDispatchClass(now, []string{StateQueued}, &isFile, excludedIDs, fileScanLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -5332,7 +5282,7 @@ func (m *workerManager) process(id uint) {
 		m.processDelete(&row)
 	case StateVerifying:
 		m.processVerify(&row)
-	case StateQueued, StateFailed:
+	case StateQueued:
 		if row.IsDir {
 			m.processMkdir(&row)
 		} else {
@@ -5356,7 +5306,7 @@ func (m *workerManager) waitForCanonicalParent(row *model.WebDAVWritebackObject)
 	if canonicalParentBlocksChild(parent) {
 		next := time.Now().Add(2 * time.Second)
 		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-			Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
+			Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued}).
 			Updates(map[string]any{
 				"retry_at":   &next,
 				"last_error": "waiting because canonical parent is deleted or is not a directory",
@@ -5368,7 +5318,7 @@ func (m *workerManager) waitForCanonicalParent(row *model.WebDAVWritebackObject)
 	}
 	next := time.Now().Add(time.Second)
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
+		Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued}).
 		Update("retry_at", &next)
 	return true, res.Error
 }
@@ -5410,14 +5360,14 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	if receiveErr != nil {
 		next := time.Now().Add(2 * time.Second)
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-			Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
+			Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued}).
 			Updates(map[string]any{"retry_at": &next, "last_error": "waiting for durable receive lease"}).Error
 		return
 	}
 	if receiving {
 		next := time.Now().Add(time.Duration(ReceiveRetrySeconds()) * time.Second)
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-			Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
+			Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued}).
 			Update("retry_at", &next).Error
 		return
 	}
@@ -5426,7 +5376,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		remote, verifyErr := m.remoteForVerify(row)
 		verification := classifyRemoteVerification(row, remote, verifyErr, requireHash)
 		if verification == remoteVerificationMatch {
-			m.completeRemoteVerification(row, remote, []string{StateQueued, StateFailed})
+			m.completeRemoteVerification(row, remote, []string{StateQueued})
 			return
 		}
 		if providerRepairNeedsVerification(verification) {
@@ -5439,10 +5389,9 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 				msg = "provider retry probe sees matching size but required 115 SHA-1 is unavailable; entering verification without reupload"
 			}
 			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-				Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
+				Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued}).
 				Updates(map[string]any{
 					"state":             StateVerifying,
-					"remote_sync_state": StateVerifying,
 					"retry_at":          &next,
 					"verify_count":      0,
 					"last_error":        msg,
@@ -5466,8 +5415,8 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}()
 
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued, StateFailed}).
-		Updates(map[string]any{"state": StateUploading, "remote_sync_state": StateUploading, "retry_at": nil, "last_error": ""})
+		Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued}).
+		Updates(map[string]any{"state": StateUploading, "retry_at": nil, "last_error": ""})
 	if res.Error != nil || res.RowsAffected == 0 {
 		return
 	}
@@ -5511,7 +5460,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	now := time.Now()
 	res = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
-		Updates(map[string]any{"state": StateVerifying, "remote_sync_state": StateVerifying, "retry_at": &now, "verify_count": 0})
+		Updates(map[string]any{"state": StateVerifying, "retry_at": &now, "verify_count": 0})
 	if res.Error != nil {
 		// The provider PUT has already returned success. If MySQL briefly fails
 		// here, do not strand the row forever in UPLOADING. A best-effort
@@ -5522,7 +5471,6 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
 			Updates(map[string]any{
 				"state":             StateVerifying,
-				"remote_sync_state": StateVerifying,
 				"retry_at":          &next,
 				"verify_count":      0,
 				"last_error":        fmt.Sprintf("provider upload succeeded but verification state persistence failed: %v", res.Error),
@@ -5544,8 +5492,8 @@ func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
 		return
 	}
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("id = ? AND generation = ? AND is_dir = ? AND state IN ?", row.ID, row.Generation, true, []string{StateQueued, StateFailed}).
-		Updates(map[string]any{"state": StateUploading, "remote_sync_state": StateUploading, "retry_at": nil, "last_error": ""})
+		Where("id = ? AND generation = ? AND is_dir = ? AND state IN ?", row.ID, row.Generation, true, []string{StateQueued}).
+		Updates(map[string]any{"state": StateUploading, "retry_at": nil, "last_error": ""})
 	if res.Error != nil || res.RowsAffected == 0 {
 		return
 	}
@@ -5564,7 +5512,6 @@ func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
 		Where("id = ? AND generation = ? AND is_dir = ?", row.ID, row.Generation, true).
 		Updates(map[string]any{
 			"state":             StateCompleted,
-			"remote_sync_state": StateCompleted,
 			"completed_at":      &now,
 			"retry_at":          nil,
 			"last_error":        "",
@@ -5792,7 +5739,6 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 		Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, allowedStates).
 		Updates(map[string]any{
 			"state":              StateCompleted,
-			"remote_sync_state":  StateCompleted,
 			"completed_at":       &now,
 			"retry_at":           nil,
 			"last_error":         "",
@@ -5822,7 +5768,6 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
 			Updates(map[string]any{
 				"state":             StateQueued,
-				"remote_sync_state": StateQueued,
 				"retry_at":          &now,
 				"verify_count":      0,
 				"last_error":        "directory verification state repaired to queued",
@@ -5851,7 +5796,6 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
 			Updates(map[string]any{
 				"state":             StateVerifying,
-				"remote_sync_state": StateVerifying,
 				"retry_at":          &next,
 				"verify_count":      row.VerifyCount,
 				"last_error":        msg,
@@ -5868,7 +5812,6 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
 				Updates(map[string]any{
 					"state":             StateVerifying,
-					"remote_sync_state": StateVerifying,
 					"retry_at":          &next,
 					"verify_count":      max(0, attempts-1),
 					"last_error":        "115 multipart upload remains divergent after one repair upload; preserving durable spool and continuing low-frequency verification without another automatic reupload",
@@ -5880,7 +5823,6 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
 			Updates(map[string]any{
 				"state":             StateQueued,
-				"remote_sync_state": StateQueued,
 				"retry_at":          &next,
 				"retry_count":       row.RetryCount + 1,
 				"verify_count":      0,
@@ -5907,7 +5849,6 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
 		Updates(map[string]any{
 			"state":             StateVerifying,
-			"remote_sync_state": StateVerifying,
 			"retry_at":          &next,
 			"verify_count":      nextCount,
 			"last_error":        msg,
@@ -6111,7 +6052,6 @@ func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
 				Where("id = ? AND generation = ? AND state = ?", current.ID, current.Generation, StateCompleted).
 				Updates(map[string]any{
 					"state":             StateQueued,
-					"remote_sync_state": StateQueued,
 					"retry_at":          &now,
 					"completed_at":      nil,
 					"last_error":        "re-queued because an older delete overlapped this generation",
@@ -6188,11 +6128,10 @@ func (m *workerManager) failAfter(row *model.WebDAVWritebackObject, err error, d
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ?", row.ID, row.Generation).
 		Updates(map[string]any{
-			"state":             StateFailed,
-			"remote_sync_state": StateFailed,
-			"retry_at":          &next,
-			"retry_count":       row.RetryCount + 1,
-			"last_error":        err.Error(),
+			"state":       StateQueued,
+			"retry_at":    &next,
+			"retry_count": row.RetryCount + 1,
+			"last_error":  err.Error(),
 		}).Error
 }
 

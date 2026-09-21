@@ -312,3 +312,14 @@ This fork also hardens the 115 Open driver under the write-back workload:
 ### Branch validation policy
 
 The focused WebDAV write-back workflow is intentionally not triggered by ordinary pushes to `feature/cloudsync-writeback`. During compatibility work, related changes can accumulate without repeatedly canceling/rerunning the same CI. Validation remains available through `workflow_dispatch`, and pull requests targeting `main` still run the focused write-back suite automatically.
+
+
+## State-machine simplification
+
+Provider replication now uses one persisted lifecycle column, `state`, with four active values: `queued`, `uploading`, `verifying`, and `completed`. Provider errors return the generation to `queued`; retry intent is carried by `retry_count`, `retry_at`, and `last_error` instead of a separate `failed` state. Startup recovery migrates historical `failed` rows to `queued` without losing their retry metadata.
+
+The former `remote_sync_state` model field duplicated `state` and is no longer read or written. Existing MySQL columns are intentionally left in place rather than automatically dropped, avoiding an upgrade-time table rebuild or metadata lock.
+
+Receive ownership is derived from `active_receivers` plus the crash-expiring `receive_lease_until`. The redundant `receive_state` and `receive_updated_at` model fields are no longer used; normal `updated_at` remains available for diagnostics. This reduces transition and heartbeat write amplification.
+
+Client-visible canonical state remains compact and independent: `durable_acked`, `deleted`, and `lock_null`. The historical `acked` value is accepted only for upgrade compatibility.

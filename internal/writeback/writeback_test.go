@@ -208,9 +208,10 @@ func TestProviderUploadCandidate(t *testing.T) {
 	if !providerUploadCandidate(row) {
 		t.Fatal("queued file should consume a provider-upload slot")
 	}
-	row.State = StateFailed
+	row.State = StateQueued
+	row.RetryCount = 2
 	if !providerUploadCandidate(row) {
-		t.Fatal("failed file retry should consume a provider-upload slot")
+		t.Fatal("queued retry should consume a provider-upload slot")
 	}
 	row.State = StateVerifying
 	if providerUploadCandidate(row) {
@@ -260,9 +261,10 @@ func TestLargeProviderUploadCandidate(t *testing.T) {
 		t.Fatalf("verification unexpectedly resolved provider hash capability %d times", calls)
 	}
 
-	large.State = StateFailed
+	large.State = StateQueued
+	large.RetryCount = 2
 	if largeProviderUploadCandidate(large, func(string) bool { return false }) {
-		t.Fatal("large upload on a provider without required payload hash should not be throttled")
+		t.Fatal("large retry on a provider without required payload hash should not be throttled")
 	}
 }
 
@@ -1082,7 +1084,7 @@ func TestMarkCanonicalAckedStampsCurrentTakeover(t *testing.T) {
 }
 
 func TestCanonicalStateSeparatesClientAckFromReplication(t *testing.T) {
-	for _, state := range []string{StateQueued, StateUploading, StateVerifying, StateCompleted, StateFailed} {
+	for _, state := range []string{StateQueued, StateUploading, StateVerifying, StateCompleted, legacyStateFailed} {
 		row := &model.WebDAVWritebackObject{State: state}
 		if !canonicalAcked(row) {
 			t.Fatalf("legacy replication state %q must remain client-visible as ACKed", state)
@@ -1091,33 +1093,31 @@ func TestCanonicalStateSeparatesClientAckFromReplication(t *testing.T) {
 	if canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: CanonicalStateDeleted, State: StateCompleted}) {
 		t.Fatal("explicit canonical tombstone must win over a completed remote replication state")
 	}
-	if !canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: CanonicalStateAcked, State: StateFailed}) {
+	if !canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: CanonicalStateAcked, State: legacyStateFailed}) {
 		t.Fatal("remote replication failure must not revoke the client ACK")
 	}
-	if !canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: canonicalStateLegacyAck, State: StateFailed}) {
+	if !canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: canonicalStateLegacyAck, State: legacyStateFailed}) {
 		t.Fatal("legacy acked rows must migrate logically to DURABLE_ACKED")
 	}
 }
 
-func TestRemoteSyncStateSchemaSeparatesReplicaLifecycle(t *testing.T) {
+func TestReplicaLifecycleUsesSingleStateColumn(t *testing.T) {
 	typ := reflect.TypeOf(model.WebDAVWritebackObject{})
-	remote, ok := typ.FieldByName("RemoteSyncState")
-	if !ok || !strings.Contains(remote.Tag.Get("gorm"), "index") {
-		t.Fatal("remote_sync_state must be persisted and indexed independently from canonical_state")
+	if _, ok := typ.FieldByName("RemoteSyncState"); ok {
+		t.Fatal("provider lifecycle must not be duplicated in RemoteSyncState")
 	}
 	ack, ok := typ.FieldByName("AckTime")
 	if !ok || ack.Type != reflect.TypeOf((*time.Time)(nil)) {
 		t.Fatal("ack_time must persist the Durable ACK commit timestamp")
 	}
 
-	row := &model.WebDAVWritebackObject{State: StateUploading}
-	if got := remoteSyncState(row); got != StateUploading {
-		t.Fatalf("legacy remote state = %q, want %q", got, StateUploading)
+	row := &model.WebDAVWritebackObject{
+		CanonicalState: CanonicalStateAcked,
+		State:          StateQueued,
+		RetryCount:     2,
 	}
-	row.CanonicalState = CanonicalStateAcked
-	row.RemoteSyncState = StateFailed
-	if !canonicalAcked(row) || remoteSyncState(row) != StateFailed {
-		t.Fatal("remote failure must remain independent from the client Durable ACK")
+	if !canonicalAcked(row) || row.State != StateQueued {
+		t.Fatal("queued retry metadata must remain independent from the client Durable ACK")
 	}
 }
 
@@ -1163,8 +1163,11 @@ func TestReceiveFenceSchemaKeepsPathOrderingDurable(t *testing.T) {
 	if _, ok := typ.FieldByName("ReceiveLeaseUntil"); !ok {
 		t.Fatal("receive fence must persist a crash-expiring receive lease")
 	}
-	if _, ok := typ.FieldByName("ReceiveState"); !ok {
-		t.Fatal("receive fence must persist the RECEIVING lifecycle across restart")
+	if _, ok := typ.FieldByName("ReceiveState"); ok {
+		t.Fatal("receive lifecycle must be derived from active receivers and lease")
+	}
+	if _, ok := typ.FieldByName("ReceiveUpdatedAt"); ok {
+		t.Fatal("receive fence must use UpdatedAt instead of a duplicate receive timestamp")
 	}
 }
 
@@ -1370,7 +1373,7 @@ func TestPendingDirectoryMoveLocalAuthority(t *testing.T) {
 }
 
 func TestPendingBacklogState(t *testing.T) {
-	for _, state := range []string{StateQueued, StateFailed, StateUploading, StateVerifying} {
+	for _, state := range []string{StateQueued, legacyStateFailed, StateUploading, StateVerifying} {
 		if !pendingBacklogState(state) {
 			t.Fatalf("state %q must contribute to pending backlog", state)
 		}
@@ -1879,7 +1882,7 @@ func TestProviderOverwriteQuiescent(t *testing.T) {
 	}) {
 		t.Fatal("all-completed destination tree should be safe for provider overwrite")
 	}
-	for _, state := range []string{StateQueued, StateUploading, StateVerifying, StateFailed, StateDeleted} {
+	for _, state := range []string{StateQueued, StateUploading, StateVerifying, legacyStateFailed, StateDeleted} {
 		rows := []model.WebDAVWritebackObject{{State: StateCompleted}, {State: state}}
 		if providerOverwriteQuiescent(rows) {
 			t.Fatalf("destination state %q must block provider fallback overwrite", state)
