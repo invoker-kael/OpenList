@@ -7,6 +7,7 @@ on:
       - "internal/writeback/**"
       - "internal/model/webdav_writeback.go"
       - "internal/db/db.go"
+      - "internal/conf/**"
       - "server/webdav/**"
   pull_request:
     branches: ["main"]
@@ -48,6 +49,7 @@ jobs:
           files=(
             internal/model/webdav_writeback.go
             internal/db/db.go
+            internal/conf/config.go
             internal/writeback/writeback.go
             internal/writeback/writeback_test.go
             server/webdav/file.go

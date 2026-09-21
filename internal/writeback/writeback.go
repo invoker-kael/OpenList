@@ -4377,14 +4377,55 @@ func spoolIsActive(spoolPath string) bool {
 	return activeSpoolRef[spoolPath] > 0
 }
 
+type workerJob struct {
+	id          uint
+	largeUpload bool
+}
+
 type workerManager struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	stop     chan struct{}
-	wake     chan struct{}
-	jobs     chan uint
-	inflight sync.Map
-	wg       sync.WaitGroup
+	ctx          context.Context
+	cancel       context.CancelFunc
+	stop         chan struct{}
+	wake         chan struct{}
+	jobs         chan workerJob
+	largeUploads chan struct{}
+	inflight     sync.Map
+	wg           sync.WaitGroup
+}
+
+func largeUploadWorkerLimit(workers, configured int) int {
+	workers = max(1, workers)
+	if configured <= 0 || configured >= workers {
+		return workers
+	}
+	return max(1, configured)
+}
+
+func largeProviderUploadCandidate(row *model.WebDAVWritebackObject, requireHash bool) bool {
+	return row != nil &&
+		requireHash &&
+		!row.IsDir &&
+		(row.State == StateQueued || row.State == StateFailed) &&
+		row.Size > open115MultipartChunkSize
+}
+
+func tryReserveLargeUploadSlot(slots chan struct{}) (reserved bool, allowed bool) {
+	if slots == nil {
+		return false, true
+	}
+	select {
+	case slots <- struct{}{}:
+		return true, true
+	default:
+		return false, false
+	}
+}
+
+func releaseLargeUploadSlot(slots chan struct{}, reserved bool) {
+	if slots == nil || !reserved {
+		return
+	}
+	<-slots
 }
 
 func wake() {
@@ -4410,12 +4451,19 @@ func Start() {
 		return
 	}
 	workerCtx, cancel := context.WithCancel(context.Background())
+	workers := max(1, conf.Conf.WebDAVWriteback.Workers)
+	largeUploadWorkers := largeUploadWorkerLimit(workers, conf.Conf.WebDAVWriteback.LargeUploadWorkers)
+	var largeUploads chan struct{}
+	if largeUploadWorkers < workers {
+		largeUploads = make(chan struct{}, largeUploadWorkers)
+	}
 	m := &workerManager{
-		ctx:    workerCtx,
-		cancel: cancel,
-		stop:   make(chan struct{}),
-		wake:   make(chan struct{}, 1),
-		jobs:   make(chan uint, max(4, conf.Conf.WebDAVWriteback.Workers*4)),
+		ctx:          workerCtx,
+		cancel:       cancel,
+		stop:         make(chan struct{}),
+		wake:         make(chan struct{}, 1),
+		jobs:         make(chan workerJob, max(4, workers*4)),
+		largeUploads: largeUploads,
 	}
 	manager = m
 	managerMu.Unlock()
@@ -4433,7 +4481,6 @@ func Start() {
 		}
 		m.maintainProviderOperations()
 		m.cleanupOrphans()
-		workers := max(1, conf.Conf.WebDAVWriteback.Workers)
 		for i := 0; i < workers; i++ {
 			m.wg.Add(1)
 			go m.worker()
@@ -4575,9 +4622,14 @@ func (m *workerManager) dispatch() {
 	}
 	var rows []model.WebDAVWritebackObject
 	err := db.GetDb().
-		Select("id").
+		Select("id", "path", "size", "is_dir", "state").
 		Where("state IN ? AND (retry_at IS NULL OR retry_at <= ?)", []string{StateQueued, StateFailed, StateVerifying, StateDeleted}, now).
-		Order("is_dir desc, updated_at asc").
+		Order("is_dir desc").
+		Order(clause.Expr{
+			SQL:  "CASE WHEN state IN (?, ?) AND size > ? THEN 1 ELSE 0 END ASC",
+			Vars: []any{StateQueued, StateFailed, open115MultipartChunkSize},
+		}).
+		Order("updated_at asc").
 		Limit(max(8, conf.Conf.WebDAVWriteback.Workers*4)).
 		Find(&rows).Error
 	if err != nil {
@@ -4585,13 +4637,26 @@ func (m *workerManager) dispatch() {
 		return
 	}
 	for i := range rows {
-		id := rows[i].ID
+		row := &rows[i]
+		id := row.ID
 		if _, loaded := m.inflight.LoadOrStore(id, struct{}{}); loaded {
 			continue
 		}
+
+		job := workerJob{id: id}
+		if largeProviderUploadCandidate(row, providerRequiresPayloadHash(row.Path)) {
+			reserved, allowed := tryReserveLargeUploadSlot(m.largeUploads)
+			if !allowed {
+				m.inflight.Delete(id)
+				continue
+			}
+			job.largeUpload = reserved
+		}
+
 		select {
-		case m.jobs <- id:
+		case m.jobs <- job:
 		default:
+			releaseLargeUploadSlot(m.largeUploads, job.largeUpload)
 			m.inflight.Delete(id)
 			return
 		}
@@ -4604,9 +4669,14 @@ func (m *workerManager) worker() {
 		select {
 		case <-m.stop:
 			return
-		case id := <-m.jobs:
-			m.process(id)
-			m.inflight.Delete(id)
+		case job := <-m.jobs:
+			m.process(job.id)
+			releaseLargeUploadSlot(m.largeUploads, job.largeUpload)
+			m.inflight.Delete(job.id)
+			select {
+			case m.wake <- struct{}{}:
+			default:
+			}
 		}
 	}
 }

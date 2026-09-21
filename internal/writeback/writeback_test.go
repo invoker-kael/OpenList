@@ -15,6 +15,68 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
+func TestLargeUploadWorkerLimit(t *testing.T) {
+	for _, tc := range []struct {
+		workers    int
+		configured int
+		want       int
+	}{
+		{workers: 4, configured: 2, want: 2},
+		{workers: 4, configured: 0, want: 4},
+		{workers: 4, configured: 8, want: 4},
+		{workers: 1, configured: 2, want: 1},
+	} {
+		if got := largeUploadWorkerLimit(tc.workers, tc.configured); got != tc.want {
+			t.Fatalf("largeUploadWorkerLimit(%d, %d)=%d, want %d", tc.workers, tc.configured, got, tc.want)
+		}
+	}
+}
+
+func TestLargeProviderUploadCandidate(t *testing.T) {
+	large := &model.WebDAVWritebackObject{
+		State: StateQueued,
+		Size:  open115MultipartChunkSize + 1,
+	}
+	if !largeProviderUploadCandidate(large, true) {
+		t.Fatal("large queued 115 upload should consume a large-upload slot")
+	}
+	if largeProviderUploadCandidate(large, false) {
+		t.Fatal("large upload on a provider without required payload hash should not be throttled")
+	}
+	large.State = StateVerifying
+	if largeProviderUploadCandidate(large, true) {
+		t.Fatal("verification must not consume a large-upload transfer slot")
+	}
+	large.State = StateFailed
+	large.Size = open115MultipartChunkSize
+	if largeProviderUploadCandidate(large, true) {
+		t.Fatal("single-part-sized upload should stay on the normal worker pool")
+	}
+}
+
+func TestLargeUploadSlotReservationIsNonBlocking(t *testing.T) {
+	slots := make(chan struct{}, 1)
+	reserved, allowed := tryReserveLargeUploadSlot(slots)
+	if !reserved || !allowed {
+		t.Fatal("first large upload should reserve the available slot")
+	}
+	reserved2, allowed2 := tryReserveLargeUploadSlot(slots)
+	if reserved2 || allowed2 {
+		t.Fatal("second large upload must not block a worker when the slot is full")
+	}
+	releaseLargeUploadSlot(slots, reserved)
+	reserved3, allowed3 := tryReserveLargeUploadSlot(slots)
+	if !reserved3 || !allowed3 {
+		t.Fatal("released large-upload slot should be immediately reusable")
+	}
+	releaseLargeUploadSlot(slots, reserved3)
+
+	reserved, allowed = tryReserveLargeUploadSlot(nil)
+	if reserved || !allowed {
+		t.Fatal("nil slot pool should mean unthrottled large uploads")
+	}
+}
+
 func TestProviderOperationCopyUsesNative(t *testing.T) {
 	if !ProviderOperationCopyUsesNative("/a/album", "/b/album", -1) {
 		t.Fatal("recursive same-name cross-directory COPY should use native provider COPY")
