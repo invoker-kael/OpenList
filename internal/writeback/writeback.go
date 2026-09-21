@@ -5669,6 +5669,21 @@ func cleanupExpiredReceiveReservations(now time.Time) {
 	}
 }
 
+func dispatchWorkDue(now time.Time) (bool, error) {
+	var row model.WebDAVWritebackObject
+	err := db.GetDb().
+		Select("id").
+		Where("state IN ? AND (retry_at IS NULL OR retry_at <= ?)", []string{StateDeleted, StateVerifying, StateQueued}, now).
+		Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (m *workerManager) scheduler() {
 	ticker := time.NewTicker(2 * time.Second)
 	providerTicker := time.NewTicker(providerOperationMaintenanceEvery)
@@ -5676,16 +5691,32 @@ func (m *workerManager) scheduler() {
 	defer ticker.Stop()
 	defer providerTicker.Stop()
 	defer cleanupTicker.Stop()
+
+	idle := false
 	for {
-		m.dispatch()
+		if !idle {
+			idle = !m.dispatch()
+		}
 		select {
 		case <-m.stop:
 			return
 		case <-m.wake:
+			idle = false
 		case now := <-ticker.C:
 			cleanupExpiredLockNull(now)
+			if idle {
+				due, err := dispatchWorkDue(now)
+				if err != nil {
+					log.Errorf("write-back idle queue probe failed: %v", err)
+					idle = false
+				} else if due {
+					idle = false
+				}
+			}
 		case <-providerTicker.C:
 			m.maintainProviderOperations()
+			// Provider recovery can make canonical work runnable.
+			idle = false
 		case now := <-cleanupTicker.C:
 			cleanupExpiredReceiveReservations(now)
 			m.cleanupCompleted()
@@ -5990,16 +6021,19 @@ func loadDispatchRows(now time.Time, workers, budget int, excludedIDs map[uint]s
 	return rows, nil
 }
 
-func (m *workerManager) dispatch() {
+func (m *workerManager) dispatch() bool {
 	freeJobs := cap(m.jobs) - len(m.jobs)
 	if freeJobs <= 0 {
-		return
+		return true
 	}
 	now := time.Now()
 	rows, err := loadDispatchRows(now, max(1, conf.Conf.WebDAVWriteback.Workers), freeJobs, m.inflightIDSet())
 	if err != nil {
 		log.Errorf("write-back queue scan failed: %v", err)
-		return
+		return true
+	}
+	if len(rows) == 0 {
+		return false
 	}
 	for i := range rows {
 		row := &rows[i]
@@ -6031,9 +6065,10 @@ func (m *workerManager) dispatch() {
 			releaseWorkerSlot(m.largeUploads, job.largeUpload)
 			releaseWorkerSlot(m.uploads, job.upload)
 			m.inflight.Delete(id)
-			return
+			return true
 		}
 	}
+	return true
 }
 
 func (m *workerManager) worker() {
