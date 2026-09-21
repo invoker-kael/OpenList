@@ -2485,10 +2485,14 @@ func reserveIncomingBytes(expected int64) (*incomingReservation, error) {
 	return reservation, nil
 }
 
-func beginReceiving(p string) (*receivingSession, func()) {
+func claimReceiving(p string, exclusive bool) (*receivingSession, func(), bool) {
 	key := pathKey(p)
 	receivingMu.Lock()
 	state := receivingPaths[key]
+	if exclusive && state != nil && state.active > 0 {
+		receivingMu.Unlock()
+		return nil, nil, false
+	}
 	if state == nil {
 		state = &receivingPathState{}
 		receivingPaths[key] = state
@@ -2497,7 +2501,7 @@ func beginReceiving(p string) (*receivingSession, func()) {
 	session := &receivingSession{key: key, state: state}
 	receivingMu.Unlock()
 
-	return session, func() {
+	release := func() {
 		receivingMu.Lock()
 		if current := receivingPaths[key]; current == state {
 			state.active--
@@ -2507,6 +2511,16 @@ func beginReceiving(p string) (*receivingSession, func()) {
 		}
 		receivingMu.Unlock()
 	}
+	return session, release, true
+}
+
+func beginReceiving(p string) (*receivingSession, func()) {
+	session, release, _ := claimReceiving(p, false)
+	return session, release
+}
+
+func tryBeginReceiving(p string) (*receivingSession, func(), bool) {
+	return claimReceiving(p, true)
 }
 
 func receiveSequenceSuperseded(lastCommitted, current uint64) bool {
@@ -2544,16 +2558,11 @@ func receiveAdmissionNeedsGlobalFence(limit uint64) bool {
 	return limit > 0
 }
 
-func beginReceiveSequence(ctx context.Context, p string, expected int64) (uint64, error) {
+func beginDurableReceiveSequence(ctx context.Context, p string, expected int64) (uint64, error) {
 	p = utils.FixAndCleanPath(p)
-	// Most Cloud Sync duplicate retries hit the same OpenList instance. Reject
-	// them from the in-process receive registry before taking the singleton
-	// MySQL admission fence so one stuck large-file retry storm cannot serialize
-	// unrelated PUT admissions. The durable fence inside the transaction remains
-	// the authoritative cross-instance check.
-	if isReceiving(p) {
-		return 0, ErrReceiveInProgress
-	}
+	// The caller has already claimed the in-process receive slot atomically.
+	// This durable fence remains authoritative across OpenList instances and
+	// process restarts.
 	var sequence uint64
 	now := time.Now()
 	leaseUntil := now.Add(receiveLeaseDuration)
@@ -3015,12 +3024,20 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 	p = utils.FixAndCleanPath(p)
 	modTimeProvided := !modTime.IsZero()
 	createTimeProvided := !createTime.IsZero()
-	receiveSequence, err := beginReceiveSequence(ctx, p, expected)
+
+	// Claim the local path before any MySQL admission work. Same-instance
+	// Cloud Sync duplicate PUTs are rejected before they can contend on the
+	// durable receive/admission fences or consume the request body.
+	_, releaseReceiving, claimed := tryBeginReceiving(p)
+	if !claimed {
+		return nil, false, ErrReceiveInProgress
+	}
+	defer releaseReceiving()
+
+	receiveSequence, err := beginDurableReceiveSequence(ctx, p, expected)
 	if err != nil {
 		return nil, false, err
 	}
-	_, releaseReceiving := beginReceiving(p)
-	defer releaseReceiving()
 	receiveCtx := durableCommitContext(ctx)
 	stopLeaseHeartbeat := startReceiveLeaseHeartbeat(receiveCtx, p, receiveSequence, expected)
 	defer func() {

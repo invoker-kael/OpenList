@@ -1327,6 +1327,26 @@ func TestReceivingPathReferenceCount(t *testing.T) {
 	}
 }
 
+func TestTryBeginReceivingRejectsConcurrentSamePath(t *testing.T) {
+	p := "/encrypted/exclusive.bin"
+	_, release1, claimed := tryBeginReceiving(p)
+	if !claimed || release1 == nil {
+		t.Fatal("first receive should claim the local path")
+	}
+
+	if _, _, claimed := tryBeginReceiving(p); claimed {
+		release1()
+		t.Fatal("second concurrent receive should be rejected before durable admission")
+	}
+
+	release1()
+	_, release2, claimed := tryBeginReceiving(p)
+	if !claimed || release2 == nil {
+		t.Fatal("path should be claimable again after the active receiver releases it")
+	}
+	release2()
+}
+
 func TestOrderedMutationFenceRootsIsDeterministic(t *testing.T) {
 	got := orderedMutationFenceRoots("/z", "/a", "/z", "/m/../b")
 	want := []string{"/a", "/b", "/z"}
