@@ -1469,8 +1469,8 @@ func TestReceivingTreeActiveUsesStrictPathBoundaries(t *testing.T) {
 		t.Fatal("sibling prefix or expired lease must not block /a")
 	}
 	fences = append(fences, model.WebDAVWritebackReceiveFence{
-		Path: "/a/live/file",
-		ActiveReceivers: 1,
+		Path:              "/a/live/file",
+		ActiveReceivers:   1,
 		ReceiveLeaseUntil: &future,
 	})
 	if !receivingTreeActive(fences, "/a", now) {
