@@ -2047,6 +2047,23 @@ func TestReceiveHeartbeatAdmissionOnlyForUnknownProgress(t *testing.T) {
 	}
 }
 
+func TestReceiveProgressHeartbeatOnlyForUnknownReservedUploads(t *testing.T) {
+	for _, tc := range []struct {
+		expected int64
+		reserved bool
+		want     bool
+	}{
+		{expected: 1024, reserved: true, want: false},
+		{expected: 1024, reserved: false, want: false},
+		{expected: -1, reserved: false, want: false},
+		{expected: -1, reserved: true, want: true},
+	} {
+		if got := receiveProgressHeartbeatNeeded(tc.expected, tc.reserved); got != tc.want {
+			t.Fatalf("expected=%d reserved=%v heartbeat=%v, want %v", tc.expected, tc.reserved, got, tc.want)
+		}
+	}
+}
+
 func TestReceiveAdmissionGlobalFenceOnlyWithBacklogLimit(t *testing.T) {
 	if receiveAdmissionNeedsGlobalFence(0) {
 		t.Fatal("disabled backlog limit must not serialize unrelated PUT admissions")
@@ -2331,7 +2348,7 @@ func TestCopyToSpoolRejectsDeclaredSizeOverrunBeforeWrite(t *testing.T) {
 		spaceMu.Unlock()
 	}()
 
-	size, _, err := copyToSpool(f, strings.NewReader("four"), 3, reservation)
+	size, _, err := copyToSpool(f, strings.NewReader("four"), 3, reservation, nil)
 	if err == nil {
 		t.Fatal("declared-size overrun should fail")
 	}
@@ -2399,7 +2416,7 @@ func TestCopyToSpoolAcceptsLateCancellationAfterDeclaredLength(t *testing.T) {
 	defer reservation.release()
 
 	reader := &terminalErrorReader{payload: payload, err: context.Canceled}
-	size, sha1sum, err := copyToSpool(f, reader, int64(len(payload)), reservation)
+	size, sha1sum, err := copyToSpool(f, reader, int64(len(payload)), reservation, nil)
 	if err != nil {
 		t.Fatalf("late cancellation after the declared length should not discard a complete PUT: %v", err)
 	}
@@ -2427,7 +2444,7 @@ func TestCopyToSpoolRejectsCancellationBeforeDeclaredLength(t *testing.T) {
 	defer reservation.release()
 
 	reader := &terminalErrorReader{payload: payload, err: context.Canceled}
-	if _, _, err := copyToSpool(f, reader, expected, reservation); !errors.Is(err, context.Canceled) {
+	if _, _, err := copyToSpool(f, reader, expected, reservation, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("incomplete canceled PUT error = %v, want context.Canceled", err)
 	}
 }
@@ -2445,7 +2462,7 @@ func TestCopyToSpoolComputesPayloadSHA1(t *testing.T) {
 	reservedIncoming += uint64(len(payload))
 	spaceMu.Unlock()
 	defer reservation.release()
-	size, sha1sum, err := copyToSpool(f, strings.NewReader(payload), int64(len(payload)), reservation)
+	size, sha1sum, err := copyToSpool(f, strings.NewReader(payload), int64(len(payload)), reservation, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

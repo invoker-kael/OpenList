@@ -2720,6 +2720,10 @@ func receiveHeartbeatNeedsAdmission(expected, received int64, backlogLimited boo
 	return backlogLimited && expected < 0 && received > 0
 }
 
+func receiveProgressHeartbeatNeeded(expected int64, backlogReserved bool) bool {
+	return expected < 0 && backlogReserved
+}
+
 func refreshReceiveLease(tx *gorm.DB, key string, sequence uint64, leaseUntil time.Time, backlogReserved bool) error {
 	if err := tx.Model(&model.WebDAVWritebackReceiveFence{}).
 		Where("path_key = ? AND active_receivers > 0", key).
@@ -3032,7 +3036,7 @@ var spoolCopyBufferPool = sync.Pool{
 	},
 }
 
-func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incomingReservation, heartbeat ...func(int64)) (int64, string, error) {
+func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incomingReservation, heartbeat func(int64)) (int64, string, error) {
 	buf := spoolCopyBufferPool.Get().([]byte)
 	defer spoolCopyBufferPool.Put(buf)
 	payloadHasher := utils.SHA1.NewFunc()
@@ -3054,8 +3058,8 @@ func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incom
 			total += int64(wn)
 			sinceCheck += int64(wn)
 			reservation.consume(uint64(wn))
-			if len(heartbeat) > 0 && heartbeat[0] != nil && time.Since(lastHeartbeat) >= receiveHeartbeatEvery {
-				heartbeat[0](total)
+			if heartbeat != nil && time.Since(lastHeartbeat) >= receiveHeartbeatEvery {
+				heartbeat(total)
 				lastHeartbeat = time.Now()
 			}
 			if writeErr != nil {
@@ -3068,8 +3072,8 @@ func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incom
 				if err := reservation.verifyCapacity(); err != nil {
 					return total, "", err
 				}
-				if expected < 0 && len(heartbeat) > 0 && heartbeat[0] != nil {
-					heartbeat[0](total)
+				if expected < 0 && heartbeat != nil {
+					heartbeat(total)
 					lastHeartbeat = time.Now()
 				}
 				sinceCheck = 0
@@ -3181,9 +3185,13 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			}
 		}()
 
-		actualSize, payloadSHA1, err = copyToSpool(tmp, body, expected, reservation, func(received int64) {
-			heartbeatReceiveSequence(receiveCtx, p, receiveSequence, expected, received, backlogReserved)
-		})
+		var progressHeartbeat func(int64)
+		if receiveProgressHeartbeatNeeded(expected, backlogReserved) {
+			progressHeartbeat = func(received int64) {
+				heartbeatReceiveSequence(receiveCtx, p, receiveSequence, expected, received, backlogReserved)
+			}
+		}
+		actualSize, payloadSHA1, err = copyToSpool(tmp, body, expected, reservation, progressHeartbeat)
 		if err != nil {
 			if expected >= 0 {
 				return nil, false, fmt.Errorf("WebDAV PUT receive failed after %d/%d bytes: %w", actualSize, expected, err)
