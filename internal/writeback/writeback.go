@@ -6457,7 +6457,7 @@ func (m *workerManager) processReplicaMove(row *model.WebDAVWritebackObject) {
 	}
 
 	requireHash := providerRequiresPayloadHash(row.Path)
-	remote, verifyErr := m.remoteForVerify(row)
+	remote, verifyErr := m.remoteForVerify(row, requireHash)
 	verification := classifyRemoteVerification(row, remote, verifyErr, requireHash)
 	switch verification {
 	case remoteVerificationMatch:
@@ -6561,9 +6561,9 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		m.processReplicaMove(row)
 		return
 	}
+	requireHash := providerRequiresPayloadHash(row.Path)
 	if row.RetryCount > 0 {
-		requireHash := providerRequiresPayloadHash(row.Path)
-		remote, verifyErr := m.remoteForVerify(row)
+		remote, verifyErr := m.remoteForVerify(row, requireHash)
 		verification := classifyRemoteVerification(row, remote, verifyErr, requireHash)
 		if verification == remoteVerificationMatch {
 			m.completeRemoteVerification(row, remote, []string{StateQueued}, requireHash)
@@ -6647,31 +6647,12 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		return
 	}
 
-	now := time.Now()
-	res = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
-		Updates(map[string]any{"state": StateVerifying, "retry_at": &now, "verify_count": 0})
-	if res.Error != nil {
-		// The provider PUT has already returned success. If MySQL briefly fails
-		// here, do not strand the row forever in UPLOADING. A best-effort
-		// recovery update resumes VERIFYING, preserving the multi-attempt remote
-		// consistency window before any retransmit.
-		next := time.Now().Add(2 * time.Second)
-		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
-			Updates(map[string]any{
-				"state":        StateVerifying,
-				"retry_at":     &next,
-				"verify_count": 0,
-				"last_error":   fmt.Sprintf("provider upload succeeded but verification state persistence failed: %v", res.Error),
-			}).Error
-		log.Errorf("write-back failed to enter verifying state for %s: %v", row.Path, res.Error)
-		return
-	}
-	if res.RowsAffected == 0 {
-		return
-	}
-	m.processVerify(row)
+	// Keep the provider claim in UPLOADING while the first authoritative
+	// verification runs. A normal success can now commit UPLOADING -> COMPLETED
+	// in one database write; only uncertain/divergent evidence persists the
+	// VERIFYING state. Crash recovery already promotes interrupted UPLOADING
+	// files to VERIFYING, so this fast path does not weaken durability.
+	m.processRemoteVerification(row, StateUploading, requireHash)
 }
 
 func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
@@ -6874,8 +6855,7 @@ func (m *workerManager) completeMatchingVerifySiblings(trigger *model.WebDAVWrit
 	}
 }
 
-func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject) (model.Obj, error) {
-	requireHash := providerRequiresPayloadHash(row.Path)
+func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject, requireHash bool) (model.Obj, error) {
 	if requireHash {
 		// 115 directory listings already carry size and SHA-1. Use one fresh
 		// parent snapshot as the verification authority instead of issuing a
@@ -6965,28 +6945,26 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 	return true
 }
 
-func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
-	if row.CleanupPath != "" && row.SpoolPath == "" {
-		holdReplicaMoveSource(row.CleanupPath, time.Now().Add(replicaMoveSourceHoldDelay()))
-	}
-	if row.IsDir {
-		now := time.Now()
-		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
-			Updates(map[string]any{
-				"state":        StateQueued,
-				"retry_at":     &now,
-				"verify_count": 0,
-				"last_error":   "directory verification state repaired to queued",
-			}).Error
-		return
-	}
-
-	requireHash := providerRequiresPayloadHash(row.Path)
-	remote, err := m.remoteForVerify(row)
+func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObject, currentState string, requireHash bool) {
+	remote, err := m.remoteForVerify(row, requireHash)
 	verification := classifyRemoteVerification(row, remote, err, requireHash)
 	if verification == remoteVerificationMatch {
-		m.completeRemoteVerification(row, remote, []string{StateVerifying}, requireHash)
+		if m.completeRemoteVerification(row, remote, []string{currentState}, requireHash) {
+			return
+		}
+		if currentState == StateUploading {
+			// A matched provider object must not leave a row stranded in UPLOADING
+			// when only the completion metadata write failed. Best-effort promotion
+			// to VERIFYING keeps the retry/restart recovery path intact.
+			next := time.Now().Add(2 * time.Second)
+			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
+				Updates(map[string]any{
+					"state":      StateVerifying,
+					"retry_at":   &next,
+					"last_error": "remote verification matched but completion persistence failed; retrying verification",
+				}).Error
+		}
 		return
 	}
 
@@ -7000,7 +6978,7 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 			msg = "remote size matches but required 115 SHA-1 is unavailable; keeping canonical generation without reupload"
 		}
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
 			Updates(map[string]any{
 				"state":        StateVerifying,
 				"retry_at":     &next,
@@ -7016,7 +6994,7 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		if suppressRepeatedLargeProviderRepair(row, requireHash) {
 			next := time.Now().Add(repeatedLargeProviderVerifyDelay(row))
 			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
+				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
 				Updates(map[string]any{
 					"state":        StateVerifying,
 					"retry_at":     &next,
@@ -7027,7 +7005,7 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		}
 		next := time.Now().Add(retryDelay(row.RetryCount + 1))
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
 			Updates(map[string]any{
 				"state":        StateQueued,
 				"retry_at":     &next,
@@ -7053,7 +7031,7 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		}
 	}
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
+		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
 		Updates(map[string]any{
 			"state":        StateVerifying,
 			"retry_at":     &next,
@@ -7062,6 +7040,26 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 		}).Error
 }
 
+func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
+	if row.CleanupPath != "" && row.SpoolPath == "" {
+		holdReplicaMoveSource(row.CleanupPath, time.Now().Add(replicaMoveSourceHoldDelay()))
+	}
+	if row.IsDir {
+		now := time.Now()
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
+			Updates(map[string]any{
+				"state":        StateQueued,
+				"retry_at":     &now,
+				"verify_count": 0,
+				"last_error":   "directory verification state repaired to queued",
+			}).Error
+		return
+	}
+
+	requireHash := providerRequiresPayloadHash(row.Path)
+	m.processRemoteVerification(row, StateVerifying, requireHash)
+}
 func deleteParentMissing(err error) bool {
 	return err != nil && errs.IsObjectNotFound(err)
 }
