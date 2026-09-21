@@ -169,7 +169,7 @@ func canonicalContentSHA1(row *model.WebDAVWritebackObject) string {
 	if row.PayloadSHA1 != "" {
 		return row.PayloadSHA1
 	}
-	if row.RemoteGeneration == row.Generation {
+	if row.RemoteGeneration == row.Generation && row.RemoteVerifiedAt != nil {
 		return row.RemoteSHA1
 	}
 	return ""
@@ -1513,6 +1513,9 @@ func compareRemoteContent(row *model.WebDAVWritebackObject, remote model.Obj, re
 	}
 	expectedSHA1 := canonicalContentSHA1(row)
 	if expectedSHA1 == "" {
+		if requireHash {
+			return remoteContentInconclusive
+		}
 		return remoteContentMatch
 	}
 	remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
@@ -1679,13 +1682,22 @@ func completedRemoteVerificationInterval() time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+func remoteVerificationEvidenceConsistent(row *model.WebDAVWritebackObject) bool {
+	if row == nil || row.RemoteVerifiedAt == nil || row.RemoteGeneration != row.Generation {
+		return false
+	}
+	if row.PayloadSHA1 != "" && row.RemoteSHA1 != "" && !strings.EqualFold(row.PayloadSHA1, row.RemoteSHA1) {
+		return false
+	}
+	return true
+}
+
 func completedRemoteVerificationFresh(row *model.WebDAVWritebackObject, now time.Time) bool {
 	if row == nil ||
 		row.IsDir ||
 		row.State != StateCompleted ||
 		row.SpoolPath != "" ||
-		row.RemoteVerifiedAt == nil ||
-		row.RemoteGeneration != row.Generation ||
+		!remoteVerificationEvidenceConsistent(row) ||
 		row.VerifyCount != 0 ||
 		row.RetryAt != nil ||
 		row.LastError != "" {
@@ -1694,11 +1706,14 @@ func completedRemoteVerificationFresh(row *model.WebDAVWritebackObject, now time
 	return now.Before(row.RemoteVerifiedAt.Add(completedRemoteVerificationInterval()))
 }
 
-func refreshCompletedRemoteVerification(row *model.WebDAVWritebackObject, remote model.Obj, now time.Time) error {
+func refreshCompletedRemoteVerification(row *model.WebDAVWritebackObject, remote model.Obj, now time.Time, requireHash bool) error {
 	if row == nil || remote == nil || row.IsDir || row.State != StateCompleted || row.SpoolPath != "" {
 		return nil
 	}
-	evidence := captureRemoteVerification(row, remote, now)
+	evidence, matched := matchedRemoteVerificationEvidence(row, remote, now, requireHash)
+	if !matched {
+		return nil
+	}
 	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
 		Updates(map[string]any{
@@ -1759,7 +1774,7 @@ func refreshMatchingCompletedSiblings(trigger *model.WebDAVWritebackObject, remo
 		return
 	}
 	for _, match := range matchingCompletedSiblingRows(rows, remotes, trigger.ID, requireHash) {
-		if err := refreshCompletedRemoteVerification(&match.row, match.remote, now); err != nil {
+		if err := refreshCompletedRemoteVerification(&match.row, match.remote, now, requireHash); err != nil {
 			log.Errorf("write-back completed sibling probe refresh failed for %s: %v", match.row.Path, err)
 		}
 	}
@@ -1789,7 +1804,7 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 	remote := exactRemoteByName(objs, row.Name)
 	switch compareRemoteContent(row, remote, true) {
 	case remoteContentMatch:
-		if err := refreshCompletedRemoteVerification(row, remote, now); err != nil {
+		if err := refreshCompletedRemoteVerification(row, remote, now, true); err != nil {
 			return false, err
 		}
 		refreshMatchingCompletedSiblings(row, objs, true, now)
@@ -1843,7 +1858,7 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 			return false, delErr
 		}
 		if !row.IsDir && compareRemoteContent(row, remote, requireHash) == remoteContentMatch {
-			if refreshErr := refreshCompletedRemoteVerification(row, remote, now); refreshErr != nil {
+			if refreshErr := refreshCompletedRemoteVerification(row, remote, now, requireHash); refreshErr != nil {
 				return false, refreshErr
 			}
 			return false, nil
@@ -1891,7 +1906,7 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 
 	switch compareRemoteContent(row, remote, requireHash) {
 	case remoteContentMatch:
-		if refreshErr := refreshCompletedRemoteVerification(row, remote, now); refreshErr != nil {
+		if refreshErr := refreshCompletedRemoteVerification(row, remote, now, requireHash); refreshErr != nil {
 			return false, refreshErr
 		}
 		return false, nil
@@ -5762,7 +5777,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		remote, verifyErr := m.remoteForVerify(row)
 		verification := classifyRemoteVerification(row, remote, verifyErr, requireHash)
 		if verification == remoteVerificationMatch {
-			m.completeRemoteVerification(row, remote, []string{StateQueued})
+			m.completeRemoteVerification(row, remote, []string{StateQueued}, requireHash)
 			return
 		}
 		if providerRepairNeedsVerification(verification) {
@@ -6060,7 +6075,7 @@ func (m *workerManager) completeMatchingVerifySiblings(trigger *model.WebDAVWrit
 		return
 	}
 	for _, match := range matchingVerificationRows(rows, remotes, trigger.ID, requireHash) {
-		if m.completeRemoteVerification(&match.row, match.remote, []string{StateVerifying}) {
+		if m.completeRemoteVerification(&match.row, match.remote, []string{StateVerifying}, requireHash) {
 			m.markBatchCompleted(match.row.ID)
 		}
 	}
@@ -6118,9 +6133,19 @@ func captureRemoteVerification(row *model.WebDAVWritebackObject, remote model.Ob
 	return evidence
 }
 
-func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObject, remote model.Obj, allowedStates []string) bool {
+func matchedRemoteVerificationEvidence(row *model.WebDAVWritebackObject, remote model.Obj, now time.Time, requireHash bool) (remoteVerificationEvidence, bool) {
+	if compareRemoteContent(row, remote, requireHash) != remoteContentMatch {
+		return remoteVerificationEvidence{}, false
+	}
+	return captureRemoteVerification(row, remote, now), true
+}
+
+func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObject, remote model.Obj, allowedStates []string, requireHash bool) bool {
 	now := time.Now()
-	evidence := captureRemoteVerification(row, remote, now)
+	evidence, matched := matchedRemoteVerificationEvidence(row, remote, now, requireHash)
+	if !matched {
+		return false
+	}
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, allowedStates).
 		Updates(map[string]any{
@@ -6165,7 +6190,7 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 	remote, err := m.remoteForVerify(row)
 	verification := classifyRemoteVerification(row, remote, err, requireHash)
 	if verification == remoteVerificationMatch {
-		m.completeRemoteVerification(row, remote, []string{StateVerifying})
+		m.completeRemoteVerification(row, remote, []string{StateVerifying}, requireHash)
 		return
 	}
 

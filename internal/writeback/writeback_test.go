@@ -2174,6 +2174,13 @@ func TestCompletedRemoteVerificationFresh(t *testing.T) {
 	}
 
 	row.RemoteGeneration = 7
+	row.PayloadSHA1 = strings.Repeat("a", 40)
+	row.RemoteSHA1 = strings.Repeat("b", 40)
+	if completedRemoteVerificationFresh(row, now) {
+		t.Fatal("contradictory remote SHA1 must invalidate completed verification freshness")
+	}
+	row.RemoteSHA1 = row.PayloadSHA1
+
 	retryAt := now.Add(time.Second)
 	row.RetryAt = &retryAt
 	if completedRemoteVerificationFresh(row, now) {
@@ -2506,6 +2513,14 @@ func TestCompareRemoteContentRequires115HashForConclusiveMatch(t *testing.T) {
 	}, true); got != remoteContentMismatch {
 		t.Fatalf("zero-size stale metadata comparison = %v, want mismatch pending parent confirmation", got)
 	}
+
+	noCanonicalHash := &model.WebDAVWritebackObject{Size: 8192, Generation: 9}
+	if got := compareRemoteContent(noCanonicalHash, &model.Object{
+		Size:     8192,
+		HashInfo: utils.NewHashInfo(utils.SHA1, sha),
+	}, true); got != remoteContentInconclusive {
+		t.Fatalf("strict provider without canonical SHA1 = %v, want inconclusive", got)
+	}
 }
 
 func TestExactRemoteByName(t *testing.T) {
@@ -2699,6 +2714,33 @@ func TestCaptureRemoteVerificationWithoutProviderHash(t *testing.T) {
 	}
 }
 
+func TestMatchedRemoteVerificationEvidenceRequiresExactContent(t *testing.T) {
+	now := time.Now()
+	sha := strings.Repeat("a", 40)
+	row := &model.WebDAVWritebackObject{
+		Generation:  4,
+		Size:        4096,
+		PayloadSHA1: sha,
+	}
+	match := &model.Object{
+		ID:       "remote-1",
+		Size:     4096,
+		HashInfo: utils.NewHashInfo(utils.SHA1, sha),
+	}
+	evidence, ok := matchedRemoteVerificationEvidence(row, match, now, true)
+	if !ok || evidence.generation != 4 || evidence.objectID != "remote-1" || evidence.sha1 != sha {
+		t.Fatalf("matching evidence=%+v ok=%v", evidence, ok)
+	}
+	mismatch := &model.Object{
+		ID:       "remote-2",
+		Size:     4096,
+		HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40)),
+	}
+	if _, ok := matchedRemoteVerificationEvidence(row, mismatch, now, true); ok {
+		t.Fatal("mismatched remote content must never be persisted as verification evidence")
+	}
+}
+
 func TestMatchingCompletedSiblingRows(t *testing.T) {
 	sha := strings.Repeat("a", 40)
 	rows := []model.WebDAVWritebackObject{
@@ -2780,6 +2822,11 @@ func TestCanonicalContentSHA1IsGenerationScoped(t *testing.T) {
 	}
 
 	row.PayloadSHA1 = ""
+	if got := canonicalContentSHA1(row); got != "" {
+		t.Fatalf("remote SHA1 without verified_at must not be trusted, got %q", got)
+	}
+	verifiedAt := time.Now()
+	row.RemoteVerifiedAt = &verifiedAt
 	if got := canonicalContentSHA1(row); got != remoteSHA1 {
 		t.Fatalf("verified SHA1 for current generation = %q, want %q", got, remoteSHA1)
 	}
@@ -2792,11 +2839,13 @@ func TestCanonicalContentSHA1IsGenerationScoped(t *testing.T) {
 
 func TestRemoteMatchesCanonicalUsesGenerationScopedEvidence(t *testing.T) {
 	sha := strings.Repeat("c", 40)
+	verifiedAt := time.Now()
 	row := &model.WebDAVWritebackObject{
 		Size:             4096,
 		Generation:       3,
 		RemoteSHA1:       sha,
 		RemoteGeneration: 3,
+		RemoteVerifiedAt: &verifiedAt,
 	}
 	same := &model.Object{Size: 4096, HashInfo: utils.NewHashInfo(utils.SHA1, strings.ToUpper(sha))}
 	if !remoteMatchesCanonical(row, same, true) {
@@ -2809,8 +2858,8 @@ func TestRemoteMatchesCanonicalUsesGenerationScopedEvidence(t *testing.T) {
 	}
 
 	row.RemoteGeneration = 2
-	if !remoteMatchesCanonical(row, different, true) {
-		t.Fatal("stale remote verification evidence must not constrain a newer generation without payload SHA1")
+	if remoteMatchesCanonical(row, different, true) {
+		t.Fatal("stale remote verification evidence must be inconclusive for a strict provider")
 	}
 }
 
@@ -2910,6 +2959,11 @@ func TestCanCoalesceCompletedDuplicatePut(t *testing.T) {
 	row.PayloadSHA1 = ""
 	row.RemoteSHA1 = sha
 	row.RemoteGeneration = row.Generation
+	if canCoalesceCompletedDuplicatePut(row, row.Size, sha) {
+		t.Fatal("remote SHA1 without verified_at must not coalesce completed content")
+	}
+	verifiedAt := time.Now()
+	row.RemoteVerifiedAt = &verifiedAt
 	if !canCoalesceCompletedDuplicatePut(row, row.Size, sha) {
 		t.Fatal("current-generation verified SHA1 should identify duplicate content after spool cleanup")
 	}

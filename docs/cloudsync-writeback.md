@@ -373,3 +373,12 @@ The scheduler now snapshots in-flight worker IDs once into a set and reuses that
 Backlog admission now excludes the canonical row being replaced inside the aggregate itself with one conditional SUM. This replaces SUM plus a second path-key lookup, preserves the same pending-state definition, and gives canonical backlog accounting one database snapshot.
 
 When `max_pending_spool_mb` is disabled, receive completion skips the reservation DELETE entirely because that mode never creates reservation rows. Provider-operation conflict and path-protection queries now select only routing/lifecycle columns needed for the exact decision rather than loading recovery evidence and large error fields.
+
+
+### Stronger remote-evidence accuracy
+
+Strict hash providers now require a trustworthy canonical SHA-1 as well as a provider SHA-1 before content can be classified as MATCH. If the canonical generation has no payload hash and no current-generation verified remote hash, the result is INCONCLUSIVE rather than a size-only success. A remote SHA-1 fallback is trusted only when its generation also has a verification timestamp.
+
+Upload completion and completed-object evidence refresh now pass through a defensive exact-content gate before persisting remote verification evidence. This keeps the state invariant inside the write function rather than relying only on callers to classify the provider object correctly.
+
+Completed verification cooldown also rejects internally contradictory evidence when the persisted remote SHA-1 disagrees with the canonical payload SHA-1 for the same generation, forcing reconciliation instead of suppressing it.
