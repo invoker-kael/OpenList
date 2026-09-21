@@ -2809,7 +2809,7 @@ func endReceiveSequence(ctx context.Context, p string, sequence uint64, backlogR
 			}
 			return err
 		}
-		return finalizeReceiveSequenceTx(tx, p, &fence, sequence, expected, false)
+		return finalizeReceiveSequenceTx(tx, p, &fence, sequence, backlogReserved, false)
 	})
 }
 
