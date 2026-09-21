@@ -67,6 +67,7 @@ Default configuration in this fork:
   "spool_dir": "writeback",
   "reserve_free_space_mb": 20480,
   "workers": 4,
+  "upload_workers": 3,
   "large_upload_workers": 2,
   "cloudsync_settle_millis": 2000,
   "cloudsync_placeholder_millis": 10000,
@@ -89,7 +90,8 @@ For large Cloud Sync jobs, using SSD/NVMe for the spool is recommended. When fre
 - Repeated PROPFIND calls use the ACKed canonical metadata instead of provider mtime/size or replication state. Cloud Sync can immediately re-list a just-written object without seeing the provider's temporary size=0 / missing state.
 - Upload verification and completed-object health probing use separate cadences. `verify_interval_seconds` remains the short convergence interval for a generation that is still uploading/verifying, while a healthy completed object whose local spool has already been released reuses its last generation-scoped remote evidence for `completed_remote_probe_seconds` (300 seconds by default) before direct GET/HEAD/PROPFIND touches the provider again. A suspected divergence still uses the short separated-confirmation window.
 - Recursive PROPFIND overlays load the canonical collection row and its direct children in one indexed MySQL query. Active COPY/MOVE intents are queried only when a reliable provider view could actually retire completed/no-spool canonical metadata; queued, uploading, verifying, and locally cached completed rows stay on the one-query durable hot path.
-- 115 multipart uploads larger than 20 MiB use a separate non-blocking concurrency budget. With the default `workers=4` and `large_upload_workers=2`, at most two workers are reserved for large provider PUTs, leaving capacity for MKCOL/DELETE/small files and verification. Setting `large_upload_workers` to 0 or to a value greater than or equal to `workers` disables the separate cap.
+- Provider PUTs use a separate non-blocking concurrency budget. With the default `workers=4` and `upload_workers=3`, at most three workers can be occupied by file uploads, so DELETE, verification and MKCOL always retain dispatch capacity even during a dense small-file burst. Queue selection is explicitly ordered as DELETE -> VERIFY -> MKCOL -> small upload -> large upload. Setting `upload_workers` to 0 or to a value greater than or equal to `workers` disables this general cap.
+- 115 multipart uploads larger than 20 MiB keep their tighter non-blocking budget. With `large_upload_workers=2`, at most two workers can perform large provider PUTs at once. Setting `large_upload_workers` to 0 or to a value greater than or equal to `workers` disables only the large-upload cap.
 - Cloud Sync zero-length placeholder PUTs and the following real PUT are coalesced by a short settle window. The provider worker never starts an older generation while another PUT for the same path is still being received.
 - PUT returns 201 for a newly tracked path and 204 for a later tracked overwrite, while the canonical generation/ETag changes immediately.
 - GET/HEAD use the local payload while it is cached and fall back to the backing provider after cleanup. After the local completed cache has expired, a successful provider directory listing that no longer contains the object removes the stale canonical row so Cloud Sync can see the loss and upload it again.

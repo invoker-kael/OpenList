@@ -4379,6 +4379,7 @@ func spoolIsActive(spoolPath string) bool {
 
 type workerJob struct {
 	id          uint
+	upload      bool
 	largeUpload bool
 }
 
@@ -4388,17 +4389,32 @@ type workerManager struct {
 	stop         chan struct{}
 	wake         chan struct{}
 	jobs         chan workerJob
+	uploads      chan struct{}
 	largeUploads chan struct{}
 	inflight     sync.Map
 	wg           sync.WaitGroup
 }
 
-func largeUploadWorkerLimit(workers, configured int) int {
+func boundedWorkerLimit(workers, configured int) int {
 	workers = max(1, workers)
 	if configured <= 0 || configured >= workers {
 		return workers
 	}
 	return max(1, configured)
+}
+
+func uploadWorkerLimit(workers, configured int) int {
+	return boundedWorkerLimit(workers, configured)
+}
+
+func largeUploadWorkerLimit(workers, configured int) int {
+	return boundedWorkerLimit(workers, configured)
+}
+
+func providerUploadCandidate(row *model.WebDAVWritebackObject) bool {
+	return row != nil &&
+		!row.IsDir &&
+		(row.State == StateQueued || row.State == StateFailed)
 }
 
 func largeProviderUploadCandidate(row *model.WebDAVWritebackObject, requireHash bool) bool {
@@ -4409,7 +4425,7 @@ func largeProviderUploadCandidate(row *model.WebDAVWritebackObject, requireHash 
 		row.Size > open115MultipartChunkSize
 }
 
-func tryReserveLargeUploadSlot(slots chan struct{}) (reserved bool, allowed bool) {
+func tryReserveWorkerSlot(slots chan struct{}) (reserved bool, allowed bool) {
 	if slots == nil {
 		return false, true
 	}
@@ -4421,7 +4437,7 @@ func tryReserveLargeUploadSlot(slots chan struct{}) (reserved bool, allowed bool
 	}
 }
 
-func releaseLargeUploadSlot(slots chan struct{}, reserved bool) {
+func releaseWorkerSlot(slots chan struct{}, reserved bool) {
 	if slots == nil || !reserved {
 		return
 	}
@@ -4452,7 +4468,12 @@ func Start() {
 	}
 	workerCtx, cancel := context.WithCancel(context.Background())
 	workers := max(1, conf.Conf.WebDAVWriteback.Workers)
+	uploadWorkers := uploadWorkerLimit(workers, conf.Conf.WebDAVWriteback.UploadWorkers)
 	largeUploadWorkers := largeUploadWorkerLimit(workers, conf.Conf.WebDAVWriteback.LargeUploadWorkers)
+	var uploads chan struct{}
+	if uploadWorkers < workers {
+		uploads = make(chan struct{}, uploadWorkers)
+	}
 	var largeUploads chan struct{}
 	if largeUploadWorkers < workers {
 		largeUploads = make(chan struct{}, largeUploadWorkers)
@@ -4463,6 +4484,7 @@ func Start() {
 		stop:         make(chan struct{}),
 		wake:         make(chan struct{}, 1),
 		jobs:         make(chan workerJob, max(4, workers*4)),
+		uploads:      uploads,
 		largeUploads: largeUploads,
 	}
 	manager = m
@@ -4624,10 +4646,9 @@ func (m *workerManager) dispatch() {
 	err := db.GetDb().
 		Select("id", "path", "size", "is_dir", "state").
 		Where("state IN ? AND (retry_at IS NULL OR retry_at <= ?)", []string{StateQueued, StateFailed, StateVerifying, StateDeleted}, now).
-		Order("is_dir desc").
 		Order(clause.Expr{
-			SQL:  "CASE WHEN state IN (?, ?) AND size > ? THEN 1 ELSE 0 END ASC",
-			Vars: []any{StateQueued, StateFailed, open115MultipartChunkSize},
+			SQL:  "CASE WHEN state = ? THEN 0 WHEN state = ? THEN 1 WHEN is_dir = ? THEN 2 WHEN state IN (?, ?) AND size > ? THEN 4 ELSE 3 END ASC",
+			Vars: []any{StateDeleted, StateVerifying, true, StateQueued, StateFailed, open115MultipartChunkSize},
 		}).
 		Order("updated_at asc").
 		Limit(max(8, conf.Conf.WebDAVWriteback.Workers*4)).
@@ -4644,19 +4665,30 @@ func (m *workerManager) dispatch() {
 		}
 
 		job := workerJob{id: id}
-		if largeProviderUploadCandidate(row, providerRequiresPayloadHash(row.Path)) {
-			reserved, allowed := tryReserveLargeUploadSlot(m.largeUploads)
+		if providerUploadCandidate(row) {
+			reserved, allowed := tryReserveWorkerSlot(m.uploads)
 			if !allowed {
 				m.inflight.Delete(id)
 				continue
 			}
-			job.largeUpload = reserved
+			job.upload = reserved
+
+			if largeProviderUploadCandidate(row, providerRequiresPayloadHash(row.Path)) {
+				largeReserved, largeAllowed := tryReserveWorkerSlot(m.largeUploads)
+				if !largeAllowed {
+					releaseWorkerSlot(m.uploads, job.upload)
+					m.inflight.Delete(id)
+					continue
+				}
+				job.largeUpload = largeReserved
+			}
 		}
 
 		select {
 		case m.jobs <- job:
 		default:
-			releaseLargeUploadSlot(m.largeUploads, job.largeUpload)
+			releaseWorkerSlot(m.largeUploads, job.largeUpload)
+			releaseWorkerSlot(m.uploads, job.upload)
 			m.inflight.Delete(id)
 			return
 		}
@@ -4671,7 +4703,8 @@ func (m *workerManager) worker() {
 			return
 		case job := <-m.jobs:
 			m.process(job.id)
-			releaseLargeUploadSlot(m.largeUploads, job.largeUpload)
+			releaseWorkerSlot(m.largeUploads, job.largeUpload)
+			releaseWorkerSlot(m.uploads, job.upload)
 			m.inflight.Delete(job.id)
 			select {
 			case m.wake <- struct{}{}:

@@ -15,6 +15,23 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
+func TestUploadWorkerLimit(t *testing.T) {
+	for _, tc := range []struct {
+		workers    int
+		configured int
+		want       int
+	}{
+		{workers: 4, configured: 3, want: 3},
+		{workers: 4, configured: 0, want: 4},
+		{workers: 4, configured: 8, want: 4},
+		{workers: 1, configured: 1, want: 1},
+	} {
+		if got := uploadWorkerLimit(tc.workers, tc.configured); got != tc.want {
+			t.Fatalf("uploadWorkerLimit(%d, %d)=%d, want %d", tc.workers, tc.configured, got, tc.want)
+		}
+	}
+}
+
 func TestLargeUploadWorkerLimit(t *testing.T) {
 	for _, tc := range []struct {
 		workers    int
@@ -29,6 +46,26 @@ func TestLargeUploadWorkerLimit(t *testing.T) {
 		if got := largeUploadWorkerLimit(tc.workers, tc.configured); got != tc.want {
 			t.Fatalf("largeUploadWorkerLimit(%d, %d)=%d, want %d", tc.workers, tc.configured, got, tc.want)
 		}
+	}
+}
+
+func TestProviderUploadCandidate(t *testing.T) {
+	row := &model.WebDAVWritebackObject{State: StateQueued}
+	if !providerUploadCandidate(row) {
+		t.Fatal("queued file should consume a provider-upload slot")
+	}
+	row.State = StateFailed
+	if !providerUploadCandidate(row) {
+		t.Fatal("failed file retry should consume a provider-upload slot")
+	}
+	row.State = StateVerifying
+	if providerUploadCandidate(row) {
+		t.Fatal("verification must not consume a provider-upload slot")
+	}
+	row.State = StateQueued
+	row.IsDir = true
+	if providerUploadCandidate(row) {
+		t.Fatal("directory creation must stay on the control path")
 	}
 }
 
@@ -54,26 +91,26 @@ func TestLargeProviderUploadCandidate(t *testing.T) {
 	}
 }
 
-func TestLargeUploadSlotReservationIsNonBlocking(t *testing.T) {
+func TestWorkerSlotReservationIsNonBlocking(t *testing.T) {
 	slots := make(chan struct{}, 1)
-	reserved, allowed := tryReserveLargeUploadSlot(slots)
+	reserved, allowed := tryReserveWorkerSlot(slots)
 	if !reserved || !allowed {
-		t.Fatal("first large upload should reserve the available slot")
+		t.Fatal("first worker reservation should take the available slot")
 	}
-	reserved2, allowed2 := tryReserveLargeUploadSlot(slots)
+	reserved2, allowed2 := tryReserveWorkerSlot(slots)
 	if reserved2 || allowed2 {
-		t.Fatal("second large upload must not block a worker when the slot is full")
+		t.Fatal("second reservation must not block when the slot is full")
 	}
-	releaseLargeUploadSlot(slots, reserved)
-	reserved3, allowed3 := tryReserveLargeUploadSlot(slots)
+	releaseWorkerSlot(slots, reserved)
+	reserved3, allowed3 := tryReserveWorkerSlot(slots)
 	if !reserved3 || !allowed3 {
-		t.Fatal("released large-upload slot should be immediately reusable")
+		t.Fatal("released worker slot should be immediately reusable")
 	}
-	releaseLargeUploadSlot(slots, reserved3)
+	releaseWorkerSlot(slots, reserved3)
 
-	reserved, allowed = tryReserveLargeUploadSlot(nil)
+	reserved, allowed = tryReserveWorkerSlot(nil)
 	if reserved || !allowed {
-		t.Fatal("nil slot pool should mean unthrottled large uploads")
+		t.Fatal("nil slot pool should mean unthrottled work")
 	}
 }
 
