@@ -2366,8 +2366,21 @@ var (
 )
 
 type incomingReservation struct {
-	remaining uint64
-	released  bool
+	remaining       uint64
+	consumedPending uint64
+	released        bool
+}
+
+func (r *incomingReservation) flushConsumedLocked() {
+	if r == nil || r.consumedPending == 0 {
+		return
+	}
+	if r.consumedPending > reservedIncoming {
+		reservedIncoming = 0
+	} else {
+		reservedIncoming -= r.consumedPending
+	}
+	r.consumedPending = 0
 }
 
 func completedSpoolPressureReclaimEnabled() bool {
@@ -2429,6 +2442,7 @@ func (r *incomingReservation) grow(additional uint64) error {
 
 	for attempt := 0; attempt < 2; attempt++ {
 		spaceMu.Lock()
+		r.flushConsumedLocked()
 		usage, err := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
 		if err != nil {
 			spaceMu.Unlock()
@@ -2470,17 +2484,11 @@ func (r *incomingReservation) consume(written uint64) {
 	if r == nil || written == 0 {
 		return
 	}
-	spaceMu.Lock()
-	defer spaceMu.Unlock()
 	if written > r.remaining {
 		written = r.remaining
 	}
 	r.remaining -= written
-	if written > reservedIncoming {
-		reservedIncoming = 0
-	} else {
-		reservedIncoming -= written
-	}
+	r.consumedPending += written
 }
 
 func (r *incomingReservation) verifyCapacity() error {
@@ -2490,6 +2498,7 @@ func (r *incomingReservation) verifyCapacity() error {
 
 	for attempt := 0; attempt < 2; attempt++ {
 		spaceMu.Lock()
+		r.flushConsumedLocked()
 		usage, err := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
 		if err != nil {
 			spaceMu.Unlock()
@@ -2522,6 +2531,7 @@ func (r *incomingReservation) release() {
 	if r.released {
 		return
 	}
+	r.flushConsumedLocked()
 	if r.remaining > reservedIncoming {
 		reservedIncoming = 0
 	} else {
@@ -3012,8 +3022,17 @@ func cloudSyncSettleDelay(size int64) time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
+const spoolCopyBufferSize = 4 * utils.MB
+
+var spoolCopyBufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, spoolCopyBufferSize)
+	},
+}
+
 func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incomingReservation, heartbeat ...func(int64)) (int64, string, error) {
-	buf := make([]byte, 4*utils.MB)
+	buf := spoolCopyBufferPool.Get().([]byte)
+	defer spoolCopyBufferPool.Put(buf)
 	payloadHasher := utils.SHA1.NewFunc()
 	writer := io.MultiWriter(dst, payloadHasher)
 	var total int64

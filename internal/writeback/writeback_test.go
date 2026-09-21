@@ -2139,14 +2139,14 @@ func TestIncomingReservationConsumesWithoutLeak(t *testing.T) {
 
 	r := &incomingReservation{remaining: 1024}
 	r.consume(256)
-	if r.remaining != 768 {
-		t.Fatalf("remaining=%d, want 768", r.remaining)
+	if r.remaining != 768 || r.consumedPending != 256 {
+		t.Fatalf("reservation after consume = remaining:%d pending:%d, want 768/256", r.remaining, r.consumedPending)
 	}
 	spaceMu.Lock()
 	got := reservedIncoming
 	spaceMu.Unlock()
-	if got != 768 {
-		t.Fatalf("global reservation=%d, want 768", got)
+	if got != 1024 {
+		t.Fatalf("global reservation=%d, want conservative 1024 until the next synchronization point", got)
 	}
 	r.release()
 	spaceMu.Lock()
@@ -2213,6 +2213,45 @@ func TestUnknownUploadReservationCanGrowAndRelease(t *testing.T) {
 	}
 }
 
+func TestIncomingReservationGrowFlushesConsumedBytes(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{
+		SpoolDir:                   t.TempDir(),
+		ReserveFreeSpaceMB:         0,
+		IncomingReservationChunkMB: 1,
+	}}
+	defer func() { conf.Conf = oldConf }()
+
+	spaceMu.Lock()
+	oldReserved := reservedIncoming
+	reservedIncoming = uint64(utils.MB)
+	spaceMu.Unlock()
+	defer func() {
+		spaceMu.Lock()
+		reservedIncoming = oldReserved
+		spaceMu.Unlock()
+	}()
+
+	r := &incomingReservation{remaining: uint64(utils.MB)}
+	r.consume(uint64(utils.MB))
+	if r.consumedPending != uint64(utils.MB) {
+		t.Fatalf("pending consumed bytes=%d, want %d", r.consumedPending, uint64(utils.MB))
+	}
+	if err := r.ensureForWrite(1); err != nil {
+		t.Fatal(err)
+	}
+	spaceMu.Lock()
+	got := reservedIncoming
+	spaceMu.Unlock()
+	if got != uint64(utils.MB) {
+		t.Fatalf("global reservation=%d after grow, want one replenished chunk", got)
+	}
+	if r.consumedPending != 0 || r.remaining != uint64(utils.MB) {
+		t.Fatalf("reservation after grow = remaining:%d pending:%d", r.remaining, r.consumedPending)
+	}
+	r.release()
+}
+
 func TestZeroByteUploadStillHonorsFreeSpaceFloor(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = &conf.Config{
@@ -2263,6 +2302,14 @@ func TestSpoolCapacityErrorSupportsErrorsIs(t *testing.T) {
 	if !strings.Contains(backlogErr.Error(), "pending_backlog=200") {
 		t.Fatalf("backlog capacity error lacks backlog details: %v", backlogErr)
 	}
+}
+
+func TestSpoolCopyBufferPoolUsesFixedLargeBuffer(t *testing.T) {
+	buf := spoolCopyBufferPool.Get().([]byte)
+	if len(buf) != spoolCopyBufferSize {
+		t.Fatalf("copy buffer size=%d, want %d", len(buf), spoolCopyBufferSize)
+	}
+	spoolCopyBufferPool.Put(buf)
 }
 
 func TestCopyToSpoolRejectsDeclaredSizeOverrunBeforeWrite(t *testing.T) {
