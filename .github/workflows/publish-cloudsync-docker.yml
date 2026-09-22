@@ -19,7 +19,7 @@ jobs:
       - name: Checkout validated source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: bd096fd60b31ce997b8ab6f2a17eb4628049b292
+          ref: 3fc39acb920e9d8f442e41bfcdc4a906483fb815
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
@@ -39,5 +39,5 @@ jobs:
           push: true
           tags: |
             invokerkael/openlist:cloudsync-writeback
-            invokerkael/openlist:bd096fd6
+            invokerkael/openlist:3fc39acb
           provenance: false
