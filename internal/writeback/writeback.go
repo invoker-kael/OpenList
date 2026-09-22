@@ -6290,7 +6290,7 @@ func (m *workerManager) recoverInterrupted() error {
 		Find(&legacyHighRetryRows).Error; err != nil {
 		return err
 	}
-	now := time.Now()
+	legacyVerifyNow := time.Now()
 	for i := range legacyHighRetryRows {
 		row := &legacyHighRetryRows[i]
 		if !legacyExhaustedRetryNeedsFreshVerification(row) {
@@ -6299,23 +6299,23 @@ func (m *workerManager) recoverInterrupted() error {
 		if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, row.State).
 			Updates(map[string]any{
-				"canonical_state":                CanonicalStateAcked,
-				"state":                          StateVerifying,
-				"cloud_sync_reupload_required":   false,
-				"retry_at":                       &now,
-				"verify_count":                   0,
-				"last_error":                     "legacy exhausted provider retry budget; revalidating fresh provider evidence before any further mutation",
-				"resolution_reason":              "",
-				"completed_at":                   nil,
-				"remote_object_id":               "",
-				"remote_sha1":                    "",
-				"remote_generation":              0,
-				"remote_verified_at":             nil,
-				"provider_evidence_first_at":     nil,
-				"provider_evidence_last_at":      nil,
-				"provider_evidence_count":        0,
-				"provider_evidence_result":       "",
-				"recovery_started_at":            gorm.Expr("COALESCE(recovery_started_at, updated_at, created_at)"),
+				"canonical_state":              CanonicalStateAcked,
+				"state":                        StateVerifying,
+				"cloud_sync_reupload_required": false,
+				"retry_at":                     &legacyVerifyNow,
+				"verify_count":                 0,
+				"last_error":                   "legacy exhausted provider retry budget; revalidating fresh provider evidence before any further mutation",
+				"resolution_reason":            "",
+				"completed_at":                 nil,
+				"remote_object_id":             "",
+				"remote_sha1":                  "",
+				"remote_generation":            0,
+				"remote_verified_at":           nil,
+				"provider_evidence_first_at":   nil,
+				"provider_evidence_last_at":    nil,
+				"provider_evidence_count":      0,
+				"provider_evidence_result":     "",
+				"recovery_started_at":          gorm.Expr("COALESCE(recovery_started_at, updated_at, created_at)"),
 			}).Error; err != nil {
 			return err
 		}
