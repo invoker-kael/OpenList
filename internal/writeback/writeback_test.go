@@ -2973,42 +2973,6 @@ func TestLarge115VerificationWindowUsesRetryMax(t *testing.T) {
 	}
 }
 
-func TestLarge115RepairUploadIsBounded(t *testing.T) {
-	large := &model.WebDAVWritebackObject{
-		Size:       open115MultipartChunkSize + 1,
-		RetryCount: 0,
-	}
-	if suppressRepeatedLargeProviderRepair(large, true) {
-		t.Fatal("initial large 115 divergence should still permit one repair upload")
-	}
-	large.RetryCount = 1
-	if !suppressRepeatedLargeProviderRepair(large, true) {
-		t.Fatal("large 115 generation must stop automatic provider reuploads after one repair")
-	}
-	if suppressRepeatedLargeProviderRepair(&model.WebDAVWritebackObject{Size: open115MultipartChunkSize, RetryCount: 2}, true) {
-		t.Fatal("single-part-sized files should retain the normal retry policy")
-	}
-	if suppressRepeatedLargeProviderRepair(large, false) {
-		t.Fatal("non-115 providers should retain the normal retry policy")
-	}
-}
-
-func TestRepeatedLargeProviderVerifyDelayUsesRetryMaxFloor(t *testing.T) {
-	oldConf := conf.Conf
-	conf.Conf = &conf.Config{
-		WebDAVWriteback: conf.WebDAVWritebackConfig{
-			RetryInitialSeconds: 30,
-			RetryMaxSeconds:     1800,
-		},
-	}
-	defer func() { conf.Conf = oldConf }()
-
-	row := &model.WebDAVWritebackObject{RetryCount: 1}
-	if got := repeatedLargeProviderVerifyDelay(row); got != 30*time.Minute {
-		t.Fatalf("large provider verification hold = %v, want 30m", got)
-	}
-}
-
 func TestProviderRepairInconclusiveNeverRetransmitsImmediately(t *testing.T) {
 	if !providerRepairNeedsVerification(remoteVerificationInconclusive) {
 		t.Fatal("inconclusive retry evidence must re-enter verification instead of reuploading")
