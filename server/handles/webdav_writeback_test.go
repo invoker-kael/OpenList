@@ -219,3 +219,31 @@ func TestWebDAVCurrentEffectiveStatusExplainsWaitingRepair(t *testing.T) {
 		t.Fatalf("status=%q action=%q, want remote_missing/manual_check", status, action)
 	}
 }
+
+func TestWebDAVHistoryRehydrateWaitingRepairRequiresManualCheck(t *testing.T) {
+	now := time.Unix(1000, 0)
+	ack := now.Add(-10 * time.Second)
+	sha := strings.Repeat("a", 40)
+	history := &model.WebDAVWritebackHistory{
+		PathKey:      "path-key",
+		Generation:   3,
+		Size:         1024,
+		PayloadSHA1:  sha,
+		RecoveryType: "cloudsync_rehydrate_required",
+		UpdatedAt:    now.Add(-time.Minute),
+	}
+	current := &model.WebDAVWritebackObject{
+		PathKey:          "path-key",
+		Generation:       4,
+		Size:             1024,
+		PayloadSHA1:      sha,
+		CanonicalState:   "durable_acked",
+		State:            "waiting_repair",
+		ResolutionReason: "remote_hash_mismatch",
+		AckTime:          &ack,
+	}
+	status, action := webDAVHistoryEffectiveStatus(history, current, nil, now)
+	if status != webDAVStatusRemoteHashMismatch || action != webDAVActionManualCheck {
+		t.Fatalf("status=%q action=%q, want remote_hash_mismatch/manual_check", status, action)
+	}
+}

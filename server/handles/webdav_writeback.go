@@ -483,6 +483,9 @@ func webDAVHistoryEffectiveStatus(history *model.WebDAVWritebackHistory, current
 			if writeback.RecoveryLabel(current) == "needs_cloudsync_rehydrate" {
 				return webDAVStatusWaitingCloudSync, webDAVActionRestartCloudSync
 			}
+			if current.State == writeback.StateWaitingRepair {
+				return webDAVCurrentEffectiveStatus(current)
+			}
 			switch current.State {
 			case writeback.StateCompleted:
 				if current.ResolutionReason == writeback.ResolutionRemoteHashMismatch {
@@ -504,7 +507,7 @@ func webDAVHistoryEffectiveStatus(history *model.WebDAVWritebackHistory, current
 	}
 	if history.ResolutionReason == writeback.ResolutionRemoteHashMismatch ||
 		history.FinalState == writeback.ResolutionRemoteHashMismatch {
-		return writeback.ResolutionRemoteHashMismatch, ""
+		return webDAVStatusRemoteHashMismatch, webDAVActionManualCheck
 	}
 	if history.RecoveryType != "" {
 		if history.Result == writeback.HistoryResultCompleted {
@@ -571,6 +574,7 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 				writeback.StateVerifying,
 				writeback.StateDeleted,
 				writeback.StateWaitingCloudSyncReupload,
+				writeback.StateWaitingRepair,
 			})
 		case "all":
 		case "error":
