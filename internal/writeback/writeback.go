@@ -2169,6 +2169,102 @@ func confirmCompletedRemoteMissing(ctx context.Context, row *model.WebDAVWriteba
 	return true, nil, nil
 }
 
+const completedRemoteDivergenceConfirmations = 3
+
+func completedRemoteEvidenceKind(row *model.WebDAVWritebackObject, remote model.Obj) string {
+	if remote == nil {
+		return ResolutionRemoteMissing
+	}
+	if remoteHashMismatch(row, remote, true) {
+		return ResolutionRemoteHashMismatch
+	}
+	return "divergent"
+}
+
+func completedRemoteEvidenceConsistent(row *model.WebDAVWritebackObject, remote model.Obj, kind string) bool {
+	if row == nil ||
+		row.VerifyCount <= 0 ||
+		row.ProviderEvidenceResult != kind ||
+		row.RemoteGeneration != 0 ||
+		row.RemoteVerifiedAt != nil {
+		return false
+	}
+	if kind == ResolutionRemoteMissing {
+		return remote == nil && row.RemoteObjectID == "" && row.RemoteSHA1 == ""
+	}
+	if remote == nil {
+		return false
+	}
+
+	remoteID := remote.GetID()
+	if row.RemoteObjectID == "" || remoteID == "" || row.RemoteObjectID != remoteID {
+		return false
+	}
+	remoteSHA1 := strings.ToLower(remote.GetHash().GetHash(utils.SHA1))
+	if kind == ResolutionRemoteHashMismatch {
+		return row.RemoteSHA1 != "" &&
+			remoteSHA1 != "" &&
+			strings.EqualFold(row.RemoteSHA1, remoteSHA1)
+	}
+	if row.RemoteSHA1 == "" && remoteSHA1 == "" {
+		return true
+	}
+	return row.RemoteSHA1 != "" &&
+		remoteSHA1 != "" &&
+		strings.EqualFold(row.RemoteSHA1, remoteSHA1)
+}
+
+func nextCompletedRemoteEvidenceCount(row *model.WebDAVWritebackObject, remote model.Obj, kind string) (int, bool) {
+	if !completedRemoteEvidenceConsistent(row, remote, kind) {
+		return 1, false
+	}
+	return min(max(0, row.VerifyCount)+1, completedRemoteDivergenceConfirmations), true
+}
+
+func completedRemoteEvidenceMessage(row *model.WebDAVWritebackObject, remote model.Obj, kind string) string {
+	switch kind {
+	case ResolutionRemoteMissing:
+		return "remote object is absent from the refreshed provider listing; awaiting consistent confirmation"
+	case ResolutionRemoteHashMismatch:
+		return remoteHashMismatchMessage(row, remote)
+	default:
+		if row != nil && remote != nil && remote.GetSize() != row.Size {
+			return fmt.Sprintf("remote size %d does not match canonical size %d; awaiting consistent confirmation", remote.GetSize(), row.Size)
+		}
+		return "refreshed provider metadata is divergent from canonical content; awaiting consistent confirmation"
+	}
+}
+
+func recordCompletedRemoteEvidence(row *model.WebDAVWritebackObject, remote model.Obj, kind string, now time.Time) (int, error) {
+	if row == nil || row.IsDir || row.State != StateCompleted || row.SpoolPath != "" {
+		return 0, nil
+	}
+	nextCount, _ := nextCompletedRemoteEvidenceCount(row, remote, kind)
+	evidence := captureRemoteVerification(row, remote, now)
+	nextRetry := now.Add(completedDivergenceConfirmationDelay())
+	updates := map[string]any{
+		"verify_count":       nextCount,
+		"retry_at":           &nextRetry,
+		"last_error":         completedRemoteEvidenceMessage(row, remote, kind),
+		"resolution_reason":  "",
+		"remote_object_id":   evidence.objectID,
+		"remote_sha1":        evidence.sha1,
+		"remote_generation":  0,
+		"remote_verified_at": nil,
+	}
+	updates = mergeUpdateMaps(updates, applyProviderEvidence(row, now, kind))
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
+		Updates(updates)
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return 0, nil
+	}
+	return nextCount, nil
+}
+
 func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWritebackObject, now time.Time) (bool, error) {
 	if row == nil || row.IsDir {
 		return false, nil
@@ -2211,41 +2307,52 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 			// 115 SHA-1 still cannot prove identity or loss.
 			return false, nil
 		}
-	default:
-		if remote != nil && remoteHashMismatch(row, remote, true) {
-			if confirmationClaimed {
-				return false, settleCompletedRemoteHashMismatch(row, remote, now)
-			}
-			break
-		}
-		if confirmationClaimed {
-			if remote == nil {
-				missing, direct, directErr := confirmCompletedRemoteMissing(ctx, row)
-				if directErr != nil {
-					// Provider/network failures are never destructive evidence.
-					return false, nil
-				}
-				if !missing {
-					if compareRemoteContent(row, direct, true) == remoteContentMatch {
-						return false, refreshCompletedRemoteVerification(row, direct, now, true)
-					}
-					if remoteHashMismatch(row, direct, true) {
-						return false, settleCompletedRemoteHashMismatch(row, direct, now)
-					}
-					return false, nil
-				}
-			}
-			missingRow := *row
-			missingRow.ResolutionReason = ResolutionRemoteMissing
-			return deleteCompletedCanonical(&missingRow)
-		}
+		return false, nil
 	}
 
-	// The first suspicious refreshed snapshot only arms a later confirmation.
-	// This preserves the existing two-observation deletion rule while avoiding
-	// a per-file GET before the authoritative 115 parent listing.
-	_, observeErr := observeCompletedFileDivergence(row, now)
-	return false, observeErr
+	kind := completedRemoteEvidenceKind(row, remote)
+	nextCount, consistent := nextCompletedRemoteEvidenceCount(row, remote, kind)
+	if !consistent || nextCount < completedRemoteDivergenceConfirmations {
+		_, recordErr := recordCompletedRemoteEvidence(row, remote, kind, now)
+		return false, recordErr
+	}
+
+	if kind == ResolutionRemoteHashMismatch {
+		return false, settleCompletedRemoteHashMismatch(row, remote, now)
+	}
+
+	if kind == ResolutionRemoteMissing {
+		// Only pay for a per-file provider lookup after three consistent fresh
+		// parent-listing misses. This both lowers 115 request volume and prevents
+		// short metadata visibility gaps from becoming REMOTE_MISSING.
+		missing, direct, directErr := confirmCompletedRemoteMissing(ctx, row)
+		if directErr != nil {
+			_, recordErr := recordCompletedRemoteEvidence(row, remote, kind, now)
+			return false, recordErr
+		}
+		if !missing {
+			switch compareRemoteContent(row, direct, true) {
+			case remoteContentMatch:
+				return false, refreshCompletedRemoteVerification(row, direct, now, true)
+			case remoteContentMismatch:
+				directKind := completedRemoteEvidenceKind(row, direct)
+				_, recordErr := recordCompletedRemoteEvidence(row, direct, directKind, now)
+				return false, recordErr
+			default:
+				return false, nil
+			}
+		}
+		missingRow := *row
+		missingRow.ResolutionReason = ResolutionRemoteMissing
+		return deleteCompletedCanonical(&missingRow)
+	}
+
+	// Persistent non-hash metadata divergence must also be a consistent streak;
+	// a transient size/type view must not borrow confirmation from an earlier
+	// hash mismatch or missing observation.
+	missingRow := *row
+	missingRow.ResolutionReason = ResolutionNeedsCloudSyncRehydrate
+	return deleteCompletedCanonical(&missingRow)
 }
 
 func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {

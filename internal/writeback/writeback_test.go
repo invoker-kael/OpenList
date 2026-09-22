@@ -3896,6 +3896,83 @@ func TestRemoteHashMismatchVerificationBudgetCapsAtThree(t *testing.T) {
 	}
 }
 
+func TestCompletedRemoteHashMismatchEvidenceRequiresStableIdentity(t *testing.T) {
+	canonicalSHA1 := strings.Repeat("a", 40)
+	mismatchSHA1 := strings.Repeat("b", 40)
+	row := &model.WebDAVWritebackObject{
+		Size:                   4096,
+		PayloadSHA1:            canonicalSHA1,
+		VerifyCount:            1,
+		ProviderEvidenceResult: ResolutionRemoteHashMismatch,
+		RemoteObjectID:         "remote-1",
+		RemoteSHA1:             mismatchSHA1,
+	}
+	remote := &model.Object{
+		ID:       "remote-1",
+		Size:     4096,
+		HashInfo: utils.NewHashInfo(utils.SHA1, mismatchSHA1),
+	}
+
+	next, consistent := nextCompletedRemoteEvidenceCount(row, remote, ResolutionRemoteHashMismatch)
+	if !consistent || next != 2 {
+		t.Fatalf("stable mismatch evidence should advance to 2, got count=%d consistent=%v", next, consistent)
+	}
+
+	changedHash := *remote
+	changedHash.HashInfo = utils.NewHashInfo(utils.SHA1, strings.Repeat("c", 40))
+	next, consistent = nextCompletedRemoteEvidenceCount(row, &changedHash, ResolutionRemoteHashMismatch)
+	if consistent || next != 1 {
+		t.Fatalf("changed remote SHA1 must restart the streak, got count=%d consistent=%v", next, consistent)
+	}
+
+	changedID := *remote
+	changedID.ID = "remote-2"
+	next, consistent = nextCompletedRemoteEvidenceCount(row, &changedID, ResolutionRemoteHashMismatch)
+	if consistent || next != 1 {
+		t.Fatalf("changed remote object identity must restart the streak, got count=%d consistent=%v", next, consistent)
+	}
+}
+
+func TestCompletedRemoteEvidenceKindChangeRestartsConfirmation(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		VerifyCount:            2,
+		ProviderEvidenceResult: ResolutionRemoteHashMismatch,
+		RemoteObjectID:         "remote-1",
+		RemoteSHA1:             strings.Repeat("b", 40),
+	}
+	next, consistent := nextCompletedRemoteEvidenceCount(row, nil, ResolutionRemoteMissing)
+	if consistent || next != 1 {
+		t.Fatalf("hash mismatch followed by missing must restart at 1, got count=%d consistent=%v", next, consistent)
+	}
+
+	row.ProviderEvidenceResult = ResolutionRemoteMissing
+	row.RemoteObjectID = ""
+	row.RemoteSHA1 = ""
+	next, consistent = nextCompletedRemoteEvidenceCount(row, nil, ResolutionRemoteMissing)
+	if !consistent || next != completedRemoteDivergenceConfirmations {
+		t.Fatalf("third stable missing observation should reach confirmation threshold, got count=%d consistent=%v", next, consistent)
+	}
+}
+
+func TestCompletedRemoteGenericDivergenceRequiresStableObject(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		VerifyCount:            1,
+		ProviderEvidenceResult: "divergent",
+		RemoteObjectID:         "remote-1",
+	}
+	remote := &model.Object{ID: "remote-1", Size: 0}
+	next, consistent := nextCompletedRemoteEvidenceCount(row, remote, "divergent")
+	if !consistent || next != 2 {
+		t.Fatalf("stable generic divergence should advance, got count=%d consistent=%v", next, consistent)
+	}
+
+	remote.ID = "remote-2"
+	next, consistent = nextCompletedRemoteEvidenceCount(row, remote, "divergent")
+	if consistent || next != 1 {
+		t.Fatalf("generic divergence with a changed object must restart, got count=%d consistent=%v", next, consistent)
+	}
+}
+
 func TestRemoteHashMismatchChangedObjectRestartsConfirmation(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
 		VerifyCount:    2,
