@@ -106,6 +106,8 @@ A non-empty `last_error` is **not automatically a manual-action signal**.
 
 The recovery classification is more important than a raw error string. Most provider failures should remain inside OpenList's automatic retry loop.
 
+On upgrade, legacy rows with a high `retry_count` are not judged by the counter alone. Rows that only show transport/API failures continue automatic retry. Rows that already contain provider-upload or verification/divergence evidence are first moved to a fresh provider verification pass without another blind upload. If the provider now matches, the row completes normally; if fresh evidence still proves missing/divergent content, the row converges to the current Cloud Sync re-upload recovery path.
+
 ## 4. Normal automatic recovery
 
 The expected self-healing path is:

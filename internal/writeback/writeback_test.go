@@ -3931,6 +3931,70 @@ func TestWaitingCloudSyncReuploadIsTerminalForProviderWorkers(t *testing.T) {
 	}
 }
 
+func TestLegacyExhaustedRetryNeedsFreshVerification(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name string
+		row  model.WebDAVWritebackObject
+		want bool
+	}{
+		{
+			name: "old divergent retry loop",
+			row: model.WebDAVWritebackObject{
+				State:      StateQueued,
+				RetryCount: 11,
+				LastError:  "fresh provider evidence stayed divergent through the verification window",
+			},
+			want: true,
+		},
+		{
+			name: "provider upload completed before repeated retries",
+			row: model.WebDAVWritebackObject{
+				State:                     StateQueued,
+				RetryCount:                7,
+				ProviderUploadCompletedAt: &now,
+			},
+			want: true,
+		},
+		{
+			name: "pure transport retry remains automatic",
+			row: model.WebDAVWritebackObject{
+				State:      StateQueued,
+				RetryCount: 11,
+				LastError:  "provider request timeout",
+			},
+			want: false,
+		},
+		{
+			name: "current single repair budget is not legacy exhausted",
+			row: model.WebDAVWritebackObject{
+				State:                     StateQueued,
+				RetryCount:                1,
+				ProviderUploadCompletedAt: &now,
+				LastError:                 "fresh provider evidence stayed divergent through the verification window",
+			},
+			want: false,
+		},
+		{
+			name: "replica move control row excluded",
+			row: model.WebDAVWritebackObject{
+				State:       StateQueued,
+				RetryCount:  8,
+				CleanupPath: "/old/path",
+				LastError:   "fresh provider evidence stayed divergent through the verification window",
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := legacyExhaustedRetryNeedsFreshVerification(&tt.row); got != tt.want {
+				t.Fatalf("legacyExhaustedRetryNeedsFreshVerification()=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCompletedRemoteEvidenceKindChangeRestartsConfirmation(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
 		VerifyCount:            2,

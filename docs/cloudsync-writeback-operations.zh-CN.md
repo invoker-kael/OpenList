@@ -110,6 +110,8 @@ WebDAV PUT 成功表示：
 
 运维判断应优先看 Recovery State。绝大多数 provider 错误都应该留在 OpenList 自己的自动重试闭环中。
 
+升级时，旧记录不会仅因为 `retry_count` 很高就直接判定需要 Cloud Sync 重传。只有网络/API 失败、没有形成 provider 上传完成或验证差异证据的旧任务，仍继续 OP 自动重试；已经存在 provider 上传完成、验证、Hash/缺失/不一致证据的高重试旧任务，会先进入一次 fresh provider verification，并且不会再次盲目上传。若 fresh evidence 已恢复一致则直接完成；若仍明确缺失/不一致，则收敛到当前统一的 Cloud Sync re-upload 最终恢复路径。
+
 ## 4. 正常自动恢复
 
 正常自愈路径：

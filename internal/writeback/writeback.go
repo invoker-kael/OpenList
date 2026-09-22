@@ -112,6 +112,48 @@ func waitingCloudSyncReupload(row *model.WebDAVWritebackObject) bool {
 			row.ResolutionReason == ResolutionNeedsCloudSyncRehydrate)
 }
 
+func legacyExhaustedRetryNeedsFreshVerification(row *model.WebDAVWritebackObject) bool {
+	if row == nil ||
+		row.IsDir ||
+		row.CleanupPath != "" ||
+		row.RetryCount <= 1 {
+		return false
+	}
+	switch row.State {
+	case StateQueued, legacyStateFailed, StateUploading, StateVerifying:
+	default:
+		return false
+	}
+
+	switch row.ResolutionReason {
+	case ResolutionRemoteHashMismatch, ResolutionRemoteMissing, ResolutionVerificationExhausted:
+		return true
+	}
+	if row.ProviderUploadCompletedAt != nil ||
+		row.VerifyCount > 0 ||
+		row.RemoteObjectID != "" ||
+		row.RemoteSHA1 != "" ||
+		row.ProviderEvidenceCount > 0 {
+		return true
+	}
+
+	msg := strings.ToLower(row.LastError)
+	for _, marker := range []string{
+		"fresh provider evidence stayed divergent",
+		"verification window",
+		"provider hash mismatch",
+		"remote sha1",
+		"remote object is still absent",
+		"automatic repair budget",
+		"multipart upload remains divergent",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func markCanonicalAcked(row *model.WebDAVWritebackObject, durableAt time.Time) {
 	if row == nil {
 		return
@@ -6231,6 +6273,54 @@ func (m *workerManager) recoverInterrupted() error {
 		}).Error; err != nil {
 		return err
 	}
+	var legacyHighRetryRows []model.WebDAVWritebackObject
+	if err := db.GetDb().
+		Select(
+			"id", "generation", "state", "is_dir", "cleanup_path",
+			"retry_count", "verify_count", "last_error", "resolution_reason",
+			"provider_upload_completed_at", "remote_object_id", "remote_sha1",
+			"provider_evidence_count",
+		).
+		Where("state IN ? AND retry_count > 1", []string{
+			StateQueued,
+			legacyStateFailed,
+			StateUploading,
+			StateVerifying,
+		}).
+		Find(&legacyHighRetryRows).Error; err != nil {
+		return err
+	}
+	now := time.Now()
+	for i := range legacyHighRetryRows {
+		row := &legacyHighRetryRows[i]
+		if !legacyExhaustedRetryNeedsFreshVerification(row) {
+			continue
+		}
+		if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, row.State).
+			Updates(map[string]any{
+				"canonical_state":                CanonicalStateAcked,
+				"state":                          StateVerifying,
+				"cloud_sync_reupload_required":   false,
+				"retry_at":                       &now,
+				"verify_count":                   0,
+				"last_error":                     "legacy exhausted provider retry budget; revalidating fresh provider evidence before any further mutation",
+				"resolution_reason":              "",
+				"completed_at":                   nil,
+				"remote_object_id":               "",
+				"remote_sha1":                    "",
+				"remote_generation":              0,
+				"remote_verified_at":             nil,
+				"provider_evidence_first_at":     nil,
+				"provider_evidence_last_at":      nil,
+				"provider_evidence_count":        0,
+				"provider_evidence_result":       "",
+				"recovery_started_at":            gorm.Expr("COALESCE(recovery_started_at, updated_at, created_at)"),
+			}).Error; err != nil {
+			return err
+		}
+	}
+
 	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("state = ?", legacyStateFailed).
 		Updates(map[string]any{
