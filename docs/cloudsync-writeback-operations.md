@@ -384,3 +384,16 @@ Let OpenList retry/verify automatically --+
 - Do not restart Cloud Sync for ordinary provider errors.
 - Do not restart Cloud Sync for `missing_spool` while OpenList is still verifying the provider.
 - Restart the affected Cloud Sync task only for `needs_cloudsync_rehydrate`, by fully stopping/disabling and then starting/enabling the same task to force a fresh scan.
+
+
+## Completed with remote hash difference
+
+`remote_hash_mismatch` is a terminal operator-facing result, not a retry loop and not a Cloud Sync re-upload request.
+
+OpenList enters this result only after up to three fresh provider observations keep showing the same-size object with stable provider identity/hash evidence while both canonical and provider SHA-1 values are present and remain different. If the durable local spool is still available, OpenList keeps the canonical Durable ACK, stops automatic provider re-uploads, preserves the local spool, records both SHA-1 values and the provider object ID for diagnostics, and marks the generation completed with `resolution_reason=remote_hash_mismatch`.
+
+The spool is intentionally not eligible for verified-completed cache release because the provider hash was not accepted as canonical evidence. This preserves a durable local copy for investigation.
+
+Do not restart Cloud Sync for this result. A Cloud Sync task restart is required only for the structured `needs_cloudsync_rehydrate` path, where the durable payload is unavailable and OpenList has deliberately exposed the canonical loss for a fresh reconciliation scan.
+
+Rehydrate correlation uses the recovery History row plus current path/generation or ACK timing, receive-fence timing/size, and the durable payload SHA-1 when available. A later unrelated PUT at the same path with different content does not close the old rehydrate incident.

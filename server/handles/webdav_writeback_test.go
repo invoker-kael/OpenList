@@ -112,3 +112,98 @@ func TestWebDAVHistoryEffectiveStatusRecovered(t *testing.T) {
 		t.Fatalf("status=%q action=%q, want recovered/no action", status, action)
 	}
 }
+
+
+func TestWebDAVHistoryEffectiveStatusRemoteHashMismatch(t *testing.T) {
+	now := time.Unix(600, 0)
+	history := &model.WebDAVWritebackHistory{
+		PathKey:          "path-key",
+		Generation:       9,
+		Result:           "completed",
+		FinalState:       "remote_hash_mismatch",
+		ResolutionReason: "remote_hash_mismatch",
+		UpdatedAt:        now.Add(-time.Minute),
+	}
+	status, action := webDAVHistoryEffectiveStatus(history, nil, nil, now)
+	if status != "remote_hash_mismatch" || action != "" {
+		t.Fatalf("status=%q action=%q, want remote_hash_mismatch/no action", status, action)
+	}
+}
+
+func TestWebDAVHistoryRehydrateCanFinishWithRemoteHashMismatch(t *testing.T) {
+	now := time.Unix(700, 0)
+	ack := now.Add(-10 * time.Second)
+	sha := strings.Repeat("a", 40)
+	history := &model.WebDAVWritebackHistory{
+		PathKey:      "path-key",
+		Generation:   3,
+		Size:         1024,
+		PayloadSHA1:  sha,
+		RecoveryType: "cloudsync_rehydrate_required",
+		UpdatedAt:    now.Add(-time.Minute),
+	}
+	current := &model.WebDAVWritebackObject{
+		PathKey:          "path-key",
+		Generation:       4,
+		Size:             1024,
+		PayloadSHA1:      sha,
+		CanonicalState:   "durable_acked",
+		State:            "completed",
+		ResolutionReason: "remote_hash_mismatch",
+		AckTime:          &ack,
+	}
+	status, action := webDAVHistoryEffectiveStatus(history, current, nil, now)
+	if status != "remote_hash_mismatch" || action != "" {
+		t.Fatalf("status=%q action=%q, want remote_hash_mismatch/no action", status, action)
+	}
+}
+
+func TestWebDAVHistoryRehydrateRejectsUnrelatedLaterPut(t *testing.T) {
+	now := time.Unix(800, 0)
+	ack := now.Add(-10 * time.Second)
+	history := &model.WebDAVWritebackHistory{
+		PathKey:      "path-key",
+		Generation:   3,
+		Size:         1024,
+		PayloadSHA1:  strings.Repeat("a", 40),
+		RecoveryType: "cloudsync_rehydrate_required",
+		UpdatedAt:    now.Add(-time.Minute),
+	}
+	current := &model.WebDAVWritebackObject{
+		PathKey:        "path-key",
+		Generation:     4,
+		Size:           2048,
+		PayloadSHA1:    strings.Repeat("b", 40),
+		CanonicalState: "durable_acked",
+		State:          "completed",
+		AckTime:        &ack,
+	}
+	status, action := webDAVHistoryEffectiveStatus(history, current, nil, now)
+	if status != webDAVStatusWaitingCloudSync || action != webDAVActionRestartCloudSync {
+		t.Fatalf("unrelated later PUT must not close rehydrate incident: status=%q action=%q", status, action)
+	}
+}
+
+func TestWebDAVHistoryRehydrateReceiveRequiresMatchingSize(t *testing.T) {
+	now := time.Unix(900, 0)
+	started := now.Add(-5 * time.Second)
+	lease := now.Add(time.Minute)
+	history := &model.WebDAVWritebackHistory{
+		PathKey:      "path-key",
+		Generation:   3,
+		Size:         1024,
+		RecoveryType: "cloudsync_rehydrate_required",
+		UpdatedAt:    now.Add(-time.Minute),
+	}
+	fence := &model.WebDAVWritebackReceiveFence{
+		PathKey:            "path-key",
+		ActiveReceivers:    1,
+		LatestExpectedSize: 2048,
+		LatestStartedAt:    &started,
+		ReceiveLeaseUntil:  &lease,
+	}
+	status, action := webDAVHistoryEffectiveStatus(history, nil, fence, now)
+	if status != webDAVStatusWaitingCloudSync || action != webDAVActionRestartCloudSync {
+		t.Fatalf("different-size receive must not correlate to old rehydrate: status=%q action=%q", status, action)
+	}
+}

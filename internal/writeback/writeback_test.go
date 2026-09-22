@@ -3851,3 +3851,64 @@ func TestNextReceiveGenerationUsesDurableSequenceAcrossRecreate(t *testing.T) {
 		})
 	}
 }
+
+
+func TestRemoteHashMismatchRequiresStrongSameSizeEvidence(t *testing.T) {
+	shaA := strings.Repeat("a", 40)
+	shaB := strings.Repeat("b", 40)
+	row := &model.WebDAVWritebackObject{Size: 4096, PayloadSHA1: shaA}
+	remote := &model.Object{Size: 4096, HashInfo: utils.NewHashInfo(utils.SHA1, shaB)}
+
+	if !remoteHashMismatch(row, remote, true) {
+		t.Fatal("same-size objects with two different strong SHA1 values must be classified as a provider hash difference")
+	}
+	if remoteHashMismatch(row, remote, false) {
+		t.Fatal("providers that do not require a strong payload hash must not enter the terminal hash-difference path")
+	}
+	remote.Size = 2048
+	if remoteHashMismatch(row, remote, true) {
+		t.Fatal("size divergence is a content divergence, not a hash-only difference")
+	}
+}
+
+func TestRemoteHashMismatchVerificationBudgetCapsAtThree(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyAttempts: 60}}
+	defer func() { conf.Conf = oldConf }()
+
+	row := &model.WebDAVWritebackObject{}
+	remote := &model.Object{ID: "remote-1", HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40))}
+	for attempt := 1; attempt <= remoteHashMismatchMaxAttempts; attempt++ {
+		next, terminal := advanceRemoteHashMismatch(row, remote)
+		row.VerifyCount = next
+		row.RemoteObjectID = remote.GetID()
+		row.RemoteSHA1 = remote.GetHash().GetHash(utils.SHA1)
+		if attempt < remoteHashMismatchMaxAttempts && terminal {
+			t.Fatalf("hash mismatch became terminal too early at attempt %d", attempt)
+		}
+		if attempt == remoteHashMismatchMaxAttempts && !terminal {
+			t.Fatal("third confirmed hash difference must become terminal")
+		}
+	}
+	row.VerifyCount = 54
+	next, terminal := advanceRemoteHashMismatch(row, remote)
+	if next != remoteHashMismatchMaxAttempts || !terminal {
+		t.Fatalf("legacy high verify count must converge immediately: count=%d terminal=%v", next, terminal)
+	}
+}
+
+func TestRemoteHashMismatchChangedObjectRestartsConfirmation(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		VerifyCount:    2,
+		RemoteObjectID: "old-object",
+		RemoteSHA1:     strings.Repeat("b", 40),
+	}
+	remote := &model.Object{
+		ID:       "new-object",
+		HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("c", 40)),
+	}
+	next, terminal := advanceRemoteHashMismatch(row, remote)
+	if next != 1 || terminal {
+		t.Fatalf("changed provider identity must restart hash-difference confirmation: count=%d terminal=%v", next, terminal)
+	}
+}

@@ -34,8 +34,9 @@ func TestHistoryUpsertIsIdempotentPerPathGeneration(t *testing.T) {
 	second := &model.WebDAVWritebackHistory{
 		PathKey: "path-key", Path: "/backup/a.zip", Generation: 7,
 		Result: HistoryResultRemoteMissing, FinalState: StateDeleted,
-		RecoveryType: HistoryRecoveryCloudSyncRehydrateRequired,
-		RetryCount:   2, VerifyCount: 3, LastError: "confirmed provider loss",
+		RecoveryType:     HistoryRecoveryCloudSyncRehydrateRequired,
+		ResolutionReason: ResolutionNeedsCloudSyncRehydrate,
+		RetryCount:       2, VerifyCount: 3, LastError: "confirmed provider loss",
 	}
 	if err := upsertWritebackHistory(database, second); err != nil {
 		t.Fatal(err)
@@ -54,7 +55,9 @@ func TestHistoryUpsertIsIdempotentPerPathGeneration(t *testing.T) {
 	if got.Result != HistoryResultCompleted {
 		t.Fatalf("existing final result was overwritten: %q", got.Result)
 	}
-	if got.RecoveryType != HistoryRecoveryCloudSyncRehydrateRequired || got.RetryCount != 2 || got.VerifyCount != 3 {
+	if got.RecoveryType != HistoryRecoveryCloudSyncRehydrateRequired ||
+		got.ResolutionReason != ResolutionNeedsCloudSyncRehydrate ||
+		got.RetryCount != 2 || got.VerifyCount != 3 {
 		t.Fatalf("missing supplemental recovery data: %+v", got)
 	}
 }

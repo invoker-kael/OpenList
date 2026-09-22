@@ -388,3 +388,16 @@ Recovery State 是否为 needs_cloudsync_rehydrate？
 - 普通 provider 错误不要重启 Cloud Sync。
 - `missing_spool` 仍在验证 provider 时不要重启 Cloud Sync。
 - 只有 `needs_cloudsync_rehydrate` 才需要人工完整停止/停用并重新启动/启用对应 Cloud Sync 任务，以强制重新扫描。
+
+
+## 已完成，但远端 Hash 存在差异
+
+`remote_hash_mismatch` 是一个终态运维结果，不会继续无限验证，也不会自动要求 Cloud Sync 重新上传。
+
+只有在最多 3 次强制刷新远端后，OpenList 持续观察到“对象大小一致、Provider 身份/Hash 证据稳定、Canonical SHA-1 与 Provider SHA-1 均存在但持续不同”时才进入该状态。只要本地 durable spool 仍然存在，OpenList 就保持 Durable ACK，不再重复向 Provider 上传，保留本地 spool，并记录双方 SHA-1 与 Remote Object ID 供排查，同时以 `resolution_reason=remote_hash_mismatch` 收敛该 generation。
+
+由于远端 Hash 没有被接受为 Canonical 一致性证据，此状态下的 spool 不会进入“已验证完成缓存”自动释放范围，从而保留一份可用于排查的本地持久副本。
+
+该状态不需要重启 Cloud Sync。只有结构化状态 `needs_cloudsync_rehydrate` 才要求完整停用 Cloud Sync Task 后重新启用，以触发 fresh reconciliation scan。
+
+Rehydrate 关联会综合恢复 History、当前 path/generation 或 ACK 时间、receive fence 的时间/大小，以及可用时的 durable payload SHA-1。未来同路径但内容不同的普通 PUT 不会错误关闭旧的 rehydrate 事件。
