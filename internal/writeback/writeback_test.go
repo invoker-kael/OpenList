@@ -3912,17 +3912,21 @@ func TestRemoteHashMismatchChangedObjectRestartsConfirmation(t *testing.T) {
 	}
 }
 
-func TestWaitingCloudSyncReuploadIsDeletedCanonicalButNotProviderDelete(t *testing.T) {
+func TestWaitingCloudSyncReuploadKeepsCanonicalVisibleAndDoesNotDispatch(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
-		State:            StateWaitingCloudSyncReupload,
-		CanonicalState:   CanonicalStateDeleted,
-		ResolutionReason: ResolutionNeedsCloudSyncRehydrate,
+		State:                     StateWaitingCloudSyncReupload,
+		CanonicalState:            CanonicalStateAcked,
+		ResolutionReason:          ResolutionNeedsCloudSyncRehydrate,
+		CloudSyncReuploadRequired: true,
 	}
-	if !canonicalDeleted(row) {
-		t.Fatal("waiting Cloud Sync re-upload must remain client-visible as deleted")
+	if canonicalDeleted(row) || !canonicalAcked(row) {
+		t.Fatal("waiting Cloud Sync re-upload must keep canonical metadata visible to PROPFIND")
 	}
 	if !waitingCloudSyncReupload(row) {
-		t.Fatal("waiting Cloud Sync re-upload must be protected from provider DELETE")
+		t.Fatal("waiting Cloud Sync re-upload must be explicitly classified as Cloud Sync repair")
+	}
+	if canCoalesceDuplicatePut(row, 0, emptyPayloadSHA1()) {
+		t.Fatal("an actual re-upload must publish a new generation instead of being coalesced into the waiting repair row")
 	}
 }
 
@@ -3942,5 +3946,21 @@ func TestRemoteHashMismatchDoesNotDropCompletedCanonical(t *testing.T) {
 	}
 	if shouldDropCanonicalAfterRemoteList(row, true, remote, time.Now(), true) {
 		t.Fatal("same-size provider hash mismatch must not be treated as remote missing")
+	}
+}
+
+func TestProviderEvidenceSnapshotKeepsFirstObservationAndCountsChecks(t *testing.T) {
+	first := time.Unix(100, 0)
+	row := &model.WebDAVWritebackObject{
+		ProviderEvidenceFirstAt: &first,
+		ProviderEvidenceCount:   2,
+	}
+	now := time.Unix(200, 0)
+	firstAt, lastAt, count, result := providerEvidenceSnapshot(row, now, ResolutionRemoteHashMismatch)
+	if firstAt == nil || !firstAt.Equal(first) {
+		t.Fatalf("first evidence=%v, want %v", firstAt, first)
+	}
+	if lastAt == nil || !lastAt.Equal(now) || count != 3 || result != ResolutionRemoteHashMismatch {
+		t.Fatalf("evidence last=%v count=%d result=%q", lastAt, count, result)
 	}
 }

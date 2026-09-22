@@ -151,27 +151,38 @@ func TestSuccessfulHistoryCleanupPreservesRecoveryEvidence(t *testing.T) {
 }
 
 func TestBuildWritebackHistoryKeepsPerFileProviderUploadTiming(t *testing.T) {
+	receiveStarted := time.Unix(90, 0)
 	ack := time.Unix(100, 0)
 	durable := time.Unix(101, 0)
 	providerStarted := time.Unix(110, 0)
 	providerCompleted := time.Unix(125, 0)
 	finalAt := time.Unix(140, 0)
+	evidenceFirst := time.Unix(130, 0)
+	evidenceLast := time.Unix(139, 0)
 	row := &model.WebDAVWritebackObject{
 		PathKey:                   "timing-key",
 		Path:                      "/backup/timing.bin",
 		Generation:                3,
 		Size:                      4096,
+		ReceiveStartedAt:          &receiveStarted,
 		AckTime:                   &ack,
 		DurableAt:                 &durable,
 		ProviderUploadStartedAt:   &providerStarted,
 		ProviderUploadCompletedAt: &providerCompleted,
+		ProviderEvidenceFirstAt:   &evidenceFirst,
+		ProviderEvidenceLastAt:    &evidenceLast,
+		ProviderEvidenceCount:     3,
+		ProviderEvidenceResult:    "matched",
 	}
 	h := buildWritebackHistory(row, HistoryResultCompleted, StateCompleted, "", finalAt, "")
 	if h == nil {
 		t.Fatal("history is nil")
 	}
-	if h.StartedAt == nil || !h.StartedAt.Equal(ack) {
-		t.Fatalf("end-to-end start=%v, want ACK %v", h.StartedAt, ack)
+	if h.StartedAt == nil || !h.StartedAt.Equal(receiveStarted) {
+		t.Fatalf("end-to-end start=%v, want PUT start %v", h.StartedAt, receiveStarted)
+	}
+	if h.TriggerType != HistoryTriggerPut {
+		t.Fatalf("trigger=%q, want PUT", h.TriggerType)
 	}
 	if h.ProviderUploadStartedAt == nil || !h.ProviderUploadStartedAt.Equal(providerStarted) {
 		t.Fatalf("provider upload start=%v, want %v", h.ProviderUploadStartedAt, providerStarted)
@@ -179,7 +190,28 @@ func TestBuildWritebackHistoryKeepsPerFileProviderUploadTiming(t *testing.T) {
 	if h.ProviderUploadCompletedAt == nil || !h.ProviderUploadCompletedAt.Equal(providerCompleted) {
 		t.Fatalf("provider upload completion=%v, want %v", h.ProviderUploadCompletedAt, providerCompleted)
 	}
+	if h.ProviderEvidenceCount != 3 || h.ProviderEvidenceResult != "matched" ||
+		h.ProviderEvidenceFirstAt == nil || !h.ProviderEvidenceFirstAt.Equal(evidenceFirst) ||
+		h.ProviderEvidenceLastAt == nil || !h.ProviderEvidenceLastAt.Equal(evidenceLast) {
+		t.Fatalf("provider evidence audit not preserved: %+v", h)
+	}
 	if h.CompletedAt == nil || !h.CompletedAt.Equal(finalAt) {
 		t.Fatalf("final completion=%v, want %v", h.CompletedAt, finalAt)
+	}
+}
+
+func TestHistoryTriggerClassification(t *testing.T) {
+	row := &model.WebDAVWritebackObject{CleanupPath: "/old/path"}
+	if got := historyTriggerType(row, HistoryResultCompleted, ""); got != HistoryTriggerMove {
+		t.Fatalf("MOVE trigger=%q", got)
+	}
+	if got := historyTriggerType(row, HistoryResultDeleted, ""); got != HistoryTriggerDelete {
+		t.Fatalf("DELETE trigger=%q", got)
+	}
+	if got := historyTriggerType(row, HistoryResultCompleted, HistoryRecoveryRestart); got != HistoryTriggerRestart {
+		t.Fatalf("RESTART trigger=%q", got)
+	}
+	if got := historyTriggerType(row, HistoryResultRecoveryRequired, HistoryRecoveryCloudSyncRehydrateRequired); got != HistoryTriggerRecovery {
+		t.Fatalf("RECOVERY trigger=%q", got)
 	}
 }

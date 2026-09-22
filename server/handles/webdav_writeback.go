@@ -19,7 +19,7 @@ import (
 const (
 	webDAVMonitorDefaultLimit     = 100
 	webDAVMonitorMaxLimit         = 500
-	webDAVWritebackMonitorColumns = "id, path, name, is_dir, size, e_tag, canonical_state, state, generation, remote_generation, payload_sha1, remote_sha1, remote_object_id, retry_count, verify_count, last_error, resolution_reason, retry_at, remote_verified_at, ack_time, durable_at, completed_at, created_at, updated_at"
+	webDAVWritebackMonitorColumns = "id, path, name, is_dir, size, e_tag, canonical_state, state, generation, remote_generation, payload_sha1, remote_sha1, remote_object_id, retry_count, verify_count, last_error, resolution_reason, retry_at, remote_verified_at, receive_started_at, ack_time, durable_at, provider_upload_started_at, provider_upload_completed_at, recovery_started_at, cloud_sync_reupload_required, provider_evidence_first_at, provider_evidence_last_at, provider_evidence_count, provider_evidence_result, completed_at, created_at, updated_at"
 )
 
 type webDAVWritebackStateSummary struct {
@@ -117,11 +117,20 @@ type webDAVWritebackMonitorRow struct {
 	ResolutionReason string     `json:"resolution_reason,omitempty"`
 	RetryAt          *time.Time `json:"retry_at"`
 	RecoveryState    string     `json:"recovery_state,omitempty"`
-	RemoteVerifiedAt *time.Time `json:"remote_verified_at"`
-	AckTime          *time.Time `json:"ack_time"`
-	DurableAt        *time.Time `json:"durable_at"`
-	CompletedAt      *time.Time `json:"completed_at"`
-	StartedAt        *time.Time `json:"started_at,omitempty"`
+	RemoteVerifiedAt          *time.Time `json:"remote_verified_at"`
+	ReceiveStartedAt          *time.Time `json:"receive_started_at,omitempty"`
+	AckTime                   *time.Time `json:"ack_time"`
+	DurableAt                 *time.Time `json:"durable_at"`
+	ProviderUploadStartedAt   *time.Time `json:"provider_upload_started_at,omitempty"`
+	ProviderUploadCompletedAt *time.Time `json:"provider_upload_completed_at,omitempty"`
+	RecoveryStartedAt         *time.Time `json:"recovery_started_at,omitempty"`
+	CloudSyncReuploadRequired bool       `json:"cloudsync_reupload_required"`
+	ProviderEvidenceFirstAt   *time.Time `json:"provider_evidence_first_at,omitempty"`
+	ProviderEvidenceLastAt    *time.Time `json:"provider_evidence_last_at,omitempty"`
+	ProviderEvidenceCount     int        `json:"provider_evidence_count"`
+	ProviderEvidenceResult    string     `json:"provider_evidence_result,omitempty"`
+	CompletedAt               *time.Time `json:"completed_at"`
+	StartedAt                 *time.Time `json:"started_at,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at"`
 }
@@ -381,6 +390,12 @@ func webDAVCurrentEffectiveStatus(row *model.WebDAVWritebackObject) (string, str
 	if row == nil {
 		return "", webDAVActionNone
 	}
+	if row.CloudSyncReuploadRequired || row.State == writeback.StateWaitingCloudSyncReupload {
+		if row.ResolutionReason == writeback.ResolutionRemoteMissing {
+			return webDAVStatusRemoteMissing, webDAVActionRestartCloudSync
+		}
+		return webDAVStatusNeedsCloudSyncReupload, webDAVActionRestartCloudSync
+	}
 	switch row.ResolutionReason {
 	case writeback.ResolutionRemoteHashMismatch:
 		return webDAVStatusRemoteHashMismatch, webDAVActionManualCheck
@@ -616,12 +631,21 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 				ResolutionReason: row.ResolutionReason,
 				RetryAt:          row.RetryAt,
 				RecoveryState:    writeback.RecoveryLabel(row),
-				RemoteVerifiedAt: row.RemoteVerifiedAt,
-				AckTime:          row.AckTime,
-				DurableAt:        row.DurableAt,
-				CompletedAt:      row.CompletedAt,
-				StartedAt:        row.AckTime,
-				CreatedAt:        row.CreatedAt,
+				RemoteVerifiedAt:          row.RemoteVerifiedAt,
+				ReceiveStartedAt:          row.ReceiveStartedAt,
+				AckTime:                   row.AckTime,
+				DurableAt:                 row.DurableAt,
+				ProviderUploadStartedAt:   row.ProviderUploadStartedAt,
+				ProviderUploadCompletedAt: row.ProviderUploadCompletedAt,
+				RecoveryStartedAt:         row.RecoveryStartedAt,
+				CloudSyncReuploadRequired: row.CloudSyncReuploadRequired,
+				ProviderEvidenceFirstAt:   row.ProviderEvidenceFirstAt,
+				ProviderEvidenceLastAt:    row.ProviderEvidenceLastAt,
+				ProviderEvidenceCount:     row.ProviderEvidenceCount,
+				ProviderEvidenceResult:    row.ProviderEvidenceResult,
+				CompletedAt:               row.CompletedAt,
+				StartedAt:                 row.ReceiveStartedAt,
+				CreatedAt:                 row.CreatedAt,
 				UpdatedAt:        row.UpdatedAt,
 			})
 		}
@@ -641,15 +665,73 @@ type webDAVWritebackHistoryAggregate struct {
 	Count int64
 }
 
+type webDAVWritebackTimelineEvent struct {
+	Event string    `json:"event"`
+	At    time.Time `json:"at"`
+}
+
 type webDAVWritebackHistoryRow struct {
 	model.WebDAVWritebackHistory
-	EffectiveStatus      string     `json:"effective_status"`
-	OperatorAction       string     `json:"operator_action,omitempty"`
-	CurrentGeneration    uint64     `json:"current_generation,omitempty"`
-	CurrentProviderState string     `json:"current_provider_state,omitempty"`
-	CurrentRecoveryState string     `json:"current_recovery_state,omitempty"`
-	CurrentAckTime       *time.Time `json:"current_ack_time,omitempty"`
-	CurrentCompletedAt   *time.Time `json:"current_completed_at,omitempty"`
+	EffectiveStatus           string                         `json:"effective_status"`
+	OperatorAction            string                         `json:"operator_action,omitempty"`
+	CurrentGeneration         uint64                         `json:"current_generation,omitempty"`
+	CurrentProviderState      string                         `json:"current_provider_state,omitempty"`
+	CurrentRecoveryState      string                         `json:"current_recovery_state,omitempty"`
+	CurrentAckTime            *time.Time                     `json:"current_ack_time,omitempty"`
+	CurrentCompletedAt        *time.Time                     `json:"current_completed_at,omitempty"`
+	LifecycleDurationMS       int64                          `json:"lifecycle_duration_ms"`
+	CloudSyncUploadDurationMS int64                          `json:"cloudsync_upload_duration_ms"`
+	ProviderSyncDurationMS    int64                          `json:"provider_sync_duration_ms"`
+	RecoveryDurationMS        int64                          `json:"recovery_duration_ms"`
+	EventTimeline             []webDAVWritebackTimelineEvent `json:"event_timeline,omitempty"`
+}
+
+func webDAVDurationMillis(start, end *time.Time) int64 {
+	if start == nil || end == nil || end.Before(*start) {
+		return 0
+	}
+	return end.Sub(*start).Milliseconds()
+}
+
+func webDAVHistoryTimeline(row *model.WebDAVWritebackHistory) []webDAVWritebackTimelineEvent {
+	if row == nil {
+		return nil
+	}
+	events := make([]webDAVWritebackTimelineEvent, 0, 6)
+	appendEvent := func(event string, at *time.Time) {
+		if at != nil {
+			events = append(events, webDAVWritebackTimelineEvent{Event: event, At: *at})
+		}
+	}
+	appendEvent("PUT_START", row.StartedAt)
+	appendEvent("DURABLE_ACK", row.DurableAt)
+	appendEvent("PROVIDER_UPLOAD_START", row.ProviderUploadStartedAt)
+	appendEvent("PROVIDER_UPLOAD_COMPLETE", row.ProviderUploadCompletedAt)
+	appendEvent("REMOTE_VERIFY", row.RemoteVerifiedAt)
+	if row.CompletedAt != nil {
+		event := "COMPLETED"
+		if row.Result != writeback.HistoryResultCompleted && row.Result != writeback.HistoryResultDeleted {
+			event = "RECOVERY_REQUIRED"
+		}
+		appendEvent(event, row.CompletedAt)
+	}
+	return events
+}
+
+func webDAVHistoryDurations(item *webDAVWritebackHistoryRow) {
+	if item == nil {
+		return
+	}
+	row := &item.WebDAVWritebackHistory
+	item.CloudSyncUploadDurationMS = webDAVDurationMillis(row.StartedAt, row.DurableAt)
+	if row.Result == writeback.HistoryResultCompleted {
+		item.LifecycleDurationMS = webDAVDurationMillis(row.StartedAt, row.CompletedAt)
+		item.ProviderSyncDurationMS = webDAVDurationMillis(row.DurableAt, row.CompletedAt)
+		if row.RecoveryType != "" {
+			item.RecoveryDurationMS = webDAVDurationMillis(row.RecoveryStartedAt, row.CompletedAt)
+		}
+	}
+	item.EventTimeline = webDAVHistoryTimeline(row)
 }
 
 type webDAVWritebackHistorySummary struct {
@@ -693,6 +775,9 @@ func WebDAVWritebackHistoryList(c *gin.Context) {
 	}
 	if recovery := strings.ToLower(strings.TrimSpace(c.Query("recovery"))); recovery != "" {
 		query = query.Where("recovery_type = ?", recovery)
+	}
+	if trigger := strings.ToUpper(strings.TrimSpace(c.Query("trigger"))); trigger != "" {
+		query = query.Where("trigger_type = ?", trigger)
 	}
 	if raw := strings.TrimSpace(c.Query("generation")); raw != "" {
 		generation, err := strconv.ParseUint(raw, 10, 64)
@@ -758,7 +843,7 @@ func WebDAVWritebackHistoryList(c *gin.Context) {
 	if len(pathKeys) > 0 {
 		var current []model.WebDAVWritebackObject
 		if err := db.GetDb().
-			Select("path_key", "generation", "size", "payload_sha1", "canonical_state", "state", "ack_time", "durable_at", "completed_at", "last_error", "resolution_reason").
+			Select("path_key", "generation", "size", "payload_sha1", "canonical_state", "state", "ack_time", "durable_at", "completed_at", "last_error", "resolution_reason", "cloud_sync_reupload_required").
 			Where("path_key IN ?", pathKeys).
 			Find(&current).Error; err != nil {
 			common.ErrorResp(c, err, http.StatusInternalServerError)
@@ -795,7 +880,8 @@ func WebDAVWritebackHistoryList(c *gin.Context) {
 		if currentStateFilter != "" && (current == nil || current.State != currentStateFilter) {
 			continue
 		}
-		if actionRequiredFilter != nil && (action != "") != *actionRequiredFilter {
+		actionRequired := action == webDAVActionRestartCloudSync || action == webDAVActionManualCheck
+		if actionRequiredFilter != nil && actionRequired != *actionRequiredFilter {
 			continue
 		}
 
@@ -804,6 +890,7 @@ func WebDAVWritebackHistoryList(c *gin.Context) {
 			EffectiveStatus:        status,
 			OperatorAction:         action,
 		}
+		webDAVHistoryDurations(&item)
 		if current != nil {
 			item.CurrentGeneration = current.Generation
 			item.CurrentProviderState = current.State

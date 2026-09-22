@@ -125,6 +125,9 @@ func RecoveryType(row *model.WebDAVWritebackObject) string {
 	if row == nil {
 		return RecoveryTypeNone
 	}
+	if row.CloudSyncReuploadRequired || row.State == StateWaitingCloudSyncReupload {
+		return RecoveryTypeCloudSyncRehydrate
+	}
 	if row.ResolutionReason == ResolutionRemoteHashMismatch {
 		return RecoveryTypeRemoteMismatch
 	}
@@ -167,7 +170,7 @@ func RecoveryLabel(row *model.WebDAVWritebackObject) string {
 	if row == nil {
 		return ""
 	}
-	if row.State == StateWaitingCloudSyncReupload || row.ResolutionReason == ResolutionNeedsCloudSyncRehydrate {
+	if row.CloudSyncReuploadRequired || row.State == StateWaitingCloudSyncReupload || row.ResolutionReason == ResolutionNeedsCloudSyncRehydrate {
 		return "needs_cloudsync_rehydrate"
 	}
 	msg := strings.ToLower(row.LastError)
@@ -229,8 +232,8 @@ func AdminRuntimeSnapshot() (AdminRuntimeStats, error) {
 		return stats, err
 	}
 	stats.NeedsCloudSyncRehydrate, err = count(
-		"state IN ? AND canonical_state = ? AND (resolution_reason = ? OR LOWER(last_error) LIKE ?)",
-		[]string{StateWaitingCloudSyncReupload, StateDeleted}, CanonicalStateDeleted, ResolutionNeedsCloudSyncRehydrate, "%cloud sync can re-upload%",
+		"cloud_sync_reupload_required = ? OR state = ? OR resolution_reason = ?",
+		true, StateWaitingCloudSyncReupload, ResolutionNeedsCloudSyncRehydrate,
 	)
 	if err != nil {
 		return stats, err
@@ -243,8 +246,8 @@ func AdminRuntimeSnapshot() (AdminRuntimeStats, error) {
 		return stats, err
 	}
 	stats.RemoteHashMismatch, err = count(
-		"state = ? AND resolution_reason = ?",
-		StateCompleted, ResolutionRemoteHashMismatch,
+		"resolution_reason = ? OR provider_evidence_result = ?",
+		ResolutionRemoteHashMismatch, ResolutionRemoteHashMismatch,
 	)
 	if err != nil {
 		return stats, err

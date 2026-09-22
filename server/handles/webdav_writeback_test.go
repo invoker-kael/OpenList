@@ -247,3 +247,51 @@ func TestWebDAVHistoryRehydrateWaitingRepairRequiresManualCheck(t *testing.T) {
 		t.Fatalf("status=%q action=%q, want remote_hash_mismatch/manual_check", status, action)
 	}
 }
+
+func TestWebDAVCurrentEffectiveStatusCloudSyncReuploadKeepsRootCause(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		State:                     "waiting_cloudsync_reupload",
+		CanonicalState:            "durable_acked",
+		CloudSyncReuploadRequired: true,
+		ResolutionReason:          "remote_missing",
+	}
+	status, action := webDAVCurrentEffectiveStatus(row)
+	if status != webDAVStatusRemoteMissing || action != webDAVActionRestartCloudSync {
+		t.Fatalf("status=%q action=%q, want remote_missing/restart_cloudsync_required", status, action)
+	}
+
+	row.ResolutionReason = "remote_hash_mismatch"
+	status, action = webDAVCurrentEffectiveStatus(row)
+	if status != webDAVStatusNeedsCloudSyncReupload || action != webDAVActionRestartCloudSync {
+		t.Fatalf("status=%q action=%q, want needs_cloudsync_reupload/restart_cloudsync_required", status, action)
+	}
+}
+
+func TestWebDAVHistoryDurationsSeparateCloudSyncAndProviderTime(t *testing.T) {
+	start := time.Unix(100, 0)
+	durable := time.Unix(103, 0)
+	providerStart := time.Unix(110, 0)
+	providerDone := time.Unix(120, 0)
+	completed := time.Unix(125, 0)
+	item := webDAVWritebackHistoryRow{WebDAVWritebackHistory: model.WebDAVWritebackHistory{
+		StartedAt:                 &start,
+		DurableAt:                 &durable,
+		ProviderUploadStartedAt:   &providerStart,
+		ProviderUploadCompletedAt: &providerDone,
+		CompletedAt:               &completed,
+		Result:                    "completed",
+	}}
+	webDAVHistoryDurations(&item)
+	if item.CloudSyncUploadDurationMS != 3000 {
+		t.Fatalf("cloudsync duration=%dms, want 3000", item.CloudSyncUploadDurationMS)
+	}
+	if item.ProviderSyncDurationMS != 22000 {
+		t.Fatalf("provider duration=%dms, want 22000", item.ProviderSyncDurationMS)
+	}
+	if item.LifecycleDurationMS != 25000 {
+		t.Fatalf("lifecycle duration=%dms, want 25000", item.LifecycleDurationMS)
+	}
+	if len(item.EventTimeline) != 5 {
+		t.Fatalf("timeline events=%d, want 5", len(item.EventTimeline))
+	}
+}

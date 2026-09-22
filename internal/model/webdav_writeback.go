@@ -24,10 +24,17 @@ type WebDAVWritebackObject struct {
 	// the provider-replication lifecycle so ACKed WebDAV identity cannot flap as
 	// the backing provider moves through queued/uploading/verifying/completed.
 	CanonicalState            string     `json:"canonical_state" gorm:"size:24"`
+	ReceiveStartedAt          *time.Time `json:"receive_started_at"`
 	AckTime                   *time.Time `json:"ack_time"`
 	DurableAt                 *time.Time `json:"durable_at"`
 	ProviderUploadStartedAt   *time.Time `json:"provider_upload_started_at"`
 	ProviderUploadCompletedAt *time.Time `json:"provider_upload_completed_at"`
+	RecoveryStartedAt         *time.Time `json:"recovery_started_at"`
+	CloudSyncReuploadRequired bool       `json:"cloudsync_reupload_required" gorm:"index"`
+	ProviderEvidenceFirstAt   *time.Time `json:"provider_evidence_first_at"`
+	ProviderEvidenceLastAt    *time.Time `json:"provider_evidence_last_at"`
+	ProviderEvidenceCount     int        `json:"provider_evidence_count"`
+	ProviderEvidenceResult    string     `json:"provider_evidence_result" gorm:"size:32"`
 	State                     string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1;index:idx_webdav_writeback_parent_state,priority:2;index:idx_webdav_writeback_state_size,priority:1"`
 	SpoolPath                 string     `json:"spool_path" gorm:"type:text"`
 	PayloadSHA1               string     `json:"payload_sha1" gorm:"size:40"`
@@ -66,7 +73,14 @@ type WebDAVWritebackHistory struct {
 	CompletedAt               *time.Time `json:"completed_at" gorm:"index"`
 	Result                    string     `json:"result" gorm:"size:32;index"`
 	FinalState                string     `json:"final_state" gorm:"size:24"`
+	TriggerType               string     `json:"trigger_type" gorm:"size:24;index"`
 	RecoveryType              string     `json:"recovery_type" gorm:"size:48;index"`
+	RecoveryStartedAt         *time.Time `json:"recovery_started_at"`
+	CloudSyncReuploadRequired bool       `json:"cloudsync_reupload_required"`
+	ProviderEvidenceFirstAt   *time.Time `json:"provider_evidence_first_at"`
+	ProviderEvidenceLastAt    *time.Time `json:"provider_evidence_last_at"`
+	ProviderEvidenceCount     int        `json:"provider_evidence_count"`
+	ProviderEvidenceResult    string     `json:"provider_evidence_result" gorm:"size:32"`
 	PayloadSHA1               string     `json:"payload_sha1" gorm:"size:40"`
 	RemoteSHA1                string     `json:"remote_sha1" gorm:"size:40"`
 	RemoteObjectID            string     `json:"remote_object_id" gorm:"size:255"`

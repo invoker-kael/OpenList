@@ -24,6 +24,13 @@ const (
 	HistoryRecoveryCloudSyncRehydrateRequired = "cloudsync_rehydrate_required"
 	HistoryRecoveryRemoteMismatch             = "remote_mismatch"
 	HistoryRecoveryManual                     = "manual"
+
+	HistoryTriggerPut          = "PUT"
+	HistoryTriggerMove         = "MOVE"
+	HistoryTriggerDelete       = "DELETE"
+	HistoryTriggerRecovery     = "RECOVERY"
+	HistoryTriggerRestart      = "RESTART"
+	HistoryTriggerManualCancel = "MANUAL_CANCEL"
 )
 
 type HistoryCleanupSpec struct {
@@ -59,6 +66,22 @@ func historyRecoveryForCompletion(row *model.WebDAVWritebackObject) string {
 	return ""
 }
 
+func historyTriggerType(row *model.WebDAVWritebackObject, result, recovery string) string {
+	if result == HistoryResultDeleted {
+		return HistoryTriggerDelete
+	}
+	if recovery == HistoryRecoveryRestart {
+		return HistoryTriggerRestart
+	}
+	if recovery != "" {
+		return HistoryTriggerRecovery
+	}
+	if row != nil && row.CleanupPath != "" {
+		return HistoryTriggerMove
+	}
+	return HistoryTriggerPut
+}
+
 func buildWritebackHistory(row *model.WebDAVWritebackObject, result, finalState, recovery string, finalAt time.Time, lastError string) *model.WebDAVWritebackHistory {
 	if row == nil {
 		return nil
@@ -67,7 +90,10 @@ func buildWritebackHistory(row *model.WebDAVWritebackObject, result, finalState,
 	if key == "" && row.Path != "" {
 		key = pathKey(row.Path)
 	}
-	startedAt := cloneHistoryTime(row.AckTime)
+	startedAt := cloneHistoryTime(row.ReceiveStartedAt)
+	if startedAt == nil {
+		startedAt = cloneHistoryTime(row.AckTime)
+	}
 	if startedAt == nil {
 		startedAt = cloneHistoryTime(row.DurableAt)
 	}
@@ -101,7 +127,14 @@ func buildWritebackHistory(row *model.WebDAVWritebackObject, result, finalState,
 		CompletedAt:               completedAt,
 		Result:                    result,
 		FinalState:                finalState,
+		TriggerType:               historyTriggerType(row, result, recovery),
 		RecoveryType:              recovery,
+		RecoveryStartedAt:         cloneHistoryTime(row.RecoveryStartedAt),
+		CloudSyncReuploadRequired: row.CloudSyncReuploadRequired,
+		ProviderEvidenceFirstAt:   cloneHistoryTime(row.ProviderEvidenceFirstAt),
+		ProviderEvidenceLastAt:    cloneHistoryTime(row.ProviderEvidenceLastAt),
+		ProviderEvidenceCount:     row.ProviderEvidenceCount,
+		ProviderEvidenceResult:    row.ProviderEvidenceResult,
 		PayloadSHA1:               row.PayloadSHA1,
 		RemoteSHA1:                row.RemoteSHA1,
 		RemoteObjectID:            row.RemoteObjectID,
@@ -173,8 +206,31 @@ func upsertWritebackHistory(database *gorm.DB, value *model.WebDAVWritebackHisto
 	if existing.FinalState == "" && value.FinalState != "" {
 		updates["final_state"] = value.FinalState
 	}
+	if existing.TriggerType == "" && value.TriggerType != "" {
+		updates["trigger_type"] = value.TriggerType
+	}
 	if existing.RecoveryType == "" && value.RecoveryType != "" {
 		updates["recovery_type"] = value.RecoveryType
+	}
+	if existing.RecoveryStartedAt == nil && value.RecoveryStartedAt != nil {
+		updates["recovery_started_at"] = value.RecoveryStartedAt
+	}
+	if !existing.CloudSyncReuploadRequired && value.CloudSyncReuploadRequired {
+		updates["cloud_sync_reupload_required"] = true
+	}
+	if existing.ProviderEvidenceFirstAt == nil && value.ProviderEvidenceFirstAt != nil {
+		updates["provider_evidence_first_at"] = value.ProviderEvidenceFirstAt
+	}
+	if value.ProviderEvidenceLastAt != nil &&
+		(existing.ProviderEvidenceLastAt == nil || value.ProviderEvidenceLastAt.After(*existing.ProviderEvidenceLastAt)) {
+		updates["provider_evidence_last_at"] = value.ProviderEvidenceLastAt
+	}
+	if value.ProviderEvidenceCount > existing.ProviderEvidenceCount {
+		updates["provider_evidence_count"] = value.ProviderEvidenceCount
+	}
+	if value.ProviderEvidenceResult != "" &&
+		(value.ProviderEvidenceCount >= existing.ProviderEvidenceCount || existing.ProviderEvidenceResult == "") {
+		updates["provider_evidence_result"] = value.ProviderEvidenceResult
 	}
 	if existing.PayloadSHA1 == "" && value.PayloadSHA1 != "" {
 		updates["payload_sha1"] = value.PayloadSHA1
@@ -233,6 +289,7 @@ func recordCompletedHistoryBestEffort(row *model.WebDAVWritebackObject, evidence
 	}
 	final := *row
 	final.ResolutionReason = ""
+	final.ProviderEvidenceResult = "matched"
 	history := buildWritebackHistory(&final, HistoryResultCompleted, StateCompleted, historyRecoveryForCompletion(row), now, row.LastError)
 	if history == nil {
 		return
