@@ -3830,7 +3830,6 @@ func TestApplyDuplicatePutMetadataPreservesOmittedTimes(t *testing.T) {
 	}
 }
 
-
 func TestNextReceiveGenerationUsesDurableSequenceAcrossRecreate(t *testing.T) {
 	tests := []struct {
 		name     string
