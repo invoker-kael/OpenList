@@ -2011,7 +2011,17 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 	// the main parent group so health reconciliation, VERIFY, and WebDAV refresh
 	// cannot issue parallel Refresh:true LIST calls for the same parent.
 	objs, listErr := providerParentSnapshots.do(ctx.Done(), row.Parent, func() ([]model.Obj, error) {
-		return fs.List(ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
+		slots := currentProviderProbeSlots()
+		reserved, err := acquireWorkerSlot(slots, ctx.Done())
+		if err != nil {
+			return nil, err
+		}
+		fresh, listErr := fs.List(ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
+		releaseWorkerSlot(slots, reserved)
+		if listErr == nil {
+			refreshFreshParentCompletedEvidence(row.Parent, fresh, time.Now())
+		}
+		return fresh, listErr
 	})
 	if listErr != nil {
 		// Provider/network failures are not evidence of remote loss.
