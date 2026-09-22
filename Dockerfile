@@ -1,17 +1,23 @@
 ### Default image is base. You can add other support by modifying BASE_IMAGE_TAG. The following parameters are supported: base (default), aria2, ffmpeg, aio
 ARG BASE_IMAGE_TAG=base
 ARG FRONTEND_REPO=invoker-kael/OpenList-Frontend
-ARG FRONTEND_REF=c8f23446f4ea63ecbf19118fb440600c7075f338
+ARG FRONTEND_REF=12bd89dfe7a144106259faaade80d1d997920df6
+ARG FRONTEND_I18N_URL=https://github.com/OpenListTeam/OpenList-Frontend/releases/download/v4.2.6/i18n.tar.gz
 
 FROM node:24-alpine AS frontend-builder
 ARG FRONTEND_REPO
 ARG FRONTEND_REF
-RUN apk add --no-cache git
+ARG FRONTEND_I18N_URL
+RUN apk add --no-cache git curl
 WORKDIR /frontend
 RUN git clone --filter=blob:none --no-checkout "https://github.com/${FRONTEND_REPO}.git" . \
     && git checkout "${FRONTEND_REF}"
-RUN corepack enable \
+RUN curl -fL "$FRONTEND_I18N_URL" -o /tmp/i18n.tar.gz \
+    && tar -xzf /tmp/i18n.tar.gz -C src/lang \
+    && rm -f /tmp/i18n.tar.gz \
+    && corepack enable \
     && pnpm install --frozen-lockfile \
+    && node ./scripts/i18n.mjs \
     && pnpm build
 
 FROM alpine:edge AS builder
