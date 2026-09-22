@@ -12,26 +12,26 @@ import (
 
 func validAdminConfig() conf.WebDAVWritebackConfig {
 	return conf.WebDAVWritebackConfig{
-		Enabled:                    true,
-		SpoolDir:                   "/tmp/writeback",
-		ReserveFreeSpaceMB:         1024,
-		MaxPendingSpoolMB:          4096,
-		IncomingReservationChunkMB: 64,
-		AdmissionRetrySeconds:      5,
-		Workers:                    4,
-		UploadWorkers:              3,
-		LargeUploadWorkers:         2,
-		ProviderProbeWorkers:       2,
-		CloudSyncSettleMillis:      2000,
-		CloudSyncPlaceholderMillis: 10000,
-		DirectoryGraceSeconds:      60,
-		RetryInitialSeconds:        30,
-		RetryMaxSeconds:            1800,
-		VerifyIntervalSeconds:      5,
-		VerifyAttempts:             60,
-		CompletedCacheTTLMinutes:   30,
+		Enabled:                     true,
+		SpoolDir:                    "/tmp/writeback",
+		ReserveFreeSpaceMB:          1024,
+		MaxPendingSpoolMB:           4096,
+		IncomingReservationChunkMB:  64,
+		AdmissionRetrySeconds:       5,
+		Workers:                     4,
+		UploadWorkers:               3,
+		LargeUploadWorkers:          2,
+		ProviderProbeWorkers:        2,
+		CloudSyncSettleMillis:       2000,
+		CloudSyncPlaceholderMillis:  10000,
+		DirectoryGraceSeconds:       60,
+		RetryInitialSeconds:         30,
+		RetryMaxSeconds:             1800,
+		VerifyIntervalSeconds:       5,
+		VerifyAttempts:              60,
+		CompletedCacheTTLMinutes:    30,
 		CompletedRemoteProbeSeconds: 1800,
-		ProviderSnapshotTTLSeconds: 600,
+		ProviderSnapshotTTLSeconds:  600,
 	}
 }
 
@@ -120,19 +120,19 @@ func TestRecoveryLabelMakesMissingAndRestartStatesVisible(t *testing.T) {
 		want string
 	}{
 		{
-			row: model.WebDAVWritebackObject{State: StateVerifying, CanonicalState: CanonicalStateAcked, LastError: "durable spool is missing after restart; checking provider"},
+			row:  model.WebDAVWritebackObject{State: StateVerifying, CanonicalState: CanonicalStateAcked, LastError: "durable spool is missing after restart; checking provider"},
 			want: "missing_spool",
 		},
 		{
-			row: model.WebDAVWritebackObject{State: StateVerifying, CanonicalState: CanonicalStateAcked, LastError: "resuming remote verification after interrupted upload"},
+			row:  model.WebDAVWritebackObject{State: StateVerifying, CanonicalState: CanonicalStateAcked, LastError: "resuming remote verification after interrupted upload"},
 			want: "restart_recovery",
 		},
 		{
-			row: model.WebDAVWritebackObject{State: StateVerifying, CanonicalState: CanonicalStateAcked},
+			row:  model.WebDAVWritebackObject{State: StateVerifying, CanonicalState: CanonicalStateAcked},
 			want: "waiting_provider_verification",
 		},
 		{
-			row: model.WebDAVWritebackObject{State: StateDeleted, CanonicalState: CanonicalStateDeleted, LastError: "exposing the loss so Cloud Sync can re-upload"},
+			row:  model.WebDAVWritebackObject{State: StateDeleted, CanonicalState: CanonicalStateDeleted, LastError: "exposing the loss so Cloud Sync can re-upload"},
 			want: "needs_cloudsync_rehydrate",
 		},
 	}

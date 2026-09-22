@@ -1,10 +1,11 @@
 package conf
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
-
-	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
 var saveConfigMu sync.Mutex
@@ -20,10 +21,43 @@ func SaveConfig(next *Config) error {
 		return fmt.Errorf("config path is empty")
 	}
 
+	body, err := json.MarshalIndent(next, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+
 	saveConfigMu.Lock()
 	defer saveConfigMu.Unlock()
-	if !utils.WriteJsonToFile(ConfigPath, next) {
-		return fmt.Errorf("failed to persist config to %s", ConfigPath)
+
+	dir := filepath.Dir(ConfigPath)
+	tmp, err := os.CreateTemp(dir, ".openlist-config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary config: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	mode := os.FileMode(0o600)
+	if info, statErr := os.Stat(ConfigPath); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("set temporary config mode: %w", err)
+	}
+	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temporary config: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temporary config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temporary config: %w", err)
+	}
+	if err := os.Rename(tmpPath, ConfigPath); err != nil {
+		return fmt.Errorf("replace config: %w", err)
 	}
 	return nil
 }
