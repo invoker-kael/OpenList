@@ -187,6 +187,7 @@ func WebDAVWritebackMonitorSummary(c *gin.Context) {
 	if err := db.GetDb().
 		Model(&model.WebDAVWritebackObject{}).
 		Where("last_error <> ''").
+		Where("state <> ?", writeback.StateWaitingCloudSyncReupload).
 		Count(&errorsCount).Error; err != nil {
 		common.ErrorResp(c, err, http.StatusInternalServerError)
 		return
@@ -343,7 +344,7 @@ func webDAVMonitorCanonicalState(row *model.WebDAVWritebackObject) string {
 	if row.CanonicalState != "" {
 		return row.CanonicalState
 	}
-	if row.State == "deleted" {
+	if row.State == writeback.StateDeleted || row.State == writeback.StateWaitingCloudSyncReupload {
 		return "deleted"
 	}
 	return "acked"
@@ -523,7 +524,13 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 
 		switch state {
 		case "", "active":
-			query = query.Where("state IN ?", []string{writeback.StateQueued, writeback.StateUploading, writeback.StateVerifying, writeback.StateDeleted})
+			query = query.Where("state IN ?", []string{
+				writeback.StateQueued,
+				writeback.StateUploading,
+				writeback.StateVerifying,
+				writeback.StateDeleted,
+				writeback.StateWaitingCloudSyncReupload,
+			})
 		case "all":
 		case "error":
 			query = query.Where("last_error <> ''")
