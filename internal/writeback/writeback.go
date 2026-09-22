@@ -38,9 +38,12 @@ const (
 	StateCompleted                = "completed"
 	StateDeleted                  = "deleted"
 	StateWaitingCloudSyncReupload = "waiting_cloudsync_reupload"
+	StateWaitingRepair            = "waiting_repair"
 	StateLockNull                 = "lock_null"
 
 	ResolutionRemoteHashMismatch      = "remote_hash_mismatch"
+	ResolutionRemoteMissing           = "remote_missing"
+	ResolutionVerificationExhausted   = "verification_exhausted"
 	ResolutionNeedsCloudSyncRehydrate = "needs_cloudsync_rehydrate"
 
 	CanonicalStateAcked     = "durable_acked"
@@ -7950,10 +7953,10 @@ func (m *workerManager) completeRemoteHashMismatch(row *model.WebDAVWritebackObj
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
 		Updates(map[string]any{
-			"state":              StateCompleted,
-			"completed_at":       &now,
+			"state":              StateWaitingRepair,
+			"completed_at":       nil,
 			"retry_at":           nil,
-			"last_error":         "",
+			"last_error":         diagnostic,
 			"resolution_reason":  ResolutionRemoteHashMismatch,
 			"verify_count":       verifyCount,
 			"remote_object_id":   evidence.objectID,
@@ -7966,10 +7969,10 @@ func (m *workerManager) completeRemoteHashMismatch(row *model.WebDAVWritebackObj
 	}
 
 	final := *row
-	final.State = StateCompleted
-	final.CompletedAt = &now
+	final.State = StateWaitingRepair
+	final.CompletedAt = nil
 	final.RetryAt = nil
-	final.LastError = ""
+	final.LastError = diagnostic
 	final.ResolutionReason = ResolutionRemoteHashMismatch
 	final.VerifyCount = verifyCount
 	final.RemoteObjectID = evidence.objectID
@@ -7978,9 +7981,9 @@ func (m *workerManager) completeRemoteHashMismatch(row *model.WebDAVWritebackObj
 	final.RemoteVerifiedAt = nil
 	history := buildWritebackHistory(
 		&final,
-		HistoryResultCompleted,
+		HistoryResultRecoveryRequired,
 		ResolutionRemoteHashMismatch,
-		historyRecoveryForCompletion(row),
+		HistoryRecoveryRemoteMismatch,
 		now,
 		diagnostic,
 	)
@@ -8134,6 +8137,37 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 				})).Error
 			return
 		}
+		if row.RetryCount >= 1 {
+			reason := ResolutionVerificationExhausted
+			result := HistoryResultRecoveryRequired
+			message := "fresh provider evidence stayed divergent after the automatic repair budget; waiting for operator review"
+			if remote == nil {
+				reason = ResolutionRemoteMissing
+				result = HistoryResultRemoteMissing
+				message = "remote object is still absent after the automatic repair budget; waiting for operator review"
+			}
+			now := time.Now()
+			res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
+				Updates(map[string]any{
+					"state":             StateWaitingRepair,
+					"retry_at":          nil,
+					"verify_count":      nextCount,
+					"last_error":        message,
+					"resolution_reason": reason,
+				})
+			if res.Error == nil && res.RowsAffected > 0 {
+				final := *row
+				final.State = StateWaitingRepair
+				final.RetryAt = nil
+				final.VerifyCount = nextCount
+				final.LastError = message
+				final.ResolutionReason = reason
+				recordHistoryOutcomeBestEffort(&final, result, StateWaitingRepair, HistoryRecoveryManual, now, message)
+			}
+			return
+		}
+
 		next := time.Now().Add(retryDelay(row.RetryCount + 1))
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
@@ -8142,7 +8176,7 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 				"retry_at":     &next,
 				"retry_count":  row.RetryCount + 1,
 				"verify_count": 0,
-				"last_error":   "fresh provider evidence stayed divergent through the verification window",
+				"last_error":   "fresh provider evidence stayed divergent through the verification window; scheduling one automatic repair upload",
 			}).Error
 		return
 	}

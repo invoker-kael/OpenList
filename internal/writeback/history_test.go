@@ -163,8 +163,8 @@ func TestBuildWritebackHistoryKeepsPerFileProviderUploadTiming(t *testing.T) {
 		Size:                      4096,
 		AckTime:                   &ack,
 		DurableAt:                 &durable,
-		ProviderUploadStartedAt:    &providerStarted,
-		ProviderUploadCompletedAt:  &providerCompleted,
+		ProviderUploadStartedAt:   &providerStarted,
+		ProviderUploadCompletedAt: &providerCompleted,
 	}
 	h := buildWritebackHistory(row, HistoryResultCompleted, StateCompleted, "", finalAt, "")
 	if h == nil {

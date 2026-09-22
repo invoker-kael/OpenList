@@ -107,6 +107,62 @@ func RestartRequiredFields(before, after conf.WebDAVWritebackConfig) []string {
 	return fields
 }
 
+const (
+	RecoveryTypeNone               = "none"
+	RecoveryTypeAutomatic          = "automatic"
+	RecoveryTypeRestartRecovery    = "restart_recovery"
+	RecoveryTypeMissingSpool       = "missing_spool"
+	RecoveryTypeCloudSyncRehydrate = "cloudsync_rehydrate"
+	RecoveryTypeRemoteMismatch     = "remote_mismatch"
+	RecoveryTypeManual             = "manual"
+
+	TaskHealthHealthy        = "healthy"
+	TaskHealthStalled        = "stalled"
+	TaskHealthRetryExhausted = "retry_exhausted"
+)
+
+func RecoveryType(row *model.WebDAVWritebackObject) string {
+	if row == nil {
+		return RecoveryTypeNone
+	}
+	if row.ResolutionReason == ResolutionRemoteHashMismatch {
+		return RecoveryTypeRemoteMismatch
+	}
+	if row.State == StateWaitingRepair {
+		return RecoveryTypeManual
+	}
+	switch RecoveryLabel(row) {
+	case "needs_cloudsync_rehydrate":
+		return RecoveryTypeCloudSyncRehydrate
+	case "missing_spool":
+		return RecoveryTypeMissingSpool
+	case "restart_recovery":
+		return RecoveryTypeRestartRecovery
+	case "waiting_provider_verification":
+		return RecoveryTypeAutomatic
+	}
+	if row.RetryCount > 0 || row.VerifyCount > 0 || row.LastError != "" {
+		return RecoveryTypeAutomatic
+	}
+	return RecoveryTypeNone
+}
+
+func TaskHealth(row *model.WebDAVWritebackObject) string {
+	if row == nil {
+		return TaskHealthHealthy
+	}
+	if row.State == StateWaitingRepair {
+		return TaskHealthRetryExhausted
+	}
+	if row.State == StateWaitingCloudSyncReupload {
+		return TaskHealthStalled
+	}
+	if row.State == StateVerifying && row.RetryAt == nil {
+		return TaskHealthStalled
+	}
+	return TaskHealthHealthy
+}
+
 func RecoveryLabel(row *model.WebDAVWritebackObject) string {
 	if row == nil {
 		return ""

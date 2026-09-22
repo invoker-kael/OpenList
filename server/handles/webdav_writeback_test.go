@@ -125,8 +125,8 @@ func TestWebDAVHistoryEffectiveStatusRemoteHashMismatch(t *testing.T) {
 		UpdatedAt:        now.Add(-time.Minute),
 	}
 	status, action := webDAVHistoryEffectiveStatus(history, nil, nil, now)
-	if status != "remote_hash_mismatch" || action != "" {
-		t.Fatalf("status=%q action=%q, want remote_hash_mismatch/no action", status, action)
+	if status != webDAVStatusRemoteHashMismatch || action != webDAVActionManualCheck {
+		t.Fatalf("status=%q action=%q, want remote_hash_mismatch/manual_check", status, action)
 	}
 }
 
@@ -153,8 +153,8 @@ func TestWebDAVHistoryRehydrateCanFinishWithRemoteHashMismatch(t *testing.T) {
 		AckTime:          &ack,
 	}
 	status, action := webDAVHistoryEffectiveStatus(history, current, nil, now)
-	if status != "remote_hash_mismatch" || action != "" {
-		t.Fatalf("status=%q action=%q, want remote_hash_mismatch/no action", status, action)
+	if status != webDAVStatusRemoteHashMismatch || action != webDAVActionManualCheck {
+		t.Fatalf("status=%q action=%q, want remote_hash_mismatch/manual_check", status, action)
 	}
 }
 
@@ -205,5 +205,17 @@ func TestWebDAVHistoryRehydrateReceiveRequiresMatchingSize(t *testing.T) {
 	status, action := webDAVHistoryEffectiveStatus(history, nil, fence, now)
 	if status != webDAVStatusWaitingCloudSync || action != webDAVActionRestartCloudSync {
 		t.Fatalf("different-size receive must not correlate to old rehydrate: status=%q action=%q", status, action)
+	}
+}
+
+func TestWebDAVCurrentEffectiveStatusExplainsWaitingRepair(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		State:            "waiting_repair",
+		ResolutionReason: "remote_missing",
+		RetryCount:       1,
+	}
+	status, action := webDAVCurrentEffectiveStatus(row)
+	if status != webDAVStatusRemoteMissing || action != webDAVActionManualCheck {
+		t.Fatalf("status=%q action=%q, want remote_missing/manual_check", status, action)
 	}
 }

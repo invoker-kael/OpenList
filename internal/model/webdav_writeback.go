@@ -23,61 +23,61 @@ type WebDAVWritebackObject struct {
 	// CanonicalState is the client-visible lifecycle. State below is retained as
 	// the provider-replication lifecycle so ACKed WebDAV identity cannot flap as
 	// the backing provider moves through queued/uploading/verifying/completed.
-	CanonicalState   string     `json:"canonical_state" gorm:"size:24"`
+	CanonicalState            string     `json:"canonical_state" gorm:"size:24"`
 	AckTime                   *time.Time `json:"ack_time"`
 	DurableAt                 *time.Time `json:"durable_at"`
 	ProviderUploadStartedAt   *time.Time `json:"provider_upload_started_at"`
 	ProviderUploadCompletedAt *time.Time `json:"provider_upload_completed_at"`
 	State                     string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1;index:idx_webdav_writeback_parent_state,priority:2;index:idx_webdav_writeback_state_size,priority:1"`
-	SpoolPath        string     `json:"spool_path" gorm:"type:text"`
-	PayloadSHA1      string     `json:"payload_sha1" gorm:"size:40"`
-	RemoteObjectID   string     `json:"remote_object_id" gorm:"size:255"`
-	RemoteSHA1       string     `json:"remote_sha1" gorm:"size:40"`
-	RemoteGeneration uint64     `json:"remote_generation"`
-	RemoteVerifiedAt *time.Time `json:"remote_verified_at"`
-	MimeType         string     `json:"mime_type" gorm:"size:255"`
-	CleanupPath      string     `json:"cleanup_path" gorm:"type:text"`
-	LastError        string     `json:"last_error" gorm:"type:text"`
-	ResolutionReason string     `json:"resolution_reason" gorm:"size:64"`
-	RetryCount       int        `json:"retry_count"`
-	VerifyCount      int        `json:"verify_count"`
-	RetryAt          *time.Time `json:"retry_at" gorm:"index;index:idx_webdav_writeback_queue,priority:2;index:idx_webdav_writeback_dispatch,priority:3"`
-	CompletedAt      *time.Time `json:"completed_at" gorm:"index;index:idx_webdav_writeback_completed,priority:2"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at" gorm:"index:idx_webdav_writeback_dispatch,priority:4"`
+	SpoolPath                 string     `json:"spool_path" gorm:"type:text"`
+	PayloadSHA1               string     `json:"payload_sha1" gorm:"size:40"`
+	RemoteObjectID            string     `json:"remote_object_id" gorm:"size:255"`
+	RemoteSHA1                string     `json:"remote_sha1" gorm:"size:40"`
+	RemoteGeneration          uint64     `json:"remote_generation"`
+	RemoteVerifiedAt          *time.Time `json:"remote_verified_at"`
+	MimeType                  string     `json:"mime_type" gorm:"size:255"`
+	CleanupPath               string     `json:"cleanup_path" gorm:"type:text"`
+	LastError                 string     `json:"last_error" gorm:"type:text"`
+	ResolutionReason          string     `json:"resolution_reason" gorm:"size:64"`
+	RetryCount                int        `json:"retry_count"`
+	VerifyCount               int        `json:"verify_count"`
+	RetryAt                   *time.Time `json:"retry_at" gorm:"index;index:idx_webdav_writeback_queue,priority:2;index:idx_webdav_writeback_dispatch,priority:3"`
+	CompletedAt               *time.Time `json:"completed_at" gorm:"index;index:idx_webdav_writeback_completed,priority:2"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at" gorm:"index:idx_webdav_writeback_dispatch,priority:4"`
 }
 
 // WebDAVWritebackHistory is the append-by-generation audit plane for durable
 // writeback. It never participates in client-visible canonical decisions.
 type WebDAVWritebackHistory struct {
-	ID               uint       `json:"id" gorm:"primaryKey"`
-	PathKey          string     `json:"path_key" gorm:"size:64;uniqueIndex:idx_webdav_writeback_history_generation,priority:1"`
-	Path             string     `json:"path" gorm:"type:text"`
-	Parent           string     `json:"parent" gorm:"type:text"`
-	Name             string     `json:"name" gorm:"size:1024"`
-	Generation       uint64     `json:"generation" gorm:"uniqueIndex:idx_webdav_writeback_history_generation,priority:2"`
-	Size             int64      `json:"size"`
-	IsDir            bool       `json:"is_dir"`
-	StartedAt        *time.Time `json:"started_at"`
+	ID                        uint       `json:"id" gorm:"primaryKey"`
+	PathKey                   string     `json:"path_key" gorm:"size:64;uniqueIndex:idx_webdav_writeback_history_generation,priority:1"`
+	Path                      string     `json:"path" gorm:"type:text"`
+	Parent                    string     `json:"parent" gorm:"type:text"`
+	Name                      string     `json:"name" gorm:"size:1024"`
+	Generation                uint64     `json:"generation" gorm:"uniqueIndex:idx_webdav_writeback_history_generation,priority:2"`
+	Size                      int64      `json:"size"`
+	IsDir                     bool       `json:"is_dir"`
+	StartedAt                 *time.Time `json:"started_at"`
 	AckTime                   *time.Time `json:"ack_time"`
 	DurableAt                 *time.Time `json:"durable_at"`
 	ProviderUploadStartedAt   *time.Time `json:"provider_upload_started_at"`
 	ProviderUploadCompletedAt *time.Time `json:"provider_upload_completed_at"`
 	CompletedAt               *time.Time `json:"completed_at" gorm:"index"`
-	Result           string     `json:"result" gorm:"size:32;index"`
-	FinalState       string     `json:"final_state" gorm:"size:24"`
-	RecoveryType     string     `json:"recovery_type" gorm:"size:48;index"`
-	PayloadSHA1      string     `json:"payload_sha1" gorm:"size:40"`
-	RemoteSHA1       string     `json:"remote_sha1" gorm:"size:40"`
-	RemoteObjectID   string     `json:"remote_object_id" gorm:"size:255"`
-	RemoteVerifiedAt *time.Time `json:"remote_verified_at"`
-	RetryCount       int        `json:"retry_count"`
-	VerifyCount      int        `json:"verify_count"`
-	LastError        string     `json:"last_error" gorm:"type:text"`
-	ResolutionReason string     `json:"resolution_reason" gorm:"size:64"`
-	MimeType         string     `json:"mime_type" gorm:"size:255"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at" gorm:"index"`
+	Result                    string     `json:"result" gorm:"size:32;index"`
+	FinalState                string     `json:"final_state" gorm:"size:24"`
+	RecoveryType              string     `json:"recovery_type" gorm:"size:48;index"`
+	PayloadSHA1               string     `json:"payload_sha1" gorm:"size:40"`
+	RemoteSHA1                string     `json:"remote_sha1" gorm:"size:40"`
+	RemoteObjectID            string     `json:"remote_object_id" gorm:"size:255"`
+	RemoteVerifiedAt          *time.Time `json:"remote_verified_at"`
+	RetryCount                int        `json:"retry_count"`
+	VerifyCount               int        `json:"verify_count"`
+	LastError                 string     `json:"last_error" gorm:"type:text"`
+	ResolutionReason          string     `json:"resolution_reason" gorm:"size:64"`
+	MimeType                  string     `json:"mime_type" gorm:"size:255"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at" gorm:"index"`
 }
 
 // WebDAVWritebackReceiveFence serializes same-path PUT publication through

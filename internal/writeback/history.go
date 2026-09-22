@@ -22,6 +22,8 @@ const (
 	HistoryRecoveryRestart                    = "restart_recovery"
 	HistoryRecoveryMissingSpoolProvider       = "missing_spool_provider_recovered"
 	HistoryRecoveryCloudSyncRehydrateRequired = "cloudsync_rehydrate_required"
+	HistoryRecoveryRemoteMismatch             = "remote_mismatch"
+	HistoryRecoveryManual                     = "manual"
 )
 
 type HistoryCleanupSpec struct {
@@ -84,31 +86,31 @@ func buildWritebackHistory(row *model.WebDAVWritebackObject, result, finalState,
 		durableAt = nil
 	}
 	return &model.WebDAVWritebackHistory{
-		PathKey:          key,
-		Path:             row.Path,
-		Parent:           row.Parent,
-		Name:             row.Name,
-		Generation:       row.Generation,
-		Size:             row.Size,
-		IsDir:            row.IsDir,
-		StartedAt:        startedAt,
-		AckTime:          ackTime,
+		PathKey:                   key,
+		Path:                      row.Path,
+		Parent:                    row.Parent,
+		Name:                      row.Name,
+		Generation:                row.Generation,
+		Size:                      row.Size,
+		IsDir:                     row.IsDir,
+		StartedAt:                 startedAt,
+		AckTime:                   ackTime,
 		DurableAt:                 durableAt,
 		ProviderUploadStartedAt:   cloneHistoryTime(row.ProviderUploadStartedAt),
 		ProviderUploadCompletedAt: cloneHistoryTime(row.ProviderUploadCompletedAt),
 		CompletedAt:               completedAt,
-		Result:           result,
-		FinalState:       finalState,
-		RecoveryType:     recovery,
-		PayloadSHA1:      row.PayloadSHA1,
-		RemoteSHA1:       row.RemoteSHA1,
-		RemoteObjectID:   row.RemoteObjectID,
-		RemoteVerifiedAt: cloneHistoryTime(row.RemoteVerifiedAt),
-		RetryCount:       row.RetryCount,
-		VerifyCount:      row.VerifyCount,
-		LastError:        lastError,
-		ResolutionReason: row.ResolutionReason,
-		MimeType:         row.MimeType,
+		Result:                    result,
+		FinalState:                finalState,
+		RecoveryType:              recovery,
+		PayloadSHA1:               row.PayloadSHA1,
+		RemoteSHA1:                row.RemoteSHA1,
+		RemoteObjectID:            row.RemoteObjectID,
+		RemoteVerifiedAt:          cloneHistoryTime(row.RemoteVerifiedAt),
+		RetryCount:                row.RetryCount,
+		VerifyCount:               row.VerifyCount,
+		LastError:                 lastError,
+		ResolutionReason:          row.ResolutionReason,
+		MimeType:                  row.MimeType,
 	}
 }
 

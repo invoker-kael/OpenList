@@ -101,7 +101,9 @@ type webDAVWritebackMonitorRow struct {
 	ClientState      string     `json:"client_state"`
 	ProviderState    string     `json:"provider_state"`
 	EffectiveStatus  string     `json:"effective_status"`
-	OperatorAction   string     `json:"operator_action,omitempty"`
+	OperatorAction   string     `json:"operator_action"`
+	RecoveryType     string     `json:"recovery_type"`
+	TaskHealth       string     `json:"task_health"`
 	Generation       uint64     `json:"generation"`
 	RemoteGeneration uint64     `json:"remote_generation"`
 	ETag             string     `json:"etag"`
@@ -351,31 +353,67 @@ func webDAVMonitorCanonicalState(row *model.WebDAVWritebackObject) string {
 }
 
 const (
-	webDAVStatusWaitingCloudSync  = "waiting_cloudsync_reupload"
-	webDAVStatusReuploadReceiving = "reupload_receiving"
-	webDAVStatusReuploadReceived  = "reupload_received"
-	webDAVStatusReuploadUploading = "reupload_uploading"
-	webDAVStatusReuploadVerifying = "reupload_verifying"
-	webDAVStatusRecovered         = "recovered"
-	webDAVStatusAutomaticRecovery = "automatic_recovery"
+	webDAVStatusReceiving              = "receiving"
+	webDAVStatusDurableAcked           = "durable_acked"
+	webDAVStatusRemoteUploading        = "remote_uploading"
+	webDAVStatusRemoteVerifying        = "remote_verifying"
+	webDAVStatusCompleted              = "completed"
+	webDAVStatusRemoteMissing          = "remote_missing"
+	webDAVStatusRemoteHashMismatch     = "remote_hash_mismatch"
+	webDAVStatusNeedsCloudSyncReupload = "needs_cloudsync_reupload"
+	webDAVStatusWaitingRepair          = "waiting_repair"
+	webDAVStatusWaitingCloudSync       = webDAVStatusNeedsCloudSyncReupload
+	webDAVStatusReuploadReceiving      = "reupload_receiving"
+	webDAVStatusReuploadReceived       = "reupload_received"
+	webDAVStatusReuploadUploading      = "reupload_uploading"
+	webDAVStatusReuploadVerifying      = "reupload_verifying"
+	webDAVStatusRecovered              = "recovered"
+	webDAVStatusAutomaticRecovery      = "automatic_recovery"
 
-	webDAVActionRestartCloudSync = "restart_cloudsync"
+	webDAVActionNone                  = "none"
+	webDAVActionWait                  = "wait"
+	webDAVActionRetryingAutomatically = "retrying_automatically"
+	webDAVActionRestartCloudSync      = "restart_cloudsync_required"
+	webDAVActionManualCheck           = "manual_check_required"
 )
 
 func webDAVCurrentEffectiveStatus(row *model.WebDAVWritebackObject) (string, string) {
 	if row == nil {
-		return "", ""
+		return "", webDAVActionNone
 	}
-	if row.ResolutionReason == writeback.ResolutionRemoteHashMismatch {
-		return writeback.ResolutionRemoteHashMismatch, ""
+	switch row.ResolutionReason {
+	case writeback.ResolutionRemoteHashMismatch:
+		return webDAVStatusRemoteHashMismatch, webDAVActionManualCheck
+	case writeback.ResolutionRemoteMissing:
+		return webDAVStatusRemoteMissing, webDAVActionManualCheck
+	}
+	if row.State == writeback.StateWaitingRepair {
+		return webDAVStatusWaitingRepair, webDAVActionManualCheck
 	}
 	switch writeback.RecoveryLabel(row) {
 	case "needs_cloudsync_rehydrate":
-		return webDAVStatusWaitingCloudSync, webDAVActionRestartCloudSync
+		return webDAVStatusNeedsCloudSyncReupload, webDAVActionRestartCloudSync
 	case "missing_spool", "restart_recovery", "waiting_provider_verification":
-		return webDAVStatusAutomaticRecovery, ""
+		return webDAVStatusAutomaticRecovery, webDAVActionRetryingAutomatically
 	}
-	return row.State, ""
+	switch row.State {
+	case writeback.StateQueued:
+		if row.RetryCount > 0 || row.LastError != "" {
+			return webDAVStatusDurableAcked, webDAVActionRetryingAutomatically
+		}
+		return webDAVStatusDurableAcked, webDAVActionWait
+	case writeback.StateUploading:
+		return webDAVStatusRemoteUploading, webDAVActionWait
+	case writeback.StateVerifying:
+		if row.VerifyCount > 0 || row.LastError != "" {
+			return webDAVStatusRemoteVerifying, webDAVActionRetryingAutomatically
+		}
+		return webDAVStatusRemoteVerifying, webDAVActionWait
+	case writeback.StateCompleted:
+		return webDAVStatusCompleted, webDAVActionNone
+	default:
+		return row.State, webDAVActionNone
+	}
 }
 
 func webDAVHistoryCurrentIsNewer(history *model.WebDAVWritebackHistory, current *model.WebDAVWritebackObject) bool {
@@ -448,7 +486,7 @@ func webDAVHistoryEffectiveStatus(history *model.WebDAVWritebackHistory, current
 			switch current.State {
 			case writeback.StateCompleted:
 				if current.ResolutionReason == writeback.ResolutionRemoteHashMismatch {
-					return writeback.ResolutionRemoteHashMismatch, ""
+					return webDAVStatusRemoteHashMismatch, webDAVActionManualCheck
 				}
 				return webDAVStatusRecovered, ""
 			case writeback.StateUploading:
@@ -507,7 +545,10 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 				Size:            fence.LatestExpectedSize,
 				ClientState:     "receiving",
 				ProviderState:   "not_started",
-				EffectiveStatus: "receiving",
+				EffectiveStatus: webDAVStatusReceiving,
+				OperatorAction:  webDAVActionWait,
+				RecoveryType:    writeback.RecoveryType(nil),
+				TaskHealth:      writeback.TaskHealth(nil),
 				ActiveReceivers: fence.ActiveReceivers,
 				StartedAt:       fence.LatestStartedAt,
 				CreatedAt:       fence.CreatedAt,
@@ -557,6 +598,8 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 				ProviderState:    row.State,
 				EffectiveStatus:  effectiveStatus,
 				OperatorAction:   operatorAction,
+				RecoveryType:     writeback.RecoveryType(row),
+				TaskHealth:       writeback.TaskHealth(row),
 				Generation:       row.Generation,
 				RemoteGeneration: row.RemoteGeneration,
 				ETag:             row.ETag,
