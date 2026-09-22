@@ -2,6 +2,8 @@
 
 This fork adds a WebDAV write-back path intended for **one-way Synology Cloud Sync uploads**, including Cloud Sync client-side encrypted jobs.
 
+> **Operations / 运维说明:** See [Cloud Sync Write-back Operations Guide / Cloud Sync 写回运维指南](./cloudsync-writeback-operations.md) for the complete bilingual state/action matrix, recovery procedure, and the manual Cloud Sync rehydrate workflow.
+
 ## Design
 
 Cloud Sync is treated as the authoritative source. The opaque object received by WebDAV is committed to a local spool before the HTTP PUT succeeds. A persistent MySQL/GORM row then provides canonical WebDAV metadata while a background worker uploads the payload through the normal OpenList storage driver.
@@ -41,7 +43,13 @@ After the complete PUT body is fsynced and atomically installed in the spool, th
 
 Failed remote uploads retry in the background. An interrupted `UPLOADING` row is deliberately re-queued from the durable spool after restart. This can duplicate a provider upload after a crash, but it avoids treating an older same-sized encrypted object as proof that the newest generation arrived. The remote write contract is therefore **at-least-once across crashes**, with the local canonical generation remaining authoritative to Cloud Sync.
 
-## MySQL
+## Database requirement
+
+> **SQLite is not supported for WebDAV durable write-back.** Use a server database with transactional row-level locking. **MySQL is the validated and recommended backend. PostgreSQL is the other supported OpenList server-database target, but deployments should run the write-back test suite before production use.** Do not enable this feature on the default SQLite database even if OpenList itself starts successfully.
+
+The reason is correctness rather than raw performance: receive fences, admission reservations, generation publication, provider-operation recovery, and multi-worker/multi-instance coordination rely on transactional locking semantics that are not equivalent to SQLite's process/file locking model.
+
+### MySQL
 
 The write-back queue and canonical metadata use the normal OpenList GORM database. With a MySQL deployment no SQLite side database is created.
 
