@@ -1753,6 +1753,70 @@ func TestCloudSyncPlaceholderSettleDelay(t *testing.T) {
 	}
 }
 
+func TestInspectDurableLocalPayload(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "payload.data")
+	if err := os.WriteFile(tmp, []byte("payload"), 0o600); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		row  *model.WebDAVWritebackObject
+		want durablePayloadAvailability
+	}{
+		{
+			name: "persisted spool survives restart",
+			row: &model.WebDAVWritebackObject{
+				Size:           7,
+				SpoolPath:      tmp,
+				CanonicalState: CanonicalStateAcked,
+				State:          StateQueued,
+			},
+			want: durablePayloadAvailable,
+		},
+		{
+			name: "missing persisted spool needs recovery",
+			row: &model.WebDAVWritebackObject{
+				Size:           7,
+				SpoolPath:      filepath.Join(t.TempDir(), "missing.data"),
+				CanonicalState: CanonicalStateAcked,
+				State:          StateQueued,
+			},
+			want: durablePayloadMissing,
+		},
+		{
+			name: "nonzero ack without spool needs recovery",
+			row: &model.WebDAVWritebackObject{
+				Size:           7,
+				CanonicalState: CanonicalStateAcked,
+				State:          StateVerifying,
+			},
+			want: durablePayloadMissing,
+		},
+		{
+			name: "zero byte ack is reconstructible",
+			row: &model.WebDAVWritebackObject{
+				Size:           0,
+				CanonicalState: CanonicalStateAcked,
+				State:          StateQueued,
+			},
+			want: durablePayloadAvailable,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := inspectDurableLocalPayload(tt.row)
+			if err != nil {
+				t.Fatalf("inspectDurableLocalPayload returned error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("availability=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestZeroByteCanonicalPayloadNeedsNoSpoolFile(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
 		Size:           0,

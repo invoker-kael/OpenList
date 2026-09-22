@@ -326,7 +326,7 @@ th{position:sticky;top:0;background:#f8fafc;z-index:1;color:#475467}
     <div class="card"><div class="label">Durable backlog</div><div class="value" id="backlog">-</div></div>
     <div class="card"><div class="label">Workers</div><div class="value" id="workers">-</div></div>
   </div>
-  <div class="note">Receiving shows active WebDAV request admission. After durable ACK, provider state moves queued → uploading → verifying → completed. Byte-level provider progress is not fabricated; this page shows authoritative lifecycle state from MySQL.</div>
+  <div class="note">Receiving shows active WebDAV request admission. After durable ACK, provider state moves queued → uploading → verifying → completed. On restart, interrupted uploads verify the provider first; if the persistent spool still exists they can re-upload from local disk, while a confirmed missing spool/provider generation is exposed back to Cloud Sync for re-PUT. Byte-level provider progress is not fabricated; this page shows authoritative lifecycle state from MySQL.</div>
   <div class="table-wrap">
     <table>
       <thead><tr>

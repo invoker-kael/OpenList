@@ -181,15 +181,37 @@ func canonicalContentSHA1(row *model.WebDAVWritebackObject) string {
 	return ""
 }
 
-func durableLocalPayloadAvailable(row *model.WebDAVWritebackObject) bool {
+type durablePayloadAvailability uint8
+
+const (
+	durablePayloadUnavailable durablePayloadAvailability = iota
+	durablePayloadAvailable
+	durablePayloadMissing
+)
+
+func inspectDurableLocalPayload(row *model.WebDAVWritebackObject) (durablePayloadAvailability, error) {
 	if row == nil || row.IsDir || canonicalDeleted(row) {
-		return false
+		return durablePayloadUnavailable, nil
 	}
 	if row.SpoolPath == "" {
-		return row.Size == 0 && canonicalAcked(row)
+		if row.Size == 0 && canonicalAcked(row) {
+			return durablePayloadAvailable, nil
+		}
+		return durablePayloadMissing, nil
 	}
 	_, err := os.Stat(row.SpoolPath)
-	return err == nil
+	if err == nil {
+		return durablePayloadAvailable, nil
+	}
+	if os.IsNotExist(err) {
+		return durablePayloadMissing, nil
+	}
+	return durablePayloadUnavailable, err
+}
+
+func durableLocalPayloadAvailable(row *model.WebDAVWritebackObject) bool {
+	availability, err := inspectDurableLocalPayload(row)
+	return err == nil && availability == durablePayloadAvailable
 }
 
 func canCoalesceDuplicatePut(row *model.WebDAVWritebackObject, size int64, payloadSHA1 string) bool {
@@ -5743,6 +5765,81 @@ func Stop() {
 	providerParentSnapshots.clear()
 }
 
+const missingDurablePayloadRecoveryMessage = "durable spool is missing after restart; verifying provider before Cloud Sync repair"
+
+func markMissingDurablePayloadForVerification(row *model.WebDAVWritebackObject, now time.Time, message string) error {
+	if row == nil {
+		return nil
+	}
+	if message == "" {
+		message = missingDurablePayloadRecoveryMessage
+	}
+	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state IN ? AND cleanup_path = ''",
+			row.ID, row.Generation, []string{StateQueued, StateVerifying}).
+		Updates(map[string]any{
+			"state":        StateVerifying,
+			"retry_at":     &now,
+			"verify_count": 0,
+			"last_error":   message,
+		}).Error
+}
+
+func (m *workerManager) recoverMissingDurablePayloads(now time.Time) error {
+	var rows []model.WebDAVWritebackObject
+	if err := db.GetDb().
+		Select("id", "generation", "path", "is_dir", "size", "spool_path", "cleanup_path", "canonical_state", "state").
+		Where("is_dir = ? AND cleanup_path = '' AND state IN ?", false, []string{StateQueued, StateVerifying}).
+		Where("canonical_state = ?", CanonicalStateAcked).
+		Find(&rows).Error; err != nil {
+		return err
+	}
+
+	for i := range rows {
+		row := &rows[i]
+		availability, err := inspectDurableLocalPayload(row)
+		if err != nil {
+			log.Warnf("write-back restart spool audit could not inspect %s: %v", row.Path, err)
+			continue
+		}
+		if availability != durablePayloadMissing {
+			continue
+		}
+		if err := markMissingDurablePayloadForVerification(row, now, "durable spool is missing after restart; checking provider before exposing loss to Cloud Sync"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func forceCloudSyncRepairForMissingPayload(row *model.WebDAVWritebackObject, currentState, reason string) bool {
+	if row == nil || row.IsDir || row.CleanupPath != "" {
+		return false
+	}
+	now := time.Now()
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ? AND cleanup_path = ''", row.ID, row.Generation, currentState).
+		Updates(map[string]any{
+			"canonical_state":    CanonicalStateDeleted,
+			"state":              StateDeleted,
+			"spool_path":         "",
+			"retry_at":           &now,
+			"last_error":         reason,
+			"retry_count":        0,
+			"verify_count":       0,
+			"completed_at":       nil,
+			"remote_object_id":   "",
+			"remote_sha1":        "",
+			"remote_generation":  0,
+			"remote_verified_at": nil,
+		})
+	if res.Error != nil || res.RowsAffected == 0 {
+		return false
+	}
+	wake()
+	return true
+}
+
 func (m *workerManager) recoverInterrupted() error {
 	if err := db.GetDb().Where("lease_until <= ?", time.Now()).
 		Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
@@ -5810,7 +5907,7 @@ func (m *workerManager) recoverInterrupted() error {
 	// evidence and can recover an already-applied provider mutation safely.
 	// Treating them as ordinary uploads would add a wrong verification phase.
 	now := time.Now()
-	return db.GetDb().Transaction(func(tx *gorm.DB) error {
+	if err := db.GetDb().Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&model.WebDAVWritebackObject{}).
 			Where("state IN ? AND spool_path = '' AND cleanup_path <> ''", []string{StateUploading, StateVerifying}).
 			Updates(map[string]any{
@@ -5874,7 +5971,15 @@ func (m *workerManager) recoverInterrupted() error {
 				"verify_count": 0,
 				"last_error":   "resuming remote verification after interrupted upload",
 			}).Error
-	})
+	}); err != nil {
+		return err
+	}
+
+	// A normal restart should continue from the persistent spool. If the spool
+	// disappeared unexpectedly, never keep advertising the ACK forever: verify
+	// the provider first, then either converge remotely or expose a tombstone so
+	// Cloud Sync can re-PUT the source.
+	return m.recoverMissingDurablePayloads(now)
 }
 
 const (
@@ -7180,7 +7285,10 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		return
 	}
 	if !available {
-		m.fail(row, errors.New("durable local payload is missing"))
+		now := time.Now()
+		if err := markMissingDurablePayloadForVerification(row, now, "durable local payload is missing; verifying provider before Cloud Sync repair"); err != nil {
+			m.fail(row, err)
+		}
 		return
 	}
 	releaseActiveSpool := func() {}
@@ -7592,6 +7700,25 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 	attempts := verificationAttemptsFor(row, requireHash)
 	nextCount, retryUpload := advanceRemoteVerification(verification, row.VerifyCount, attempts)
 	if retryUpload {
+		availability, payloadErr := inspectDurableLocalPayload(row)
+		if payloadErr != nil {
+			next := time.Now().Add(remoteVerificationInconclusiveDelay())
+			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
+				Updates(verifyingUpdates(currentState, map[string]any{
+					"retry_at":   &next,
+					"last_error": fmt.Sprintf("cannot inspect durable spool during recovery: %v", payloadErr),
+				})).Error
+			return
+		}
+		if availability == durablePayloadMissing && row.CleanupPath == "" {
+			forceCloudSyncRepairForMissingPayload(
+				row,
+				currentState,
+				"durable spool is missing and fresh provider evidence stayed divergent; exposing the loss so Cloud Sync can re-upload",
+			)
+			return
+		}
 		if suppressRepeatedLargeProviderRepair(row, requireHash) {
 			next := time.Now().Add(repeatedLargeProviderVerifyDelay(row))
 			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
