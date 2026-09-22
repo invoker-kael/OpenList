@@ -2,7 +2,7 @@
 
 This fork adds a WebDAV write-back path intended for **one-way Synology Cloud Sync uploads**, including Cloud Sync client-side encrypted jobs.
 
-> **Operations / 运维说明:** See [Cloud Sync Write-back Operations Guide / Cloud Sync 写回运维指南](./cloudsync-writeback-operations.md) for the complete bilingual state/action matrix, recovery procedure, and the manual Cloud Sync rehydrate workflow.
+> **Operations:** See the [English operations guide](./cloudsync-writeback-operations.md) for the state/action matrix, recovery procedures, and Cloud Sync rehydrate workflow. A separate [Chinese operations guide](./cloudsync-writeback-operations.zh-CN.md) is also available.
 
 ## Design
 
