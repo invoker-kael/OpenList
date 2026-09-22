@@ -27,7 +27,7 @@ type AdminRuntimeStats struct {
 	ReceivingReservationBytes   uint64 `json:"receiving_reservation_bytes"`
 	MissingSpool                int64  `json:"missing_spool"`
 	RestartRecovery             int64  `json:"restart_recovery"`
-	WaitingProviderVerification int64 `json:"waiting_provider_verification"`
+	WaitingProviderVerification int64  `json:"waiting_provider_verification"`
 	NeedsCloudSyncRehydrate     int64  `json:"needs_cloudsync_rehydrate"`
 }
 
