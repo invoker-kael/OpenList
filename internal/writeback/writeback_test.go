@@ -3951,6 +3951,23 @@ func TestShouldAutomaticallyRepairHashMismatchOnlyOnce(t *testing.T) {
 	}
 }
 
+func TestWaitingCloudSyncReuploadIsTerminalForProviderWorkers(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		State:                     StateWaitingCloudSyncReupload,
+		CanonicalState:            CanonicalStateAcked,
+		CloudSyncReuploadRequired: true,
+		ResolutionReason:          ResolutionRemoteHashMismatch,
+		RetryCount:                1,
+	}
+	if !waitingCloudSyncReupload(row) {
+		t.Fatal("final provider recovery failure must wait for a fresh Cloud Sync PUT")
+	}
+	if pendingBacklogState(row.State) {
+		t.Fatal("Cloud Sync re-upload wait state must not remain in the provider backlog")
+	}
+}
+
+
 func TestCompletedRemoteEvidenceKindChangeRestartsConfirmation(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
 		VerifyCount:            2,

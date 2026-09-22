@@ -199,7 +199,7 @@ fresh provider verification is conclusively missing/divergent
 OpenList has no payload left to upload by itself
         |
         v
-canonical state is exposed as deleted
+canonical Durable ACK remains visible while the row explicitly waits for a fresh Cloud Sync generation
         |
         v
 needs_cloudsync_rehydrate
@@ -226,7 +226,7 @@ A successful rehydrate should broadly look like:
 ```text
 PROPFIND parent (Depth: 1)
     |
-    +--> affected object is absent from the canonical WebDAV view
+    +--> affected object remains in the canonical WebDAV view with an explicit Cloud Sync re-upload recovery state
     |
     v
 Cloud Sync detects a local-only file
@@ -378,22 +378,26 @@ Let OpenList retry/verify automatically --+
 
 - Cloud Sync owns the source copy.
 - OpenList owns durable acceptance, provider upload, retry, and verification.
-- MySQL is the validated and recommended database.
-- PostgreSQL is the other supported server-database target; validate the exact deployment before production use.
+- Durable Write-back is MySQL-only in this fork.
 - SQLite is unsupported for Durable Write-back.
+- Other database backends are outside the supported Durable Write-back path.
 - Do not restart Cloud Sync for ordinary provider errors.
 - Do not restart Cloud Sync for `missing_spool` while OpenList is still verifying the provider.
 - Restart the affected Cloud Sync task only for `needs_cloudsync_rehydrate`, by fully stopping/disabling and then starting/enabling the same task to force a fresh scan.
 
 
-## Completed with remote hash difference
+## Remote hash difference and final recovery
 
-`remote_hash_mismatch` is a terminal operator-facing result, not a retry loop and not a Cloud Sync re-upload request.
+`remote_hash_mismatch` is a confirmed provider-divergence cause, not a manual retransmit state.
 
-OpenList enters this result only after up to three fresh provider observations keep showing the same-size object with stable provider identity/hash evidence while both canonical and provider SHA-1 values are present and remain different. If the durable local spool is still available, OpenList keeps the canonical Durable ACK, stops automatic provider re-uploads, preserves the local spool, records both SHA-1 values and the provider object ID for diagnostics, and marks the generation completed with `resolution_reason=remote_hash_mismatch`.
+OpenList requires stable fresh provider evidence before accepting the mismatch. If the durable spool is still available, OpenList performs at most one automatic provider repair upload and verifies again. A fresh provider pre-check can skip that upload if the provider has already converged.
 
-The spool is intentionally not eligible for verified-completed cache release because the provider hash was not accepted as canonical evidence. This preserves a durable local copy for investigation.
+If the same generation still cannot converge after that single automatic repair, OpenList stops provider retry loops and transitions the item to `waiting_cloudsync_reupload` with `cloud_sync_reupload_required=true`. The root cause remains `remote_hash_mismatch` for diagnostics, but the operator action is only:
 
-Do not restart Cloud Sync for this result. A Cloud Sync task restart is required only for the structured `needs_cloudsync_rehydrate` path, where the durable payload is unavailable and OpenList has deliberately exposed the canonical loss for a fresh reconciliation scan.
+1. fully stop/disable the affected Cloud Sync task;
+2. start/enable the same task;
+3. allow a fresh reconciliation scan;
+4. confirm Cloud Sync issues a new PUT for the affected path;
+5. verify the new generation reaches `completed`.
 
-Rehydrate correlation uses the recovery History row plus current path/generation or ACK timing, receive-fence timing/size, and the durable payload SHA-1 when available. A later unrelated PUT at the same path with different content does not close the old rehydrate incident.
+There is no manual re-upload action in OpenList. When OpenList can no longer safely converge the provider replica, Cloud Sync is the source-of-truth recovery path.

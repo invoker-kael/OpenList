@@ -6143,57 +6143,32 @@ func (m *workerManager) recoverMissingDurablePayloads(now time.Time) error {
 }
 
 func forceCloudSyncRepairForMissingPayload(row *model.WebDAVWritebackObject, currentState, reason string) bool {
-	if row == nil || row.IsDir || row.CleanupPath != "" {
-		return false
-	}
-	now := time.Now()
-	recoveryStartedAt := row.RecoveryStartedAt
-	if recoveryStartedAt == nil {
-		recoveryStartedAt = &now
-	}
-	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("id = ? AND generation = ? AND state = ? AND cleanup_path = ''", row.ID, row.Generation, currentState).
+	return requireCloudSyncReupload(
+		row,
+		currentState,
+		ResolutionNeedsCloudSyncRehydrate,
+		reason,
+		0,
+		true,
+	)
+}
+func (m *workerManager) recoverInterrupted() error {
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("state = ? AND resolution_reason IN ?", StateWaitingRepair, []string{
+			ResolutionRemoteHashMismatch,
+			ResolutionRemoteMissing,
+			ResolutionVerificationExhausted,
+		}).
 		Updates(map[string]any{
 			"canonical_state":              CanonicalStateAcked,
 			"state":                        StateWaitingCloudSyncReupload,
 			"cloud_sync_reupload_required": true,
-			"recovery_started_at":          recoveryStartedAt,
-			"spool_path":                   "",
 			"retry_at":                     nil,
-			"last_error":                   reason,
-			"resolution_reason":            ResolutionNeedsCloudSyncRehydrate,
-			"retry_count":                  0,
-			"verify_count":                 0,
-			"completed_at":                 nil,
-			"remote_generation":            0,
-			"remote_verified_at":           nil,
-		})
-	if res.Error != nil || res.RowsAffected == 0 {
-		return false
+			"recovery_started_at":          gorm.Expr("COALESCE(recovery_started_at, updated_at, created_at)"),
+		}).Error; err != nil {
+		return err
 	}
-	row.CanonicalState = CanonicalStateAcked
-	row.State = StateWaitingCloudSyncReupload
-	row.CloudSyncReuploadRequired = true
-	row.RecoveryStartedAt = recoveryStartedAt
-	row.SpoolPath = ""
-	row.RetryAt = nil
-	row.CompletedAt = nil
-	row.RemoteGeneration = 0
-	row.RemoteVerifiedAt = nil
-	row.ResolutionReason = ResolutionNeedsCloudSyncRehydrate
-	row.LastError = reason
-	recordHistoryOutcomeBestEffort(
-		row,
-		HistoryResultRecoveryRequired,
-		StateWaitingCloudSyncReupload,
-		HistoryRecoveryCloudSyncRehydrateRequired,
-		now,
-		reason,
-	)
-	return true
-}
 
-func (m *workerManager) recoverInterrupted() error {
 	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("state = ? AND canonical_state = ? AND (resolution_reason = ? OR LOWER(last_error) LIKE ?)",
 			StateDeleted, CanonicalStateDeleted, ResolutionNeedsCloudSyncRehydrate, "%cloud sync can re-upload%").
@@ -7967,27 +7942,6 @@ func verificationAttemptsFor(row *model.WebDAVWritebackObject, requireHash bool)
 	return max(attempts, minAttempts)
 }
 
-func suppressRepeatedLargeProviderRepair(row *model.WebDAVWritebackObject, requireHash bool) bool {
-	return row != nil &&
-		requireHash &&
-		row.Size > open115MultipartChunkSize &&
-		row.RetryCount >= 1
-}
-
-func repeatedLargeProviderVerifyDelay(row *model.WebDAVWritebackObject) time.Duration {
-	delay := retryDelay(1)
-	if row != nil {
-		delay = retryDelay(row.RetryCount + 1)
-	}
-	if conf.Conf != nil {
-		floor := time.Duration(max(1, conf.Conf.WebDAVWriteback.RetryMaxSeconds)) * time.Second
-		if delay < floor {
-			delay = floor
-		}
-	}
-	return delay
-}
-
 func remoteVerificationInconclusiveDelay() time.Duration {
 	verifySeconds := 1
 	retrySeconds := 1
@@ -8203,60 +8157,71 @@ func shouldAutomaticallyRepairHashMismatch(row *model.WebDAVWritebackObject, ava
 	return row != nil && availability == durablePayloadAvailable && row.RetryCount < 1
 }
 
-func (m *workerManager) completeRemoteHashMismatch(row *model.WebDAVWritebackObject, remote model.Obj, currentState string, verifyCount int, diagnostic string) bool {
-	if row == nil || remote == nil {
+func requireCloudSyncReupload(row *model.WebDAVWritebackObject, currentState, resolution, reason string, verifyCount int, clearSpool bool) bool {
+	if row == nil || row.IsDir || row.CleanupPath != "" {
 		return false
 	}
 	now := time.Now()
-	evidence := captureRemoteVerification(row, remote, now)
+	recoveryStartedAt := row.RecoveryStartedAt
+	if recoveryStartedAt == nil {
+		recoveryStartedAt = &now
+	}
+	oldSpool := row.SpoolPath
+	updates := map[string]any{
+		"canonical_state":              CanonicalStateAcked,
+		"state":                        StateWaitingCloudSyncReupload,
+		"cloud_sync_reupload_required": true,
+		"recovery_started_at":          recoveryStartedAt,
+		"retry_at":                     nil,
+		"last_error":                   reason,
+		"resolution_reason":            resolution,
+		"verify_count":                 verifyCount,
+		"completed_at":                 nil,
+		"remote_generation":            0,
+		"remote_verified_at":           nil,
+	}
+	if clearSpool {
+		updates["spool_path"] = ""
+	}
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
-		Updates(map[string]any{
-			"state":              StateWaitingRepair,
-			"completed_at":       nil,
-			"retry_at":           nil,
-			"last_error":         diagnostic,
-			"resolution_reason":  ResolutionRemoteHashMismatch,
-			"verify_count":       verifyCount,
-			"remote_object_id":   evidence.objectID,
-			"remote_sha1":        evidence.sha1,
-			"remote_generation":  0,
-			"remote_verified_at": nil,
-		})
+		Where("id = ? AND generation = ? AND state = ? AND cleanup_path = ''", row.ID, row.Generation, currentState).
+		Updates(updates)
 	if res.Error != nil || res.RowsAffected == 0 {
 		return false
 	}
 
 	final := *row
-	final.State = StateWaitingRepair
-	final.CompletedAt = nil
+	final.CanonicalState = CanonicalStateAcked
+	final.State = StateWaitingCloudSyncReupload
+	final.CloudSyncReuploadRequired = true
+	final.RecoveryStartedAt = recoveryStartedAt
 	final.RetryAt = nil
-	final.LastError = diagnostic
-	final.ResolutionReason = ResolutionRemoteHashMismatch
+	final.LastError = reason
+	final.ResolutionReason = resolution
 	final.VerifyCount = verifyCount
-	final.RemoteObjectID = evidence.objectID
-	final.RemoteSHA1 = evidence.sha1
+	final.CompletedAt = nil
 	final.RemoteGeneration = 0
 	final.RemoteVerifiedAt = nil
-	history := buildWritebackHistory(
+	if clearSpool {
+		final.SpoolPath = ""
+	}
+	result := HistoryResultRecoveryRequired
+	if resolution == ResolutionRemoteMissing {
+		result = HistoryResultRemoteMissing
+	}
+	recordHistoryOutcomeBestEffort(
 		&final,
-		HistoryResultRecoveryRequired,
-		ResolutionRemoteHashMismatch,
-		HistoryRecoveryRemoteMismatch,
+		result,
+		StateWaitingCloudSyncReupload,
+		HistoryRecoveryCloudSyncRehydrateRequired,
 		now,
-		diagnostic,
+		reason,
 	)
-	recordWritebackHistoryBestEffort(history)
-
-	if row.CleanupPath != "" && row.CleanupPath != row.Path {
-		_ = fs.Remove(m.ctx, row.CleanupPath)
-		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-			Where("id = ? AND generation = ?", row.ID, row.Generation).
-			Update("cleanup_path", "").Error
+	if clearSpool && oldSpool != "" && !spoolIsActive(oldSpool) {
+		removeSpoolIfUnreferenced(oldSpool)
 	}
 	return true
 }
-
 func verifyingUpdates(currentState string, updates map[string]any) map[string]any {
 	if currentState != StateVerifying {
 		updates["state"] = StateVerifying
@@ -8359,7 +8324,15 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 					Updates(mergeUpdateMaps(updates, evidenceUpdates)).Error
 				return
 			}
-			if availability == durablePayloadAvailable && m.completeRemoteHashMismatch(row, remote, currentState, nextCount, diagnostic) {
+			if availability == durablePayloadAvailable && row.RetryCount >= 1 {
+				requireCloudSyncReupload(
+					row,
+					currentState,
+					ResolutionRemoteHashMismatch,
+					diagnostic+"; one automatic provider repair upload did not converge; restart/rescan Cloud Sync to publish a fresh generation",
+					nextCount,
+					true,
+				)
 				return
 			}
 			next := time.Now().Add(remoteVerificationInconclusiveDelay())
@@ -8411,52 +8384,14 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 			)
 			return
 		}
-		if suppressRepeatedLargeProviderRepair(row, requireHash) {
-			next := time.Now().Add(repeatedLargeProviderVerifyDelay(row))
-			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
-				Updates(verifyingUpdates(currentState, map[string]any{
-					"retry_at":     &next,
-					"verify_count": max(0, attempts-1),
-					"last_error":   "115 multipart upload remains divergent after one repair upload; preserving durable spool and continuing low-frequency verification without another automatic reupload",
-				})).Error
-			return
-		}
 		if row.RetryCount >= 1 {
 			reason := ResolutionVerificationExhausted
-			result := HistoryResultRecoveryRequired
-			message := "fresh provider evidence stayed divergent after the automatic repair budget; waiting for operator review"
+			message := "fresh provider evidence stayed divergent after one automatic repair upload; restart/rescan Cloud Sync to publish a fresh generation"
 			if remote == nil {
 				reason = ResolutionRemoteMissing
-				result = HistoryResultRemoteMissing
-				message = "remote object is still absent after the automatic repair budget; waiting for operator review"
+				message = "remote object is still absent after one automatic repair upload; restart/rescan Cloud Sync to publish a fresh generation"
 			}
-			now := time.Now()
-			evidenceResult := "divergent"
-			if remote == nil {
-				evidenceResult = ResolutionRemoteMissing
-			}
-			updates := map[string]any{
-				"state":               StateWaitingRepair,
-				"retry_at":            nil,
-				"verify_count":        nextCount,
-				"last_error":          message,
-				"resolution_reason":   reason,
-				"recovery_started_at": gorm.Expr("COALESCE(recovery_started_at, ?)", now),
-			}
-			updates = mergeUpdateMaps(updates, applyProviderEvidence(row, now, evidenceResult))
-			res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
-				Updates(updates)
-			if res.Error == nil && res.RowsAffected > 0 {
-				final := *row
-				final.State = StateWaitingRepair
-				final.RetryAt = nil
-				final.VerifyCount = nextCount
-				final.LastError = message
-				final.ResolutionReason = reason
-				recordHistoryOutcomeBestEffort(&final, result, StateWaitingRepair, HistoryRecoveryManual, now, message)
-			}
+			requireCloudSyncReupload(row, currentState, reason, message, nextCount, true)
 			return
 		}
 

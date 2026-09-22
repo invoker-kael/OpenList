@@ -391,10 +391,14 @@ func webDAVCurrentEffectiveStatus(row *model.WebDAVWritebackObject) (string, str
 		return "", webDAVActionNone
 	}
 	if row.CloudSyncReuploadRequired || row.State == writeback.StateWaitingCloudSyncReupload {
-		if row.ResolutionReason == writeback.ResolutionRemoteMissing {
+		switch row.ResolutionReason {
+		case writeback.ResolutionRemoteMissing:
 			return webDAVStatusRemoteMissing, webDAVActionRestartCloudSync
+		case writeback.ResolutionRemoteHashMismatch:
+			return webDAVStatusRemoteHashMismatch, webDAVActionRestartCloudSync
+		default:
+			return webDAVStatusNeedsCloudSyncReupload, webDAVActionRestartCloudSync
 		}
-		return webDAVStatusNeedsCloudSyncReupload, webDAVActionRestartCloudSync
 	}
 	switch row.ResolutionReason {
 	case writeback.ResolutionRemoteHashMismatch:
@@ -496,7 +500,7 @@ func webDAVHistoryEffectiveStatus(history *model.WebDAVWritebackHistory, current
 	if history.RecoveryType == writeback.HistoryRecoveryCloudSyncRehydrateRequired {
 		if webDAVHistoryCurrentCorrelatesRehydrate(history, current) {
 			if writeback.RecoveryLabel(current) == "needs_cloudsync_rehydrate" {
-				return webDAVStatusWaitingCloudSync, webDAVActionRestartCloudSync
+				return webDAVCurrentEffectiveStatus(current)
 			}
 			if current.State == writeback.StateWaitingRepair {
 				return webDAVCurrentEffectiveStatus(current)

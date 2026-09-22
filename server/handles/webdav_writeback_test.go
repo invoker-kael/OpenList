@@ -208,19 +208,18 @@ func TestWebDAVHistoryRehydrateReceiveRequiresMatchingSize(t *testing.T) {
 	}
 }
 
-func TestWebDAVCurrentEffectiveStatusExplainsWaitingRepair(t *testing.T) {
+func TestWebDAVCurrentEffectiveStatusKeepsUnclassifiedWaitingRepairManual(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
-		State:            "waiting_repair",
-		ResolutionReason: "remote_missing",
-		RetryCount:       1,
+		State:      "waiting_repair",
+		RetryCount: 1,
 	}
 	status, action := webDAVCurrentEffectiveStatus(row)
-	if status != webDAVStatusRemoteMissing || action != webDAVActionManualCheck {
-		t.Fatalf("status=%q action=%q, want remote_missing/manual_check", status, action)
+	if status != webDAVStatusWaitingRepair || action != webDAVActionManualCheck {
+		t.Fatalf("status=%q action=%q, want waiting_repair/manual_check", status, action)
 	}
 }
 
-func TestWebDAVHistoryRehydrateWaitingRepairRequiresManualCheck(t *testing.T) {
+func TestWebDAVHistoryRehydrateHashMismatchRequiresCloudSyncRescan(t *testing.T) {
 	now := time.Unix(1000, 0)
 	ack := now.Add(-10 * time.Second)
 	sha := strings.Repeat("a", 40)
@@ -238,13 +237,14 @@ func TestWebDAVHistoryRehydrateWaitingRepairRequiresManualCheck(t *testing.T) {
 		Size:             1024,
 		PayloadSHA1:      sha,
 		CanonicalState:   "durable_acked",
-		State:            "waiting_repair",
-		ResolutionReason: "remote_hash_mismatch",
-		AckTime:          &ack,
+		State:                     "waiting_cloudsync_reupload",
+		ResolutionReason:          "remote_hash_mismatch",
+		CloudSyncReuploadRequired: true,
+		AckTime:                   &ack,
 	}
 	status, action := webDAVHistoryEffectiveStatus(history, current, nil, now)
-	if status != webDAVStatusRemoteHashMismatch || action != webDAVActionManualCheck {
-		t.Fatalf("status=%q action=%q, want remote_hash_mismatch/manual_check", status, action)
+	if status != webDAVStatusRemoteHashMismatch || action != webDAVActionRestartCloudSync {
+		t.Fatalf("status=%q action=%q, want remote_hash_mismatch/restart_cloudsync_required", status, action)
 	}
 }
 
@@ -262,8 +262,8 @@ func TestWebDAVCurrentEffectiveStatusCloudSyncReuploadKeepsRootCause(t *testing.
 
 	row.ResolutionReason = "remote_hash_mismatch"
 	status, action = webDAVCurrentEffectiveStatus(row)
-	if status != webDAVStatusNeedsCloudSyncReupload || action != webDAVActionRestartCloudSync {
-		t.Fatalf("status=%q action=%q, want needs_cloudsync_reupload/restart_cloudsync_required", status, action)
+	if status != webDAVStatusRemoteHashMismatch || action != webDAVActionRestartCloudSync {
+		t.Fatalf("status=%q action=%q, want remote_hash_mismatch/restart_cloudsync_required", status, action)
 	}
 }
 

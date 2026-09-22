@@ -382,22 +382,26 @@ Recovery State 是否为 needs_cloudsync_rehydrate？
 
 - Cloud Sync 负责保留源文件。
 - OpenList 负责 durable 接收、provider 上传、重试和验证。
-- MySQL 是当前已验证并推荐的数据库。
-- PostgreSQL 是另一个服务端数据库目标，生产使用前应验证实际部署版本。
+- 本 fork 的 Durable Write-back 仅支持 MySQL。
 - SQLite 不支持 Durable Write-back。
+- 其他数据库后端不属于当前 Durable Write-back 支持范围。
 - 普通 provider 错误不要重启 Cloud Sync。
 - `missing_spool` 仍在验证 provider 时不要重启 Cloud Sync。
-- 只有 `needs_cloudsync_rehydrate` 才需要人工完整停止/停用并重新启动/启用对应 Cloud Sync 任务，以强制重新扫描。
+- 只有自动 Provider 恢复已经失败并进入 Cloud Sync re-upload 等待态时，才需要完整停止/停用并重新启动/启用对应 Cloud Sync 任务，以强制重新扫描。
 
 
-## 已完成，但远端 Hash 存在差异
+## 远端 Hash 差异与最终恢复
 
-`remote_hash_mismatch` 是一个终态运维结果，不会继续无限验证，也不会自动要求 Cloud Sync 重新上传。
+`remote_hash_mismatch` 表示已经确认的 Provider 差异原因，不再作为“人工重传”状态。
 
-只有在最多 3 次强制刷新远端后，OpenList 持续观察到“对象大小一致、Provider 身份/Hash 证据稳定、Canonical SHA-1 与 Provider SHA-1 均存在但持续不同”时才进入该状态。只要本地 durable spool 仍然存在，OpenList 就保持 Durable ACK，不再重复向 Provider 上传，保留本地 spool，并记录双方 SHA-1 与 Remote Object ID 供排查，同时以 `resolution_reason=remote_hash_mismatch` 收敛该 generation。
+OpenList 必须先取得连续、稳定的 fresh provider evidence 才会确认 Hash mismatch。如果本地 durable spool 仍存在，OpenList 最多自动执行 **1 次 Provider repair upload**，随后重新验证；如果 Provider 已经自行收敛，repair 前的 fresh pre-check 会直接跳过不必要的重复上传。
 
-由于远端 Hash 没有被接受为 Canonical 一致性证据，此状态下的 spool 不会进入“已验证完成缓存”自动释放范围，从而保留一份可用于排查的本地持久副本。
+如果同一 generation 在这一次自动 repair 后仍然无法收敛，OpenList 不再继续 Provider 重试或无限低频验证，而是进入 `waiting_cloudsync_reupload`，并设置 `cloud_sync_reupload_required=true`。后台仍保留 `remote_hash_mismatch` 作为根因，但最终运维动作只有：
 
-该状态不需要重启 Cloud Sync。只有结构化状态 `needs_cloudsync_rehydrate` 才要求完整停用 Cloud Sync Task 后重新启用，以触发 fresh reconciliation scan。
+1. 完整停止/停用对应 Cloud Sync 任务；
+2. 重新启动/启用同一个任务；
+3. 等待 fresh reconciliation scan；
+4. 确认 Cloud Sync 对异常路径重新发起 PUT；
+5. 确认新 generation 最终进入 `completed`。
 
-Rehydrate 关联会综合恢复 History、当前 path/generation 或 ACK 时间、receive fence 的时间/大小，以及可用时的 durable payload SHA-1。未来同路径但内容不同的普通 PUT 不会错误关闭旧的 rehydrate 事件。
+OpenList 不提供“手动重传”动作。当 OpenList 已无法安全地让 Provider 副本收敛时，最终恢复数据来源必须回到 Cloud Sync。
