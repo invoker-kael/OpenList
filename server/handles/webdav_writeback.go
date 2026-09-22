@@ -585,6 +585,19 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 				writeback.StateWaitingRepair,
 			})
 		case "all":
+		case "syncing":
+			query = query.Where("state IN ?", []string{
+				writeback.StateQueued,
+				writeback.StateUploading,
+				writeback.StateVerifying,
+			})
+		case "waiting_reupload":
+			query = query.Where(
+				"state IN ? OR cloud_sync_reupload_required = ? OR resolution_reason IN ?",
+				[]string{writeback.StateWaitingCloudSyncReupload, writeback.StateWaitingRepair},
+				true,
+				[]string{writeback.ResolutionRemoteMissing, writeback.ResolutionRemoteHashMismatch},
+			)
 		case "error":
 			query = query.Where("last_error <> ''")
 		default:
