@@ -665,7 +665,13 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 	}
 
 	sort.SliceStable(rows, func(i, j int) bool {
-		return rows[i].UpdatedAt.After(rows[j].UpdatedAt)
+		if !rows[i].UpdatedAt.Equal(rows[j].UpdatedAt) {
+			return rows[i].UpdatedAt.After(rows[j].UpdatedAt)
+		}
+		if rows[i].Path != rows[j].Path {
+			return rows[i].Path < rows[j].Path
+		}
+		return rows[i].ID < rows[j].ID
 	})
 	if len(rows) > limit {
 		rows = rows[:limit]
