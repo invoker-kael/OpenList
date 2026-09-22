@@ -400,4 +400,6 @@ If the same generation still cannot converge after that single automatic repair,
 4. confirm Cloud Sync issues a new PUT for the affected path;
 5. verify the new generation reaches `completed`.
 
+Once OpenList accepts a newer PUT for the same path, that newer generation supersedes the old recovery incident. The monitor/history should move through `reupload_receiving` / `reupload_received` / `reupload_uploading` / `reupload_verifying` and finally `recovered` as the newer generation progresses. Recovery correlation does not require the new payload SHA-1 or size to equal the failed generation, because Cloud Sync encryption or a legitimate local edit can change the bytes; same-path generation/ACK ordering is authoritative. The old incident remains in History for audit, but it is no longer action-required.
+
 There is no manual re-upload action in OpenList. When OpenList can no longer safely converge the provider replica, Cloud Sync is the source-of-truth recovery path.

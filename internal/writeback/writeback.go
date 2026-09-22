@@ -6153,6 +6153,28 @@ func forceCloudSyncRepairForMissingPayload(row *model.WebDAVWritebackObject, cur
 	)
 }
 func (m *workerManager) recoverInterrupted() error {
+	// Older builds could persist provider divergence as a completed/manual-check
+	// result. Under the current model these generations are terminal for provider
+	// workers and must wait for a fresh Cloud Sync PUT instead.
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("state = ? AND resolution_reason IN ?", StateCompleted, []string{
+			ResolutionRemoteHashMismatch,
+			ResolutionRemoteMissing,
+			ResolutionVerificationExhausted,
+		}).
+		Updates(map[string]any{
+			"canonical_state":              CanonicalStateAcked,
+			"state":                        StateWaitingCloudSyncReupload,
+			"cloud_sync_reupload_required": true,
+			"retry_at":                     nil,
+			"completed_at":                 nil,
+			"remote_generation":            0,
+			"remote_verified_at":           nil,
+			"recovery_started_at":          gorm.Expr("COALESCE(recovery_started_at, updated_at, created_at)"),
+		}).Error; err != nil {
+		return err
+	}
+
 	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("state = ? AND resolution_reason IN ?", StateWaitingRepair, []string{
 			ResolutionRemoteHashMismatch,

@@ -203,13 +203,14 @@ Cloud Sync 之前已经收到成功响应
 OpenList 已经没有 payload 可以自行重新上传
         |
         v
-canonical state 对 WebDAV 表现为 deleted
+canonical Durable ACK 继续对 WebDAV 可见，
+同时该 row 明确进入 waiting_cloudsync_reupload
         |
         v
-needs_cloudsync_rehydrate
+needs_cloudsync_rehydrate / restart_cloudsync_required
 ```
 
-此时 OpenList 会有意让该对象从 canonical WebDAV view 中消失，让 Cloud Sync 在下一次完整 reconciliation 时看到本地有文件、WebDAV 端没有文件，从而重新执行 PUT。
+此时 OpenList 不再删除 canonical WebDAV 视图中的对象，也不会继续 Provider 无限重试。运维动作是完整停止/停用并重新启动/启用对应 Cloud Sync 任务，强制 fresh reconciliation；只要 Cloud Sync 对同一路径重新发起 PUT，新 generation 就会接管旧异常 generation。
 
 ### 必须执行的人工步骤
 
@@ -403,5 +404,7 @@ OpenList 必须先取得连续、稳定的 fresh provider evidence 才会确认 
 3. 等待 fresh reconciliation scan；
 4. 确认 Cloud Sync 对异常路径重新发起 PUT；
 5. 确认新 generation 最终进入 `completed`。
+
+只要 OpenList 接收到同一路径的更新 PUT，新 generation 就会接管旧 recovery incident。后台/History 应随新 generation 依次显示 `reupload_receiving`、`reupload_received`、`reupload_uploading`、`reupload_verifying`，最终变为 `recovered`。这里不再要求新 payload 的 SHA-1 或大小必须与失败 generation 完全一致，因为 Cloud Sync 加密重新生成或本地文件的正常变更都可能改变实际字节；恢复判断以同一路径的 generation/ACK 顺序为准。旧 incident 仍保留在 History 作为审计记录，但不再属于待人工处理状态。
 
 OpenList 不提供“手动重传”动作。当 OpenList 已无法安全地让 Provider 副本收敛时，最终恢复数据来源必须回到 Cloud Sync。

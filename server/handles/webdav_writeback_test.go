@@ -158,7 +158,7 @@ func TestWebDAVHistoryRehydrateCanFinishWithRemoteHashMismatch(t *testing.T) {
 	}
 }
 
-func TestWebDAVHistoryRehydrateRejectsUnrelatedLaterPut(t *testing.T) {
+func TestWebDAVHistoryRehydrateNewerGenerationSupersedesOldIncident(t *testing.T) {
 	now := time.Unix(800, 0)
 	ack := now.Add(-10 * time.Second)
 	history := &model.WebDAVWritebackHistory{
@@ -179,12 +179,12 @@ func TestWebDAVHistoryRehydrateRejectsUnrelatedLaterPut(t *testing.T) {
 		AckTime:        &ack,
 	}
 	status, action := webDAVHistoryEffectiveStatus(history, current, nil, now)
-	if status != webDAVStatusWaitingCloudSync || action != webDAVActionRestartCloudSync {
-		t.Fatalf("unrelated later PUT must not close rehydrate incident: status=%q action=%q", status, action)
+	if status != webDAVStatusRecovered || action != "" {
+		t.Fatalf("newer same-path generation must supersede old recovery incident: status=%q action=%q", status, action)
 	}
 }
 
-func TestWebDAVHistoryRehydrateReceiveRequiresMatchingSize(t *testing.T) {
+func TestWebDAVHistoryRehydrateNewerReceiveSupersedesOldIncident(t *testing.T) {
 	now := time.Unix(900, 0)
 	started := now.Add(-5 * time.Second)
 	lease := now.Add(time.Minute)
@@ -203,8 +203,8 @@ func TestWebDAVHistoryRehydrateReceiveRequiresMatchingSize(t *testing.T) {
 		ReceiveLeaseUntil:  &lease,
 	}
 	status, action := webDAVHistoryEffectiveStatus(history, nil, fence, now)
-	if status != webDAVStatusWaitingCloudSync || action != webDAVActionRestartCloudSync {
-		t.Fatalf("different-size receive must not correlate to old rehydrate: status=%q action=%q", status, action)
+	if status != webDAVStatusReuploadReceiving || action != "" {
+		t.Fatalf("newer same-path receive must supersede old recovery incident: status=%q action=%q", status, action)
 	}
 }
 

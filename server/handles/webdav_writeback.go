@@ -452,16 +452,11 @@ func webDAVHistoryCurrentIsNewer(history *model.WebDAVWritebackHistory, current 
 }
 
 func webDAVHistoryCurrentCorrelatesRehydrate(history *model.WebDAVWritebackHistory, current *model.WebDAVWritebackObject) bool {
-	if !webDAVHistoryCurrentIsNewer(history, current) || !webDAVHistoryCurrentIsAcked(current) {
-		return false
-	}
-	if history.PayloadSHA1 != "" {
-		return current.PayloadSHA1 != "" && strings.EqualFold(history.PayloadSHA1, current.PayloadSHA1)
-	}
-	if history.Size >= 0 && current.Size >= 0 && history.Size != current.Size {
-		return false
-	}
-	return true
+	// A newer accepted generation at the same path supersedes the old recovery
+	// incident even when the payload bytes changed. Cloud Sync encryption or a
+	// legitimate local edit can produce a different size/hash on the fresh PUT;
+	// generation/ACK ordering is the authoritative recovery signal.
+	return webDAVHistoryCurrentIsNewer(history, current) && webDAVHistoryCurrentIsAcked(current)
 }
 
 func webDAVHistoryCurrentIsAcked(current *model.WebDAVWritebackObject) bool {
@@ -477,20 +472,14 @@ func webDAVHistoryCurrentIsAcked(current *model.WebDAVWritebackObject) bool {
 }
 
 func webDAVHistoryReceiveIsNewer(history *model.WebDAVWritebackHistory, fence *model.WebDAVWritebackReceiveFence, now time.Time) bool {
-	if history == nil ||
-		fence == nil ||
-		fence.PathKey != history.PathKey ||
-		fence.ActiveReceivers <= 0 ||
-		fence.ReceiveLeaseUntil == nil ||
-		!fence.ReceiveLeaseUntil.After(now) ||
-		fence.LatestStartedAt == nil ||
-		!fence.LatestStartedAt.After(history.UpdatedAt) {
-		return false
-	}
-	if history.Size >= 0 && fence.LatestExpectedSize >= 0 && history.Size != fence.LatestExpectedSize {
-		return false
-	}
-	return true
+	return history != nil &&
+		fence != nil &&
+		fence.PathKey == history.PathKey &&
+		fence.ActiveReceivers > 0 &&
+		fence.ReceiveLeaseUntil != nil &&
+		fence.ReceiveLeaseUntil.After(now) &&
+		fence.LatestStartedAt != nil &&
+		fence.LatestStartedAt.After(history.UpdatedAt)
 }
 
 func webDAVHistoryEffectiveStatus(history *model.WebDAVWritebackHistory, current *model.WebDAVWritebackObject, fence *model.WebDAVWritebackReceiveFence, now time.Time) (string, string) {
