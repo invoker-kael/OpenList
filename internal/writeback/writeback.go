@@ -32,12 +32,13 @@ import (
 )
 
 const (
-	StateQueued    = "queued"
-	StateUploading = "uploading"
-	StateVerifying = "verifying"
-	StateCompleted = "completed"
-	StateDeleted   = "deleted"
-	StateLockNull  = "lock_null"
+	StateQueued                   = "queued"
+	StateUploading                = "uploading"
+	StateVerifying                = "verifying"
+	StateCompleted                = "completed"
+	StateDeleted                  = "deleted"
+	StateWaitingCloudSyncReupload = "waiting_cloudsync_reupload"
+	StateLockNull                 = "lock_null"
 
 	ResolutionRemoteHashMismatch      = "remote_hash_mismatch"
 	ResolutionNeedsCloudSyncRehydrate = "needs_cloudsync_rehydrate"
@@ -84,7 +85,7 @@ func canonicalState(row *model.WebDAVWritebackObject) string {
 	// Treat every non-delete/non-lock row as an already accepted canonical
 	// object so upgrades do not make existing Cloud Sync files disappear.
 	switch row.State {
-	case StateDeleted:
+	case StateDeleted, StateWaitingCloudSyncReupload:
 		return CanonicalStateDeleted
 	case StateLockNull:
 		return CanonicalStateLockNull
@@ -99,6 +100,12 @@ func canonicalDeleted(row *model.WebDAVWritebackObject) bool {
 
 func canonicalAcked(row *model.WebDAVWritebackObject) bool {
 	return canonicalState(row) == CanonicalStateAcked
+}
+
+func waitingCloudSyncReupload(row *model.WebDAVWritebackObject) bool {
+	return row != nil &&
+		canonicalDeleted(row) &&
+		(row.State == StateWaitingCloudSyncReupload || row.ResolutionReason == ResolutionNeedsCloudSyncRehydrate)
 }
 
 func markCanonicalAcked(row *model.WebDAVWritebackObject, durableAt time.Time) {
@@ -1822,7 +1829,7 @@ func remoteVerificationEvidenceConsistent(row *model.WebDAVWritebackObject) bool
 		return false
 	}
 	if row.PayloadSHA1 != "" && row.RemoteSHA1 != "" && !strings.EqualFold(row.PayloadSHA1, row.RemoteSHA1) {
-		return false
+		return row.ResolutionReason == ResolutionRemoteHashMismatch
 	}
 	return true
 }
@@ -1855,6 +1862,7 @@ func refreshCompletedRemoteVerification(row *model.WebDAVWritebackObject, remote
 			"verify_count":       0,
 			"retry_at":           nil,
 			"last_error":         "",
+			"resolution_reason":  "",
 			"remote_object_id":   evidence.objectID,
 			"remote_sha1":        evidence.sha1,
 			"remote_generation":  evidence.generation,
@@ -2045,6 +2053,62 @@ func refreshFreshParentCompletedEvidence(parent string, remotes []model.Obj, now
 	}
 }
 
+func settleCompletedRemoteHashMismatch(row *model.WebDAVWritebackObject, remote model.Obj, now time.Time) error {
+	if row == nil || remote == nil || row.IsDir || row.State != StateCompleted || row.SpoolPath != "" ||
+		!remoteHashMismatch(row, remote, true) {
+		return nil
+	}
+	evidence := captureRemoteVerification(row, remote, now)
+	if evidence.objectID == "" {
+		// Without a stable provider identity, preserve canonical state but keep the
+		// observation non-terminal so a later probe can obtain stronger metadata.
+		return nil
+	}
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
+		Updates(map[string]any{
+			"verify_count":       0,
+			"retry_at":           nil,
+			"last_error":         "",
+			"resolution_reason":  ResolutionRemoteHashMismatch,
+			"remote_object_id":   evidence.objectID,
+			"remote_sha1":        evidence.sha1,
+			"remote_generation":  evidence.generation,
+			"remote_verified_at": &evidence.verifiedAt,
+		}).Error; err != nil {
+		return err
+	}
+	historyRow := *row
+	historyRow.ResolutionReason = ResolutionRemoteHashMismatch
+	historyRow.RemoteObjectID = evidence.objectID
+	historyRow.RemoteSHA1 = evidence.sha1
+	historyRow.RemoteGeneration = evidence.generation
+	historyRow.RemoteVerifiedAt = &evidence.verifiedAt
+	recordHistoryOutcomeBestEffort(
+		&historyRow,
+		HistoryResultCompleted,
+		ResolutionRemoteHashMismatch,
+		historyRecoveryForCompletion(row),
+		now,
+		remoteHashMismatchMessage(row, remote),
+	)
+	return nil
+}
+
+func confirmCompletedRemoteMissing(ctx context.Context, row *model.WebDAVWritebackObject) (bool, model.Obj, error) {
+	if row == nil || row.IsDir {
+		return false, nil, nil
+	}
+	remote, err := fs.Get(ctx, row.Path, &fs.GetArgs{NoLog: true})
+	if err == nil && remote != nil {
+		return false, remote, nil
+	}
+	if err != nil && !errs.IsObjectNotFound(err) {
+		return false, nil, err
+	}
+	return true, nil, nil
+}
+
 func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWritebackObject, now time.Time) (bool, error) {
 	if row == nil || row.IsDir {
 		return false, nil
@@ -2088,7 +2152,29 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 			return false, nil
 		}
 	default:
+		if remote != nil && remoteHashMismatch(row, remote, true) {
+			if confirmationClaimed {
+				return false, settleCompletedRemoteHashMismatch(row, remote, now)
+			}
+			break
+		}
 		if confirmationClaimed {
+			if remote == nil {
+				missing, direct, directErr := confirmCompletedRemoteMissing(ctx, row)
+				if directErr != nil {
+					// Provider/network failures are never destructive evidence.
+					return false, nil
+				}
+				if !missing {
+					if compareRemoteContent(row, direct, true) == remoteContentMatch {
+						return false, refreshCompletedRemoteVerification(row, direct, now, true)
+					}
+					if remoteHashMismatch(row, direct, true) {
+						return false, settleCompletedRemoteHashMismatch(row, direct, now)
+					}
+					return false, nil
+				}
+			}
 			return deleteCompletedCanonical(row)
 		}
 	}
@@ -2161,6 +2247,18 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 		if row.IsDir {
 			return false, nil
 		}
+		missing, direct, directErr := confirmCompletedRemoteMissing(ctx, row)
+		if directErr != nil {
+			return false, nil
+		}
+		if !missing {
+			if compareRemoteContent(row, direct, requireHash) == remoteContentMatch {
+				if refreshErr := refreshCompletedRemoteVerification(row, direct, now, requireHash); refreshErr != nil {
+					return false, refreshErr
+				}
+			}
+			return false, nil
+		}
 		return deleteCompletedCanonical(row)
 	}
 	if remote.IsDir() != row.IsDir {
@@ -2203,6 +2301,9 @@ func shouldDropCanonicalAfterRemoteList(row *model.WebDAVWritebackObject, remote
 	}
 	if remote == nil {
 		return true
+	}
+	if remoteHashMismatch(row, remote, requireHash) {
+		return false
 	}
 	return compareRemoteContent(row, remote, requireHash) == remoteContentMismatch
 }
@@ -5855,9 +5956,9 @@ func forceCloudSyncRepairForMissingPayload(row *model.WebDAVWritebackObject, cur
 		Where("id = ? AND generation = ? AND state = ? AND cleanup_path = ''", row.ID, row.Generation, currentState).
 		Updates(map[string]any{
 			"canonical_state":    CanonicalStateDeleted,
-			"state":              StateDeleted,
+			"state":              StateWaitingCloudSyncReupload,
 			"spool_path":         "",
-			"retry_at":           &now,
+			"retry_at":           nil,
 			"last_error":         reason,
 			"resolution_reason":  ResolutionNeedsCloudSyncRehydrate,
 			"retry_count":        0,
@@ -5876,7 +5977,7 @@ func forceCloudSyncRepairForMissingPayload(row *model.WebDAVWritebackObject, cur
 	recordHistoryOutcomeBestEffort(
 		row,
 		HistoryResultRecoveryRequired,
-		StateDeleted,
+		StateWaitingCloudSyncReupload,
 		HistoryRecoveryCloudSyncRehydrateRequired,
 		now,
 		reason,
@@ -5886,6 +5987,17 @@ func forceCloudSyncRepairForMissingPayload(row *model.WebDAVWritebackObject, cur
 }
 
 func (m *workerManager) recoverInterrupted() error {
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("state = ? AND canonical_state = ? AND (resolution_reason = ? OR LOWER(last_error) LIKE ?)",
+			StateDeleted, CanonicalStateDeleted, ResolutionNeedsCloudSyncRehydrate, "%cloud sync can re-upload%").
+		Updates(map[string]any{
+			"state":             StateWaitingCloudSyncReupload,
+			"retry_at":          nil,
+			"resolution_reason": ResolutionNeedsCloudSyncRehydrate,
+		}).Error; err != nil {
+		return err
+	}
+
 	if err := db.GetDb().Where("lease_until <= ?", time.Now()).
 		Delete(&model.WebDAVWritebackReceiveReservation{}).Error; err != nil {
 		return err
@@ -5945,7 +6057,7 @@ func (m *workerManager) recoverInterrupted() error {
 	}
 	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("canonical_state = '' OR canonical_state IS NULL").
-		Where("state NOT IN ?", []string{StateDeleted, StateLockNull}).
+		Where("state NOT IN ?", []string{StateDeleted, StateWaitingCloudSyncReupload, StateLockNull}).
 		Updates(map[string]any{
 			"canonical_state": CanonicalStateAcked,
 			"ack_time":        gorm.Expr("COALESCE(ack_time, durable_at, created_at)"),
@@ -8239,6 +8351,16 @@ func deleteConfirmedTombstoneSubtree(root *model.WebDAVWritebackObject) (bool, e
 }
 
 func (m *workerManager) processDelete(row *model.WebDAVWritebackObject) {
+	if waitingCloudSyncReupload(row) {
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateDeleted).
+			Updates(map[string]any{
+				"state":             StateWaitingCloudSyncReupload,
+				"retry_at":          nil,
+				"resolution_reason": ResolutionNeedsCloudSyncRehydrate,
+			}).Error
+		return
+	}
 	// A tombstone can be superseded by a fast Cloud Sync recreate of the same
 	// path. Re-check the generation before touching the provider so a queued old
 	// delete cannot blindly remove a newer canonical generation.

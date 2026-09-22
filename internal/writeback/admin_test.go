@@ -162,3 +162,14 @@ func TestGenericProviderAndStrongSHA1EvidenceDiffer(t *testing.T) {
 		t.Fatalf("strong SHA1 mismatch must be divergent, got %v", got)
 	}
 }
+
+func TestRecoveryLabelWaitingCloudSyncReupload(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		State:            StateWaitingCloudSyncReupload,
+		CanonicalState:   CanonicalStateDeleted,
+		ResolutionReason: ResolutionNeedsCloudSyncRehydrate,
+	}
+	if got := RecoveryLabel(row); got != "needs_cloudsync_rehydrate" {
+		t.Fatalf("RecoveryLabel=%q, want needs_cloudsync_rehydrate", got)
+	}
+}

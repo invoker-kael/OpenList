@@ -3911,3 +3911,36 @@ func TestRemoteHashMismatchChangedObjectRestartsConfirmation(t *testing.T) {
 		t.Fatalf("changed provider identity must restart hash-difference confirmation: count=%d terminal=%v", next, terminal)
 	}
 }
+
+func TestWaitingCloudSyncReuploadIsDeletedCanonicalButNotProviderDelete(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		State:            StateWaitingCloudSyncReupload,
+		CanonicalState:   CanonicalStateDeleted,
+		ResolutionReason: ResolutionNeedsCloudSyncRehydrate,
+	}
+	if !canonicalDeleted(row) {
+		t.Fatal("waiting Cloud Sync re-upload must remain client-visible as deleted")
+	}
+	if !waitingCloudSyncReupload(row) {
+		t.Fatal("waiting Cloud Sync re-upload must be protected from provider DELETE")
+	}
+}
+
+func TestRemoteHashMismatchDoesNotDropCompletedCanonical(t *testing.T) {
+	shaA := strings.Repeat("a", 40)
+	shaB := strings.Repeat("b", 40)
+	row := &model.WebDAVWritebackObject{
+		State:       StateCompleted,
+		Size:        123,
+		PayloadSHA1: shaA,
+	}
+	remote := &model.Object{
+		ID:       "provider-object",
+		Name:     "file.bin",
+		Size:     123,
+		HashInfo: utils.NewHashInfo(utils.SHA1, shaB),
+	}
+	if shouldDropCanonicalAfterRemoteList(row, true, remote, time.Now(), true) {
+		t.Fatal("same-size provider hash mismatch must not be treated as remote missing")
+	}
+}

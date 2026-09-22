@@ -111,7 +111,7 @@ func RecoveryLabel(row *model.WebDAVWritebackObject) string {
 	if row == nil {
 		return ""
 	}
-	if row.ResolutionReason == ResolutionNeedsCloudSyncRehydrate {
+	if row.State == StateWaitingCloudSyncReupload || row.ResolutionReason == ResolutionNeedsCloudSyncRehydrate {
 		return "needs_cloudsync_rehydrate"
 	}
 	msg := strings.ToLower(row.LastError)
@@ -173,8 +173,8 @@ func AdminRuntimeSnapshot() (AdminRuntimeStats, error) {
 		return stats, err
 	}
 	stats.NeedsCloudSyncRehydrate, err = count(
-		"state = ? AND canonical_state = ? AND (resolution_reason = ? OR LOWER(last_error) LIKE ?)",
-		StateDeleted, CanonicalStateDeleted, ResolutionNeedsCloudSyncRehydrate, "%cloud sync can re-upload%",
+		"state IN ? AND canonical_state = ? AND (resolution_reason = ? OR LOWER(last_error) LIKE ?)",
+		[]string{StateWaitingCloudSyncReupload, StateDeleted}, CanonicalStateDeleted, ResolutionNeedsCloudSyncRehydrate, "%cloud sync can re-upload%",
 	)
 	if err != nil {
 		return stats, err
