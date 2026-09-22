@@ -194,6 +194,43 @@ func TestProviderSnapshotUsesBoundedFreshnessAndInvalidation(t *testing.T) {
 	}
 }
 
+func TestProviderSnapshotInvalidationWinsAgainstInflightRefresh(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{ProviderSnapshotTTLSeconds: 600}}
+	defer func() { conf.Conf = oldConf }()
+
+	group := &providerRefreshGroup{}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	result := make(chan []model.Obj, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		objs, err := group.do(nil, "/encrypted", func() ([]model.Obj, error) {
+			close(started)
+			<-release
+			return []model.Obj{&model.Object{Name: "before-mutation.bin", Size: 123}}, nil
+		})
+		errCh <- err
+		result <- objs
+	}()
+
+	<-started
+	group.invalidate("/encrypted")
+	close(release)
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("fresh provider refresh failed: %v", err)
+	}
+	objs := <-result
+	if len(objs) != 1 || objs[0].GetName() != "before-mutation.bin" {
+		t.Fatalf("in-flight refresh result = %#v", objs)
+	}
+	if _, ok := group.cached("/encrypted", time.Now()); ok {
+		t.Fatal("a provider LIST started before mutation invalidation must not repopulate the snapshot cache")
+	}
+}
+
 func TestProviderSnapshotTTLDefaultsConservatively(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = &conf.Config{}
@@ -3366,7 +3403,6 @@ func TestMatchingCompletedSiblingRows(t *testing.T) {
 		t.Fatalf("trigger row must be skipped, got %v", got)
 	}
 }
-
 
 func TestMatchingFreshCompletedEvidenceRowsRequiresHealthyExact115Evidence(t *testing.T) {
 	now := time.Date(2026, time.September, 22, 1, 0, 0, 0, time.UTC)

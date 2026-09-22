@@ -1812,8 +1812,6 @@ func refreshCompletedRemoteVerification(row *model.WebDAVWritebackObject, remote
 
 const completedSiblingProbeBatchLimit = 128
 
-var completedProbeRefreshes providerRefreshGroup
-
 func matchingCompletedSiblingRows(rows []model.WebDAVWritebackObject, remotes []model.Obj, skipID uint, requireHash bool) []verificationBatchMatch {
 	if len(rows) == 0 || len(remotes) == 0 {
 		return nil
@@ -1856,10 +1854,12 @@ func refreshMatchingCompletedSiblings(trigger *model.WebDAVWritebackObject, remo
 		log.Errorf("write-back completed sibling probe scan failed for %s: %v", trigger.Parent, err)
 		return
 	}
-	for _, match := range matchingCompletedSiblingRows(rows, remotes, trigger.ID, requireHash) {
-		if err := refreshCompletedRemoteVerification(&match.row, match.remote, now, requireHash); err != nil {
-			log.Errorf("write-back completed sibling probe refresh failed for %s: %v", match.row.Path, err)
-		}
+	matches := matchingCompletedSiblingRows(rows, remotes, trigger.ID, requireHash)
+	if len(matches) == 0 {
+		return
+	}
+	if err := refreshCompletedVerificationEvidenceBatch(matches, now, false); err != nil {
+		log.Errorf("write-back completed sibling probe batch refresh failed for %s: %v", trigger.Parent, err)
 	}
 }
 
@@ -1900,7 +1900,7 @@ func matchingFreshCompletedEvidenceRows(rows []model.WebDAVWritebackObject, remo
 	return matches
 }
 
-func refreshFreshCompletedEvidenceBatch(matches []verificationBatchMatch, now time.Time) error {
+func refreshCompletedVerificationEvidenceBatch(matches []verificationBatchMatch, now time.Time, healthyOnly bool) error {
 	if len(matches) == 0 {
 		return nil
 	}
@@ -1938,18 +1938,26 @@ func refreshFreshCompletedEvidenceBatch(matches []verificationBatchMatch, now ti
 	objectIDCase.WriteString(" ELSE remote_object_id END")
 	sha1Case.WriteString(" ELSE remote_sha1 END")
 
-	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
+	query := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id IN ?", ids).
 		Where("generation = "+generationCase.String(), generationArgs...).
-		Where("state = ? AND spool_path = '' AND payload_sha1 <> ''", StateCompleted).
-		Where("verify_count = 0 AND retry_at IS NULL AND last_error = ''").
-		Where("(canonical_state = ? OR canonical_state = '' OR canonical_state IS NULL)", CanonicalStateAcked).
-		Updates(map[string]any{
-			"remote_object_id":  gorm.Expr(objectIDCase.String(), objectIDArgs...),
-			"remote_sha1":       gorm.Expr(sha1Case.String(), sha1Args...),
-			"remote_generation": gorm.Expr("generation"),
-			"remote_verified_at": &now,
-		}).Error
+		Where("state = ? AND spool_path = ''", StateCompleted)
+	if healthyOnly {
+		query = query.
+			Where("payload_sha1 <> ''").
+			Where("verify_count = 0 AND retry_at IS NULL AND last_error = ''").
+			Where("(canonical_state = ? OR canonical_state = '' OR canonical_state IS NULL)", CanonicalStateAcked)
+	}
+
+	return query.Updates(map[string]any{
+		"verify_count":       0,
+		"retry_at":           nil,
+		"last_error":         "",
+		"remote_object_id":   gorm.Expr(objectIDCase.String(), objectIDArgs...),
+		"remote_sha1":        gorm.Expr(sha1Case.String(), sha1Args...),
+		"remote_generation":  gorm.Expr("generation"),
+		"remote_verified_at": &now,
+	}).Error
 }
 
 func refreshFreshParentCompletedEvidence(parent string, remotes []model.Obj, now time.Time) {
@@ -1980,7 +1988,7 @@ func refreshFreshParentCompletedEvidence(parent string, remotes []model.Obj, now
 	if len(matches) == 0 {
 		return
 	}
-	if err := refreshFreshCompletedEvidenceBatch(matches, now); err != nil {
+	if err := refreshCompletedVerificationEvidenceBatch(matches, now, true); err != nil {
 		log.Errorf("write-back fresh parent completed evidence refresh failed for %s: %v", parent, err)
 	}
 }
@@ -1999,7 +2007,10 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 		confirmationClaimed = true
 	}
 
-	objs, listErr := completedProbeRefreshes.do(ctx.Done(), row.Parent, func() ([]model.Obj, error) {
+	// do() is fresh-only: it never consults the provider snapshot cache. Reuse
+	// the main parent group so health reconciliation, VERIFY, and WebDAV refresh
+	// cannot issue parallel Refresh:true LIST calls for the same parent.
+	objs, listErr := providerParentSnapshots.do(ctx.Done(), row.Parent, func() ([]model.Obj, error) {
 		return fs.List(ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
 	})
 	if listErr != nil {
@@ -5314,6 +5325,7 @@ type providerRefreshGroup struct {
 	mu        sync.Mutex
 	calls     map[string]*providerRefreshCall
 	snapshots map[string]providerSnapshotEntry
+	revisions map[string]uint64
 }
 
 func cloneProviderObjects(objs []model.Obj) []model.Obj {
@@ -5382,17 +5394,23 @@ func (g *providerRefreshGroup) storeSnapshotLocked(parent string, objs []model.O
 func (g *providerRefreshGroup) invalidate(parents ...string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.revisions == nil {
+		g.revisions = make(map[string]uint64)
+	}
 	for _, parent := range parents {
 		if parent == "" {
 			continue
 		}
-		delete(g.snapshots, utils.FixAndCleanPath(parent))
+		parent = utils.FixAndCleanPath(parent)
+		delete(g.snapshots, parent)
+		g.revisions[parent]++
 	}
 }
 
 func (g *providerRefreshGroup) clear() {
 	g.mu.Lock()
 	g.snapshots = nil
+	g.revisions = nil
 	g.mu.Unlock()
 }
 
@@ -5411,6 +5429,7 @@ func (g *providerRefreshGroup) do(stop <-chan struct{}, parent string, refresh f
 			return nil, context.Canceled
 		}
 	}
+	revision := g.revisions[parent]
 	call := &providerRefreshCall{done: make(chan struct{})}
 	g.calls[parent] = call
 	g.mu.Unlock()
@@ -5418,7 +5437,12 @@ func (g *providerRefreshGroup) do(stop <-chan struct{}, parent string, refresh f
 	call.objs, call.err = refresh()
 	if call.err == nil {
 		g.mu.Lock()
-		g.storeSnapshotLocked(parent, call.objs, time.Now())
+		// A canonical mutation may invalidate this parent while Refresh:true is
+		// in flight. The result can still serve its current caller and canonical
+		// overlay, but a pre-mutation provider view must not repopulate the cache.
+		if g.revisions[parent] == revision {
+			g.storeSnapshotLocked(parent, call.objs, time.Now())
+		}
 		g.mu.Unlock()
 	}
 	close(call.done)
