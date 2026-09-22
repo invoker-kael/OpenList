@@ -34,7 +34,6 @@ func Init(e *gin.Engine) {
 	g.GET("/favicon.ico", handles.Favicon)
 	g.GET("/robots.txt", handles.Robots)
 	g.GET("/manifest.json", static.ManifestJSON)
-	g.GET("/@manage/webdav-writeback", handles.WebDAVWritebackMonitorPage)
 	g.GET("/i/:link_name", handles.Plist)
 	common.SecretKey = []byte(conf.Conf.JwtSecret)
 	g.Use(middlewares.StoragesLoaded)

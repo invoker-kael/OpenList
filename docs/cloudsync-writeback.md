@@ -432,3 +432,9 @@ The WebDAV Writeback admin surface is organized as **Overview | Active | History
 **Release Completed Cache** removes only safe, provider-verified completed `.data` spool files. **Delete History** removes only History rows. History cleanup never removes or changes the current canonical object, current generation, spool files, provider objects, recovery state, or Cloud Sync visibility.
 
 `CompletedRemoteProbeSeconds` is exposed in Settings as the existing interval controlling how long released completed objects may reuse fresh provider evidence before background reconciliation checks the provider again. The reconciliation algorithm and the two-stage confirmed-loss behavior are unchanged.
+
+### Native admin frontend integration
+
+The experimental standalone `/@manage/webdav-writeback` HTML handler has been removed. The same path is now owned by the normal OpenList SolidJS management router, with an admin-only **WebDAV Writeback** side-menu entry on the Go backend. The page keeps the existing **Overview | Active | History | Settings** information architecture and consumes only the authenticated `/api/admin/webdav-writeback/*` APIs.
+
+CloudSync Docker builds pin both halves of the test surface: the backend commit and frontend commit `c8f23446f4ea63ecbf19118fb440600c7075f338` from `invoker-kael/OpenList-Frontend`. The Docker build compiles that frontend source into `public/dist` and tells `build.sh` to use the prebuilt dist instead of downloading an unrelated upstream frontend release. This keeps long-running test images reproducible and prevents upstream UI changes from silently changing the writeback test environment.

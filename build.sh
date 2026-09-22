@@ -28,7 +28,11 @@ else
   git tag -d beta || true
   # Always true if there's no tag
   version=$(git describe --abbrev=0 --tags 2>/dev/null || echo "v0.0.0")
-  webVersion=$(eval "curl -fsSL --max-time 2 $githubAuthArgs \"https://api.github.com/repos/$frontendRepo/releases/latest\"" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+  if [ -n "$OPENLIST_FRONTEND_REF" ]; then
+    webVersion="$OPENLIST_FRONTEND_REF"
+  else
+    webVersion=$(eval "curl -fsSL --max-time 2 $githubAuthArgs \"https://api.github.com/repos/$frontendRepo/releases/latest\"" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+  fi
 fi
 
 echo "backend version: $version"
@@ -648,7 +652,9 @@ if [ "$buildType" = "dev" ]; then
     BuildDev
   fi
 elif [ "$buildType" = "release" -o "$buildType" = "beta" ]; then
-  if [ "$buildType" = "beta" ]; then
+  if [ "$OPENLIST_FRONTEND_PREBUILT" = "1" ]; then
+    echo "using prebuilt frontend from $frontendRepo@$OPENLIST_FRONTEND_REF"
+  elif [ "$buildType" = "beta" ]; then
     FetchWebRolling
   else
     FetchWebRelease
