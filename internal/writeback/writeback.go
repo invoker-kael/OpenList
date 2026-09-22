@@ -8292,15 +8292,15 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 		return false
 	}
 	updates := map[string]any{
-		"state":              StateCompleted,
-		"completed_at":       &now,
-		"retry_at":           nil,
-		"last_error":         "",
-		"resolution_reason":  "",
-		"retry_count":        0,
-		"verify_count":       0,
-		"remote_object_id":   evidence.objectID,
-		"remote_sha1":        evidence.sha1,
+		"state":                   StateCompleted,
+		"completed_at":            &now,
+		"retry_at":                nil,
+		"last_error":              "",
+		"resolution_reason":       "",
+		"retry_count":             0,
+		"verify_count":            0,
+		"remote_object_id":        evidence.objectID,
+		"remote_sha1":             evidence.sha1,
 		"remote_generation":       evidence.generation,
 		"remote_verified_at":      &evidence.verifiedAt,
 		"restart_upload_recovery": false,
@@ -8479,17 +8479,17 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 				// the repair upload if the provider converged in the meantime.
 				next := time.Now()
 				updates := map[string]any{
-					"state":               StateQueued,
-					"retry_at":            &next,
-					"retry_count":         row.RetryCount + 1,
-					"verify_count":        0,
-					"last_error":          "confirmed provider hash mismatch; scheduling one automatic repair upload",
-					"resolution_reason":   "",
-					"recovery_started_at": gorm.Expr("COALESCE(recovery_started_at, ?)", evidenceAt),
-					"remote_object_id":    remoteID,
-					"remote_sha1":         remoteSHA1,
-					"remote_generation":        0,
-					"remote_verified_at":       nil,
+					"state":                   StateQueued,
+					"retry_at":                &next,
+					"retry_count":             row.RetryCount + 1,
+					"verify_count":            0,
+					"last_error":              "confirmed provider hash mismatch; scheduling one automatic repair upload",
+					"resolution_reason":       "",
+					"recovery_started_at":     gorm.Expr("COALESCE(recovery_started_at, ?)", evidenceAt),
+					"remote_object_id":        remoteID,
+					"remote_sha1":             remoteSHA1,
+					"remote_generation":       0,
+					"remote_verified_at":      nil,
 					"restart_upload_recovery": false,
 				}
 				_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
