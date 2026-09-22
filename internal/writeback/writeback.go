@@ -55,8 +55,8 @@ const (
 	// are represented by retry_count, retry_at and last_error.
 	legacyStateFailed = "failed"
 
-	receiveLeaseDuration          = 15 * time.Minute
-	receiveHeartbeatEvery         = time.Minute
+	receiveLeaseDuration          = time.Minute
+	receiveHeartbeatEvery         = 10 * time.Second
 	receiveProgressHeartbeatEvery = time.Second
 )
 
@@ -2170,6 +2170,7 @@ func settleCompletedRemoteHashMismatch(row *model.WebDAVWritebackObject, remote 
 		"remote_sha1":                  evidence.sha1,
 		"remote_generation":            0,
 		"remote_verified_at":           nil,
+		"restart_upload_recovery":      false,
 	}
 	updates = mergeUpdateMaps(updates, applyProviderEvidence(row, now, ResolutionRemoteHashMismatch))
 	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
@@ -6454,10 +6455,11 @@ func (m *workerManager) recoverInterrupted() error {
 		return tx.Model(&model.WebDAVWritebackObject{}).
 			Where("state = ? AND is_dir = ? AND cleanup_path = ''", StateUploading, false).
 			Updates(map[string]any{
-				"state":        StateVerifying,
-				"retry_at":     &now,
-				"verify_count": 0,
-				"last_error":   "resuming remote verification after interrupted upload",
+				"state":                   StateVerifying,
+				"retry_at":                &now,
+				"verify_count":            0,
+				"restart_upload_recovery": true,
+				"last_error":              "resuming remote verification after interrupted upload",
 			}).Error
 	}); err != nil {
 		return err
@@ -7835,6 +7837,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 			"provider_upload_started_at":   &uploadStartedAt,
 			"provider_upload_completed_at": nil,
 			"provider_uploaded_bytes":      0,
+			"restart_upload_recovery":      false,
 		})
 	if res.Error != nil || res.RowsAffected == 0 {
 		return
@@ -8089,17 +8092,25 @@ func advanceRemoteVerification(state remoteVerificationState, current, attempts 
 	return next, next >= max(1, attempts)
 }
 
-const open115MultipartChunkSize int64 = 20 * utils.MB
+const (
+	open115MultipartChunkSize       int64 = 20 * utils.MB
+	restartUploadVerificationWindow       = time.Minute
+)
 
 func verificationAttemptsFor(row *model.WebDAVWritebackObject, requireHash bool) int {
 	attempts := max(1, conf.Conf.WebDAVWriteback.VerifyAttempts)
-	if row == nil || !requireHash || row.Size <= open115MultipartChunkSize {
-		return attempts
-	}
 	intervalSeconds := max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)
-	minWindowSeconds := max(intervalSeconds, conf.Conf.WebDAVWriteback.RetryMaxSeconds)
-	minAttempts := (minWindowSeconds + intervalSeconds - 1) / intervalSeconds
-	return max(attempts, minAttempts)
+	if row != nil && requireHash && row.Size > open115MultipartChunkSize {
+		minWindowSeconds := max(intervalSeconds, conf.Conf.WebDAVWriteback.RetryMaxSeconds)
+		minAttempts := (minWindowSeconds + intervalSeconds - 1) / intervalSeconds
+		attempts = max(attempts, minAttempts)
+	}
+	if row != nil && row.RestartUploadRecovery {
+		windowSeconds := max(intervalSeconds, int(restartUploadVerificationWindow/time.Second))
+		restartAttempts := max(2, (windowSeconds+intervalSeconds-1)/intervalSeconds)
+		attempts = min(attempts, restartAttempts)
+	}
+	return attempts
 }
 
 func remoteVerificationInconclusiveDelay() time.Duration {
@@ -8290,8 +8301,9 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 		"verify_count":       0,
 		"remote_object_id":   evidence.objectID,
 		"remote_sha1":        evidence.sha1,
-		"remote_generation":  evidence.generation,
-		"remote_verified_at": &evidence.verifiedAt,
+		"remote_generation":       evidence.generation,
+		"remote_verified_at":      &evidence.verifiedAt,
+		"restart_upload_recovery": false,
 	}
 	updates = mergeUpdateMaps(updates, applyProviderEvidence(row, now, "matched"))
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
@@ -8476,8 +8488,9 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 					"recovery_started_at": gorm.Expr("COALESCE(recovery_started_at, ?)", evidenceAt),
 					"remote_object_id":    remoteID,
 					"remote_sha1":         remoteSHA1,
-					"remote_generation":   0,
-					"remote_verified_at":  nil,
+					"remote_generation":        0,
+					"remote_verified_at":       nil,
+					"restart_upload_recovery": false,
 				}
 				_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 					Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
@@ -8559,11 +8572,12 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
 			Updates(map[string]any{
-				"state":        StateQueued,
-				"retry_at":     &next,
-				"retry_count":  row.RetryCount + 1,
-				"verify_count": 0,
-				"last_error":   "fresh provider evidence stayed divergent through the verification window; scheduling one automatic repair upload",
+				"state":                   StateQueued,
+				"retry_at":                &next,
+				"retry_count":             row.RetryCount + 1,
+				"verify_count":            0,
+				"restart_upload_recovery": false,
+				"last_error":              "fresh provider evidence stayed divergent through the verification window; scheduling one automatic repair upload",
 			}).Error
 		return
 	}

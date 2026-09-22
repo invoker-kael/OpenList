@@ -43,7 +43,11 @@ A successful PUT means the complete payload is durable in the local spool and th
 
 After the complete PUT body is fsynced and atomically installed in the spool, the canonical MySQL commit is intentionally detached from HTTP request cancellation. A late Cloud Sync timeout/disconnect can therefore lose the response, but it cannot make OpenList discard an already complete large payload; the next retry observes/coalesces against the durable canonical generation. An incomplete body is never committed. When the request has a declared length and OpenList has received exactly that many bytes, a terminal connection-cancellation error after the final byte is treated as end-of-body rather than as truncation; cancellation before the declared length remains a hard failure.
 
-Failed remote uploads retry in the background. An interrupted `UPLOADING` row is deliberately re-queued from the durable spool after restart. This can duplicate a provider upload after a crash, but it avoids treating an older same-sized encrypted object as proof that the newest generation arrived. The remote write contract is therefore **at-least-once across crashes**, with the local canonical generation remaining authoritative to Cloud Sync.
+Failed remote uploads retry in the background. An interrupted provider `UPLOADING` row is recovered from the durable spool after restart without requiring Cloud Sync to resend an already-ACKed file. OpenList first performs fresh provider verification; restart-interrupted uploads use a bounded roughly one-minute verification window instead of the normal long large-object convergence window. A match completes immediately; confirmed divergence with a healthy spool returns to the automatic provider-upload path.
+
+A PUT that was still **RECEIVING** when OpenList crashed is different: it never received Durable ACK and cannot be resumed from a partial body. The durable receive lease is one minute with an independent 10-second heartbeat, so a crashed receive stops blocking quickly while a live slow upload keeps renewing its lease. Cloud Sync may continue with later files and retry/rescan the interrupted file later; OpenList does not fabricate a completed generation for the partial receive.
+
+The remote write contract remains **at-least-once across crashes**, with the local canonical generation remaining authoritative to Cloud Sync.
 
 
 ## Database requirement

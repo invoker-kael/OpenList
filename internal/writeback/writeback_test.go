@@ -1591,12 +1591,12 @@ func TestReplicaLifecycleUsesSingleStateColumn(t *testing.T) {
 	}
 }
 
-func TestReceiveLeaseConstantsCoverSlowLargePuts(t *testing.T) {
-	if receiveLeaseDuration <= receiveHeartbeatEvery {
-		t.Fatalf("receive lease %v must exceed heartbeat interval %v", receiveLeaseDuration, receiveHeartbeatEvery)
+func TestReceiveLeaseConstantsRecoverQuicklyAfterCrash(t *testing.T) {
+	if receiveLeaseDuration < 5*receiveHeartbeatEvery {
+		t.Fatalf("receive lease %v must leave several heartbeat intervals over %v", receiveLeaseDuration, receiveHeartbeatEvery)
 	}
-	if receiveLeaseDuration < 5*time.Minute {
-		t.Fatalf("receive lease %v is too short for slow large PUTs", receiveLeaseDuration)
+	if receiveLeaseDuration > time.Minute {
+		t.Fatalf("receive lease %v keeps crashed PUTs visible too long", receiveLeaseDuration)
 	}
 }
 
@@ -2977,6 +2977,15 @@ func TestLarge115VerificationWindowUsesRetryMax(t *testing.T) {
 	conf.Conf.WebDAVWriteback.VerifyAttempts = 500
 	if got := verificationAttemptsFor(large, true); got != 500 {
 		t.Fatalf("explicit longer verification budget = %d, want 500", got)
+	}
+
+	large.RestartUploadRecovery = true
+	if got := verificationAttemptsFor(large, true); got != 12 {
+		t.Fatalf("restart-interrupted large upload verification attempts = %d, want 12", got)
+	}
+	small.RestartUploadRecovery = true
+	if got := verificationAttemptsFor(small, true); got != 12 {
+		t.Fatalf("restart-interrupted small upload verification attempts = %d, want 12", got)
 	}
 }
 

@@ -258,10 +258,10 @@ OpenList 重启通常**不需要**同时重启 Cloud Sync。
 
 重启后预期行为：
 
-- 中断的 `uploading` 从 durable state 恢复；
-- stale receive lease 被回收；
-- queued payload 重新进入 provider worker；
-- verification 继续；
+- 如果 PUT 在 Durable ACK 之前中断，部分请求体不能续传；receive lease 最多约 1 分钟失效，正常仍在运行的 PUT 每 10 秒续租，Cloud Sync 可以先继续其他文件，之后再 retry/rescan 该文件；
+- 如果文件已经 Durable ACK、只是在 Provider 上传阶段中断，则完全由 OpenList 使用 durable spool 自动恢复，不依赖 Cloud Sync 重传；
+- 重启中断的 Provider 上传会先做 fresh verification，使用约 1 分钟的受限验证窗口；仍明确不一致且 spool 完整时自动重新进入 Provider 上传；
+- queued payload 会重新进入 provider worker；
 - 已 ACK 的 canonical metadata 对 Cloud Sync 保持稳定。
 
 只有最终恢复状态变成 `needs_cloudsync_rehydrate` 时，才需要停止并重新启动 Cloud Sync 任务。

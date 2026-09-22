@@ -254,10 +254,10 @@ Restarting OpenList is not normally a reason to restart Cloud Sync.
 
 Expected behavior after OpenList restart:
 
-- interrupted `uploading` work is recovered from durable state;
-- stale receive leases expire and are reclaimed;
+- a PUT interrupted before Durable ACK is not resumable from its partial body; its receive lease expires within about one minute while a live PUT renews the lease every 10 seconds, and Cloud Sync may retry that file later after continuing other work;
+- an already-ACKed file interrupted during provider upload is recovered entirely by OpenList from the durable spool and does not depend on Cloud Sync retransmission;
+- restart-interrupted provider uploads first use fresh verification with a bounded roughly one-minute window, then automatically return to provider upload when the provider is still conclusively divergent and the spool is intact;
 - queued payloads return to provider workers;
-- verification resumes;
 - acknowledged canonical metadata remains stable for Cloud Sync.
 
 Only if recovery ultimately becomes `needs_cloudsync_rehydrate` should the Cloud Sync task itself be stop/started.
