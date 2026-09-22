@@ -747,6 +747,13 @@ type webDAVWritebackHistoryCleanupResult struct {
 func WebDAVWritebackHistoryList(c *gin.Context) {
 	limit := webDAVMonitorLimit(c)
 	statusFilter := strings.ToLower(strings.TrimSpace(c.Query("status")))
+	statusGroupFilter := strings.ToLower(strings.TrimSpace(c.Query("status_group")))
+	switch statusGroupFilter {
+	case "", "completed", "processing":
+	default:
+		common.ErrorResp(c, errors.New("unsupported status_group"), http.StatusBadRequest)
+		return
+	}
 	currentStateFilter := strings.ToLower(strings.TrimSpace(c.Query("current_state")))
 	actionRequiredRaw := strings.TrimSpace(c.Query("action_required"))
 	var actionRequiredFilter *bool
@@ -809,7 +816,7 @@ func WebDAVWritebackHistoryList(c *gin.Context) {
 		query = query.Where("updated_at >= ?", after)
 	}
 	candidateLimit := limit
-	if statusFilter != "" || currentStateFilter != "" || actionRequiredFilter != nil {
+	if statusFilter != "" || statusGroupFilter != "" || currentStateFilter != "" || actionRequiredFilter != nil {
 		candidateLimit = webDAVMonitorMaxLimit
 	}
 	var rows []model.WebDAVWritebackHistory
@@ -876,6 +883,26 @@ func WebDAVWritebackHistoryList(c *gin.Context) {
 		actionRequired := action == webDAVActionRestartCloudSync || action == webDAVActionManualCheck
 		if actionRequiredFilter != nil && actionRequired != *actionRequiredFilter {
 			continue
+		}
+		switch statusGroupFilter {
+		case "completed":
+			if status != webDAVStatusCompleted && status != webDAVStatusRecovered {
+				continue
+			}
+		case "processing":
+			switch status {
+			case webDAVStatusReceiving,
+				webDAVStatusDurableAcked,
+				webDAVStatusRemoteUploading,
+				webDAVStatusRemoteVerifying,
+				webDAVStatusAutomaticRecovery,
+				webDAVStatusReuploadReceiving,
+				webDAVStatusReuploadReceived,
+				webDAVStatusReuploadUploading,
+				webDAVStatusReuploadVerifying:
+			default:
+				continue
+			}
 		}
 
 		item := webDAVWritebackHistoryRow{
