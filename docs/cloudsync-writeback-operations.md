@@ -1,14 +1,16 @@
 # Cloud Sync Write-back Operations Guide
 
-This guide is for operating WebDAV Durable Write-back with **one-way Synology Cloud Sync** jobs.
+This guide covers day-to-day operation of WebDAV Durable Write-back with **one-way Synology Cloud Sync** jobs. Most recovery is automatic; the sections below focus on what the UI means and when operator action is genuinely useful.
 
 > **Development note:** This feature was developed with AI assistance and validated through human testing.
 
 ## Core rule
 
-**`needs_cloudsync_rehydrate` is the only normal write-back recovery state that requires Cloud Sync or operator intervention. All other normal write-back recovery states are designed to self-heal.**
+For normal operation, there is one simple rule:
 
-Infrastructure failures are outside this rule. If the database service is unavailable, the spool filesystem is full or damaged, provider credentials are invalid, or the provider/network path is broken, repair that infrastructure first.
+**Only `needs_cloudsync_rehydrate` requires Cloud Sync or operator intervention. Other normal write-back recovery states are designed to recover automatically.**
+
+Infrastructure failures are the exception. If MySQL is unavailable, the spool filesystem is full or damaged, credentials have expired, or the provider/network path is broken, fix that underlying issue first and then let OpenList resume recovery.
 
 
 ## 1. Component requirements
@@ -250,9 +252,9 @@ docker logs op --since 2h 2>&1 | grep -E \
 
 ## 9. Restart behavior
 
-Restarting OpenList is not normally a reason to restart Cloud Sync.
+A normal OpenList restart should be transparent to Cloud Sync in most cases.
 
-Expected behavior after OpenList restart:
+After restart, OpenList handles the two interrupted stages differently:
 
 - a PUT interrupted before Durable ACK is not resumable from its partial body; its receive lease expires within about one minute while a live PUT renews the lease every 10 seconds, and Cloud Sync may retry that file later after continuing other work;
 - an already-ACKed file interrupted during provider upload is recovered entirely by OpenList from the durable spool and does not depend on Cloud Sync retransmission;
@@ -262,17 +264,19 @@ Expected behavior after OpenList restart:
 
 Only if recovery ultimately becomes `needs_cloudsync_rehydrate` should the Cloud Sync task itself be stop/started.
 
-## 10. What not to do
+## 10. Recommended operating boundaries
 
-Avoid these actions unless performing deliberate incident recovery:
+The safest approach is to let OpenList finish its own recovery whenever it still has enough durable state to do so.
 
-- do not manually delete spool files for queued/uploading/verifying generations;
-- do not clear server-database write-back rows just to make the UI look clean;
-- do not restart Cloud Sync for every provider retry;
-- do not treat the first divergence observation as confirmed data loss;
-- do not delete/recreate a Cloud Sync task merely to trigger rehydrate;
-- do not use SQLite for Durable Write-back;
-- do not directly modify canonical state while a receive or provider operation is active.
+In normal operation:
+
+- keep spool files for queued/uploading/verifying generations intact;
+- keep write-back database rows unless you are performing a deliberate clean test reset;
+- leave Cloud Sync running during ordinary provider retries and verification;
+- treat the first divergence observation as evidence to verify, not immediate proof of data loss;
+- stop/start the existing Cloud Sync task only when the UI reaches the final re-upload state;
+- use MySQL for Durable Write-back;
+- avoid manually changing canonical state while a receive or provider operation is active.
 
 ## 11. Infrastructure incidents
 

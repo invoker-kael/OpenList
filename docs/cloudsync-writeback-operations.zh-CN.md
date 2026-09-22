@@ -1,14 +1,16 @@
 # Cloud Sync Write-back 运维指南
 
-本文档用于运维 **Synology Cloud Sync 单向上传**场景下的 WebDAV Durable Write-back。
+本文档面向 **Synology Cloud Sync 单向上传**场景下的 WebDAV Durable Write-back 日常运维。大多数异常都由 OpenList 自动恢复；这里重点说明页面状态代表什么，以及什么时候真的需要人工操作。
 
 > **开发说明：** 本功能由 AI 辅助开发，并经过人工测试验证。
 
 ## 核心规则
 
-**`needs_cloudsync_rehydrate` 是正常写回恢复流程中唯一需要 Cloud Sync 或人工介入的状态。其他正常写回恢复状态都应由 OpenList 自动恢复。**
+日常使用可以记住一条：
 
-基础设施故障不属于这条规则。如果数据库不可用、spool 文件系统已满或损坏、远端存储凭据失效、网络链路异常，应先修复基础设施。
+**只有 `needs_cloudsync_rehydrate` 需要 Cloud Sync 或人工介入；其他正常写回恢复状态都应优先交给 OpenList 自动处理。**
+
+基础设施故障是例外。如果 MySQL 不可用、spool 文件系统已满或损坏、凭据失效，或 Provider/网络链路异常，应先修复基础设施，再让 OpenList 继续恢复。
 
 
 ## 1. 组件要求
@@ -254,9 +256,9 @@ docker logs op --since 2h 2>&1 | grep -E \
 
 ## 9. OpenList 重启行为
 
-OpenList 重启通常**不需要**同时重启 Cloud Sync。
+正常重启 OpenList 时，大多数情况下**不需要**同时重启 Cloud Sync。
 
-重启后预期行为：
+重启后，OpenList 会根据中断发生在哪个阶段分别处理：
 
 - 如果 PUT 在 Durable ACK 之前中断，部分请求体不能续传；receive lease 最多约 1 分钟失效，正常仍在运行的 PUT 每 10 秒续租，Cloud Sync 可以先继续其他文件，之后再 retry/rescan 该文件；
 - 如果文件已经 Durable ACK、只是在 Provider 上传阶段中断，则完全由 OpenList 使用 durable spool 自动恢复，不依赖 Cloud Sync 重传；
@@ -266,17 +268,19 @@ OpenList 重启通常**不需要**同时重启 Cloud Sync。
 
 只有最终恢复状态变成 `needs_cloudsync_rehydrate` 时，才需要停止并重新启动 Cloud Sync 任务。
 
-## 10. 不要这样做
+## 10. 日常操作建议
 
-除非明确执行事故恢复，否则不要：
+只要 OpenList 仍然掌握足够的 durable state，优先让它自己完成恢复，通常是最稳妥的做法。
 
-- 手工删除 queued/uploading/verifying generation 的 spool；
-- 为了“页面干净”直接清理服务端数据库中的 write-back 行；
-- 每次 provider retry 都去重启 Cloud Sync；
-- 第一次发现 divergence 就认定数据丢失；
-- 为触发 rehydrate 而删除或重建整个 Cloud Sync 任务；
-- 使用 SQLite 承载 Durable Write-back；
-- 在 receive 或 provider operation 正在运行时手工修改 canonical state。
+日常建议：
+
+- 保留 queued/uploading/verifying generation 对应的 spool 文件；
+- 除非明确做一次全新测试，否则不要为了“页面干净”清理 write-back 数据；
+- 普通 Provider retry 和 verification 期间保持 Cloud Sync 正常运行；
+- 第一次发现 divergence 时先让系统继续验证，不要立即判断为数据丢失；
+- 只有页面进入最终“等待 Cloud Sync 重传”状态时，才停止并重新启动现有 Cloud Sync 任务；
+- Durable Write-back 使用 MySQL；
+- receive 或 Provider operation 正在运行时，不手工修改 canonical state。
 
 ## 11. 基础设施故障
 
@@ -328,13 +332,13 @@ Recovery State 是否为 needs_cloudsync_rehydrate？
 
 ## 13. 运维总结
 
-- Cloud Sync 保留源文件。
+- Cloud Sync 始终保留源文件，是最终的数据来源。
 - OpenList 负责 durable 接收、Provider 上传、重试、验证和恢复。
 - 本 fork 的 Durable Write-back 仅支持 MySQL。
-- 普通 Provider 错误继续由 OpenList 自动恢复。
-- 活动任务只展示简化后的 Cloud Sync 生命周期，并显示真实接收/上传进度。
-- 历史记录只展示有意义的最终结果；恢复成功统一显示“已完成”。
-- 最终 fallback 保持 canonical ACK 可见，等待 Cloud Sync 对同一路径发起新的 PUT。
+- 普通 Provider 异常优先由 OpenList 自动恢复，不需要频繁操作 Cloud Sync。
+- “活动任务”只展示简化后的 Cloud Sync 生命周期，并提供真实的接收/上传进度。
+- “历史记录”只展示有意义的最终结果；恢复成功统一显示“已完成”。
+- 只有自动恢复最终无法安全收敛时，才进入“等待 Cloud Sync 重传”，由 Cloud Sync 重新发布同一路径的新 generation。
 
 ## 远端 Hash 差异与最终恢复
 
