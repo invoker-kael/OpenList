@@ -11,6 +11,7 @@ on:
       - "server/webdav/**"
       - "server/handles/webdav_writeback.go"
       - "server/router.go"
+      - ".github/workflows/writeback.yml"
   pull_request:
     branches: ["main"]
     paths:
@@ -60,8 +61,6 @@ jobs:
             server/webdav/precondition_test.go
             server/webdav/util.go
             server/webdav/util_test.go
-            server/handles/webdav_writeback.go
-            server/router.go
             server/common/proxy.go
             server/common/proxy_test.go
             drivers/115_open/driver.go
