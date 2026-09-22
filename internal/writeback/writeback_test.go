@@ -3829,3 +3829,26 @@ func TestApplyDuplicatePutMetadataPreservesOmittedTimes(t *testing.T) {
 		t.Fatalf("mime metadata should still converge, got %q", row.MimeType)
 	}
 }
+
+
+func TestNextReceiveGenerationUsesDurableSequenceAcrossRecreate(t *testing.T) {
+	tests := []struct {
+		name     string
+		current  uint64
+		sequence uint64
+		want     uint64
+	}{
+		{name: "first receive", current: 0, sequence: 1, want: 1},
+		{name: "recreate after deleted row", current: 0, sequence: 9, want: 9},
+		{name: "existing generation ahead", current: 12, sequence: 9, want: 13},
+		{name: "sequence ahead", current: 4, sequence: 8, want: 8},
+		{name: "defensive zero sequence", current: 0, sequence: 0, want: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nextReceiveGeneration(tt.current, tt.sequence); got != tt.want {
+				t.Fatalf("nextReceiveGeneration(%d, %d)=%d, want %d", tt.current, tt.sequence, got, tt.want)
+			}
+		})
+	}
+}

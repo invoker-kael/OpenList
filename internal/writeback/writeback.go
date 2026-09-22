@@ -154,6 +154,17 @@ func canonicalETag(key string, generation uint64, size int64) string {
 	return fmt.Sprintf("\"olwb-%s-%d-%x\"", key[:16], generation, uint64(size))
 }
 
+func nextReceiveGeneration(current, receiveSequence uint64) uint64 {
+	next := receiveSequence
+	if next == 0 {
+		next = 1
+	}
+	if current >= next {
+		return current + 1
+	}
+	return next
+}
+
 func emptyPayloadSHA1() string {
 	hasher := utils.SHA1.NewFunc()
 	return hex.EncodeToString(hasher.Sum(nil))
@@ -3470,10 +3481,10 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			if canonicalDeleted(&row) {
 				created = true
 			}
-			row.Generation++
+			row.Generation = nextReceiveGeneration(row.Generation, receiveSequence)
 		} else {
 			created = true
-			row.Generation = 1
+			row.Generation = nextReceiveGeneration(0, receiveSequence)
 		}
 
 		row.PathKey = key

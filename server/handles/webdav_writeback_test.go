@@ -4,6 +4,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"gorm.io/gorm/schema"
@@ -26,5 +27,88 @@ func TestWebDAVWritebackMonitorUsesGormETagColumnName(t *testing.T) {
 	}
 	if strings.Contains(webDAVWritebackMonitorColumns, " etag") {
 		t.Fatalf("monitor SELECT must not use non-existent raw column etag: %q", webDAVWritebackMonitorColumns)
+	}
+}
+
+
+func TestWebDAVHistoryEffectiveStatusWaitsForCloudSync(t *testing.T) {
+	now := time.Unix(200, 0)
+	history := &model.WebDAVWritebackHistory{
+		PathKey:      "path-key",
+		Generation:   4,
+		RecoveryType: "cloudsync_rehydrate_required",
+		UpdatedAt:    now.Add(-time.Minute),
+	}
+	status, action := webDAVHistoryEffectiveStatus(history, nil, nil, now)
+	if status != webDAVStatusWaitingCloudSync || action != webDAVActionRestartCloudSync {
+		t.Fatalf("status=%q action=%q, want waiting/restart", status, action)
+	}
+}
+
+func TestWebDAVHistoryEffectiveStatusDetectsActiveReuploadReceive(t *testing.T) {
+	now := time.Unix(300, 0)
+	started := now.Add(-5 * time.Second)
+	lease := now.Add(time.Minute)
+	history := &model.WebDAVWritebackHistory{
+		PathKey:      "path-key",
+		Generation:   4,
+		RecoveryType: "cloudsync_rehydrate_required",
+		UpdatedAt:    now.Add(-time.Minute),
+	}
+	fence := &model.WebDAVWritebackReceiveFence{
+		PathKey:           "path-key",
+		ActiveReceivers:   1,
+		LatestStartedAt:   &started,
+		ReceiveLeaseUntil: &lease,
+	}
+	status, action := webDAVHistoryEffectiveStatus(history, nil, fence, now)
+	if status != webDAVStatusReuploadReceiving || action != "" {
+		t.Fatalf("status=%q action=%q, want receiving/no action", status, action)
+	}
+}
+
+func TestWebDAVHistoryEffectiveStatusDetectsReuploadAfterGenerationReset(t *testing.T) {
+	now := time.Unix(400, 0)
+	ack := now.Add(-10 * time.Second)
+	history := &model.WebDAVWritebackHistory{
+		PathKey:      "path-key",
+		Generation:   7,
+		RecoveryType: "cloudsync_rehydrate_required",
+		UpdatedAt:    now.Add(-time.Minute),
+	}
+	current := &model.WebDAVWritebackObject{
+		PathKey:        "path-key",
+		Generation:     1,
+		CanonicalState: "durable_acked",
+		State:          "uploading",
+		AckTime:        &ack,
+	}
+	status, action := webDAVHistoryEffectiveStatus(history, current, nil, now)
+	if status != webDAVStatusReuploadUploading || action != "" {
+		t.Fatalf("status=%q action=%q, want uploading/no action", status, action)
+	}
+}
+
+func TestWebDAVHistoryEffectiveStatusRecovered(t *testing.T) {
+	now := time.Unix(500, 0)
+	ack := now.Add(-10 * time.Second)
+	completed := now.Add(-5 * time.Second)
+	history := &model.WebDAVWritebackHistory{
+		PathKey:      "path-key",
+		Generation:   3,
+		RecoveryType: "cloudsync_rehydrate_required",
+		UpdatedAt:    now.Add(-time.Minute),
+	}
+	current := &model.WebDAVWritebackObject{
+		PathKey:        "path-key",
+		Generation:     4,
+		CanonicalState: "durable_acked",
+		State:          "completed",
+		AckTime:        &ack,
+		CompletedAt:    &completed,
+	}
+	status, action := webDAVHistoryEffectiveStatus(history, current, nil, now)
+	if status != webDAVStatusRecovered || action != "" {
+		t.Fatalf("status=%q action=%q, want recovered/no action", status, action)
 	}
 }
