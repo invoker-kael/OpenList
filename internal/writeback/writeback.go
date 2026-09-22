@@ -1863,6 +1863,128 @@ func refreshMatchingCompletedSiblings(trigger *model.WebDAVWritebackObject, remo
 	}
 }
 
+const freshParentCompletedEvidenceBatchLimit = 64
+
+func freshCompletedEvidenceEligible(row *model.WebDAVWritebackObject) bool {
+	return row != nil &&
+		!row.IsDir &&
+		row.State == StateCompleted &&
+		row.SpoolPath == "" &&
+		row.PayloadSHA1 != "" &&
+		row.VerifyCount == 0 &&
+		row.RetryAt == nil &&
+		row.LastError == ""
+}
+
+func matchingFreshCompletedEvidenceRows(rows []model.WebDAVWritebackObject, remotes []model.Obj, now time.Time) []verificationBatchMatch {
+	if len(rows) == 0 || len(remotes) == 0 {
+		return nil
+	}
+	byName := make(map[string]model.Obj, len(remotes))
+	for _, remote := range remotes {
+		if remote != nil {
+			byName[remote.GetName()] = remote
+		}
+	}
+	matches := make([]verificationBatchMatch, 0, min(len(rows), len(remotes)))
+	for i := range rows {
+		row := &rows[i]
+		if !freshCompletedEvidenceEligible(row) {
+			continue
+		}
+		remote := byName[row.Name]
+		if _, matched := matchedRemoteVerificationEvidence(row, remote, now, true); matched {
+			matches = append(matches, verificationBatchMatch{row: *row, remote: remote})
+		}
+	}
+	return matches
+}
+
+func refreshFreshCompletedEvidenceBatch(matches []verificationBatchMatch, now time.Time) error {
+	if len(matches) == 0 {
+		return nil
+	}
+
+	ids := make([]uint, 0, len(matches))
+	generationArgs := make([]any, 0, len(matches)*2)
+	objectIDArgs := make([]any, 0, len(matches)*2)
+	sha1Args := make([]any, 0, len(matches)*2)
+	var generationCase strings.Builder
+	var objectIDCase strings.Builder
+	var sha1Case strings.Builder
+	generationCase.WriteString("CASE id")
+	objectIDCase.WriteString("CASE id")
+	sha1Case.WriteString("CASE id")
+
+	for i := range matches {
+		match := &matches[i]
+		evidence, ok := matchedRemoteVerificationEvidence(&match.row, match.remote, now, true)
+		if !ok {
+			continue
+		}
+		ids = append(ids, match.row.ID)
+		generationCase.WriteString(" WHEN ? THEN ?")
+		generationArgs = append(generationArgs, match.row.ID, match.row.Generation)
+		objectIDCase.WriteString(" WHEN ? THEN ?")
+		objectIDArgs = append(objectIDArgs, match.row.ID, evidence.objectID)
+		sha1Case.WriteString(" WHEN ? THEN ?")
+		sha1Args = append(sha1Args, match.row.ID, evidence.sha1)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	generationCase.WriteString(" ELSE 0 END")
+	objectIDCase.WriteString(" ELSE remote_object_id END")
+	sha1Case.WriteString(" ELSE remote_sha1 END")
+
+	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id IN ?", ids).
+		Where("generation = "+generationCase.String(), generationArgs...).
+		Where("state = ? AND spool_path = '' AND payload_sha1 <> ''", StateCompleted).
+		Where("verify_count = 0 AND retry_at IS NULL AND last_error = ''").
+		Where("(canonical_state = ? OR canonical_state = '' OR canonical_state IS NULL)", CanonicalStateAcked).
+		Updates(map[string]any{
+			"remote_object_id":  gorm.Expr(objectIDCase.String(), objectIDArgs...),
+			"remote_sha1":       gorm.Expr(sha1Case.String(), sha1Args...),
+			"remote_generation": gorm.Expr("generation"),
+			"remote_verified_at": &now,
+		}).Error
+}
+
+func refreshFreshParentCompletedEvidence(parent string, remotes []model.Obj, now time.Time) {
+	if len(remotes) == 0 {
+		return
+	}
+	parent = utils.FixAndCleanPath(parent)
+	if !providerRequiresPayloadHash(path.Join(parent, ".writeback-evidence-probe")) {
+		return
+	}
+
+	cutoff := now.Add(-completedRemoteVerificationInterval())
+	var rows []model.WebDAVWritebackObject
+	if err := db.GetDb().
+		Select("id", "name", "size", "payload_sha1", "generation", "state", "spool_path", "verify_count", "retry_at", "last_error").
+		Where("parent_key = ? AND state = ? AND is_dir = ? AND spool_path = ''", pathKey(parent), StateCompleted, false).
+		Where("verify_count = 0 AND retry_at IS NULL AND last_error = '' AND payload_sha1 <> ''").
+		Where("(canonical_state = ? OR canonical_state = '' OR canonical_state IS NULL)", CanonicalStateAcked).
+		Where("(remote_verified_at IS NULL OR remote_verified_at <= ? OR remote_generation <> generation OR remote_sha1 = '' OR LOWER(remote_sha1) <> LOWER(payload_sha1))", cutoff).
+		Order("remote_verified_at asc").
+		Order("id asc").
+		Limit(freshParentCompletedEvidenceBatchLimit).
+		Find(&rows).Error; err != nil {
+		log.Errorf("write-back fresh parent completed evidence scan failed for %s: %v", parent, err)
+		return
+	}
+	matches := matchingFreshCompletedEvidenceRows(rows, remotes, now)
+	if len(matches) == 0 {
+		return
+	}
+	if err := refreshFreshCompletedEvidenceBatch(matches, now); err != nil {
+		log.Errorf("write-back fresh parent completed evidence refresh failed for %s: %v", parent, err)
+	}
+}
+
 func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWritebackObject, now time.Time) (bool, error) {
 	if row == nil || row.IsDir {
 		return false, nil
@@ -3365,6 +3487,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 			removeSpoolIfUnreferenced(oldSpool)
 		}
 	}
+	InvalidateProviderSnapshots(parent)
 	// retry_at already carries the Cloud Sync settle window. Waking the
 	// scheduler before that deadline only forces an immediate queue query that
 	// cannot dispatch this row; the existing 2s scheduler tick will pick it up.
@@ -3449,6 +3572,7 @@ func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*m
 	if err != nil {
 		return nil, false, err
 	}
+	InvalidateProviderSnapshots(parent, p)
 	wake()
 	return &saved, created, nil
 }
@@ -3585,6 +3709,7 @@ func DeleteTree(p string) (bool, error) {
 		return handled, err
 	}
 	if handled {
+		InvalidateProviderSnapshots(path.Dir(p), p)
 		wake()
 	}
 	return handled, nil
@@ -3661,9 +3786,11 @@ func StageProviderDelete(ctx context.Context, p string, source model.Obj) (bool,
 		return false, err
 	}
 	if alreadyDeleted {
+		InvalidateProviderSnapshots(path.Dir(p), p)
 		return true, nil
 	}
 	if staged {
+		InvalidateProviderSnapshots(path.Dir(p), p)
 		wake()
 	}
 	return staged, nil
@@ -4071,7 +4198,11 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 		return false, false, nil
 	}
 	if srcRow.IsDir {
-		return movePendingDirectory(src, dst, overwrite)
+		handled, overwritten, err = movePendingDirectory(src, dst, overwrite)
+		if err == nil && handled {
+			InvalidateProviderSnapshots(path.Dir(src), path.Dir(dst), src, dst)
+		}
+		return handled, overwritten, err
 	}
 	if srcRow.SpoolPath == "" && (srcRow.State != StateCompleted || !canonicalAcked(&srcRow)) {
 		return false, false, nil
@@ -4176,6 +4307,7 @@ func MovePending(src, dst string, overwrite bool) (handled bool, overwritten boo
 			removeSpoolIfUnreferenced(oldDestinationSpool)
 		}
 	}
+	InvalidateProviderSnapshots(path.Dir(src), path.Dir(dst), src, dst)
 	wake()
 	return true, overwritten, nil
 }
@@ -4201,7 +4333,11 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 		return false, false, nil
 	}
 	if srcRow.IsDir {
-		return copyPendingDirectory(src, dst, recursive)
+		handled, overwritten, err = copyPendingDirectory(src, dst, recursive)
+		if err == nil && handled {
+			InvalidateProviderSnapshots(path.Dir(dst), dst)
+		}
+		return handled, overwritten, err
 	}
 	if srcRow.SpoolPath == "" {
 		return false, false, nil
@@ -4282,6 +4418,7 @@ func CopyPending(src, dst string, overwrite bool, recursive bool) (handled bool,
 			removeSpoolIfUnreferenced(oldDestinationSpool)
 		}
 	}
+	InvalidateProviderSnapshots(path.Dir(dst), dst)
 	wake()
 	return true, overwritten, nil
 }
@@ -5309,8 +5446,12 @@ func ProviderListForWebDAV(ctx context.Context, parent string) ([]model.Obj, boo
 		if err != nil {
 			return nil, err
 		}
-		defer releaseWorkerSlot(slots, reserved)
-		return fs.List(ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
+		fresh, listErr := fs.List(ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
+		releaseWorkerSlot(slots, reserved)
+		if listErr == nil {
+			refreshFreshParentCompletedEvidence(parent, fresh, time.Now())
+		}
+		return fresh, listErr
 	})
 	return objs, false, err
 }
@@ -5453,8 +5594,12 @@ func (m *workerManager) refreshParent(parent string) ([]model.Obj, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer releaseWorkerSlot(m.providerProbes, reserved)
-		return fs.List(m.ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
+		fresh, listErr := fs.List(m.ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
+		releaseWorkerSlot(m.providerProbes, reserved)
+		if listErr == nil {
+			refreshFreshParentCompletedEvidence(parent, fresh, time.Now())
+		}
+		return fresh, listErr
 	})
 }
 

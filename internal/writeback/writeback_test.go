@@ -3367,6 +3367,48 @@ func TestMatchingCompletedSiblingRows(t *testing.T) {
 	}
 }
 
+
+func TestMatchingFreshCompletedEvidenceRowsRequiresHealthyExact115Evidence(t *testing.T) {
+	now := time.Date(2026, time.September, 22, 1, 0, 0, 0, time.UTC)
+	sha := strings.Repeat("a", 40)
+	retryAt := now.Add(time.Minute)
+	rows := []model.WebDAVWritebackObject{
+		{ID: 1, Name: "healthy.bin", State: StateCompleted, Size: 100, PayloadSHA1: sha, Generation: 7},
+		{ID: 2, Name: "divergent.bin", State: StateCompleted, Size: 100, PayloadSHA1: sha, Generation: 7, VerifyCount: 1},
+		{ID: 3, Name: "retry.bin", State: StateCompleted, Size: 100, PayloadSHA1: sha, Generation: 7, RetryAt: &retryAt},
+		{ID: 4, Name: "error.bin", State: StateCompleted, Size: 100, PayloadSHA1: sha, Generation: 7, LastError: "active divergence"},
+		{ID: 5, Name: "missing-hash.bin", State: StateCompleted, Size: 100, Generation: 7},
+		{ID: 6, Name: "spooled.bin", State: StateCompleted, Size: 100, PayloadSHA1: sha, Generation: 7, SpoolPath: "/spool/current.data"},
+	}
+	remotes := []model.Obj{
+		&model.Object{Name: "healthy.bin", Size: 100, HashInfo: utils.NewHashInfo(utils.SHA1, strings.ToUpper(sha))},
+		&model.Object{Name: "divergent.bin", Size: 100, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
+		&model.Object{Name: "retry.bin", Size: 100, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
+		&model.Object{Name: "error.bin", Size: 100, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
+		&model.Object{Name: "missing-hash.bin", Size: 100},
+		&model.Object{Name: "spooled.bin", Size: 100, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
+	}
+
+	got := matchingFreshCompletedEvidenceRows(rows, remotes, now)
+	if len(got) != 1 || got[0].row.ID != 1 {
+		t.Fatalf("fresh completed evidence matches=%v, want only healthy row 1", got)
+	}
+	if !freshCompletedEvidenceEligible(&rows[0]) {
+		t.Fatal("healthy completed no-spool row should be eligible for piggyback verification")
+	}
+	for i := 1; i < len(rows); i++ {
+		if freshCompletedEvidenceEligible(&rows[i]) {
+			t.Fatalf("row %d with active/incomplete evidence unexpectedly eligible", rows[i].ID)
+		}
+	}
+}
+
+func TestFreshParentCompletedEvidenceBatchIsBounded(t *testing.T) {
+	if freshParentCompletedEvidenceBatchLimit <= 0 || freshParentCompletedEvidenceBatchLimit > 64 {
+		t.Fatalf("fresh parent completed evidence batch limit=%d, want 1..64", freshParentCompletedEvidenceBatchLimit)
+	}
+}
+
 func TestUnreferencedSpoolPaths(t *testing.T) {
 	candidates := []string{"/spool/a.data", "/spool/b.data", "/spool/a.data", "", "/spool/c.data"}
 	referenced := []string{"/spool/b.data"}
