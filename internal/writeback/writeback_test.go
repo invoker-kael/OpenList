@@ -3931,7 +3931,6 @@ func TestWaitingCloudSyncReuploadIsTerminalForProviderWorkers(t *testing.T) {
 	}
 }
 
-
 func TestCompletedRemoteEvidenceKindChangeRestartsConfirmation(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
 		VerifyCount:            2,
