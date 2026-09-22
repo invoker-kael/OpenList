@@ -55,8 +55,9 @@ const (
 	// are represented by retry_count, retry_at and last_error.
 	legacyStateFailed = "failed"
 
-	receiveLeaseDuration  = 15 * time.Minute
-	receiveHeartbeatEvery = time.Minute
+	receiveLeaseDuration         = 15 * time.Minute
+	receiveHeartbeatEvery        = time.Minute
+	receiveProgressHeartbeatEvery = time.Second
 )
 
 var ErrCanonicalChanged = errors.New("canonical WebDAV state changed while staging provider delete")
@@ -3201,6 +3202,7 @@ func beginDurableReceiveSequence(ctx context.Context, p string, expected int64) 
 		fence.ActiveReceivers++
 		fence.Path = p
 		fence.LatestExpectedSize = expected
+		fence.LatestReceivedSize = 0
 		fence.LatestStartedAt = &now
 		fence.ReceiveLeaseUntil = &leaseUntil
 		sequence = fence.NextSequence
@@ -3211,6 +3213,7 @@ func beginDurableReceiveSequence(ctx context.Context, p string, expected int64) 
 				"next_sequence":        sequence,
 				"active_receivers":     fence.ActiveReceivers,
 				"latest_expected_size": expected,
+				"latest_received_size": int64(0),
 				"latest_started_at":    &now,
 				"receive_lease_until":  &leaseUntil,
 			}).Error; err != nil {
@@ -3236,13 +3239,17 @@ func receiveHeartbeatNeedsAdmission(expected, received int64, backlogLimited boo
 }
 
 func receiveProgressHeartbeatNeeded(expected int64, backlogReserved bool) bool {
-	return expected < 0 && backlogReserved
+	return expected > 0 || (expected < 0 && backlogReserved)
 }
 
-func refreshReceiveLease(tx *gorm.DB, key string, sequence uint64, leaseUntil time.Time, backlogReserved bool) error {
+func refreshReceiveLease(tx *gorm.DB, key string, sequence uint64, leaseUntil time.Time, received int64, backlogReserved bool) error {
+	fenceUpdates := map[string]any{"receive_lease_until": &leaseUntil}
+	if received > 0 {
+		fenceUpdates["latest_received_size"] = received
+	}
 	if err := tx.Model(&model.WebDAVWritebackReceiveFence{}).
 		Where("path_key = ? AND active_receivers > 0", key).
-		Update("receive_lease_until", &leaseUntil).Error; err != nil {
+		Updates(fenceUpdates).Error; err != nil {
 		return err
 	}
 	if !backlogReserved {
@@ -3263,7 +3270,7 @@ func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64, ex
 		// only extend per-path leases, so they must not serialize unrelated PUTs
 		// through the singleton admission fence.
 		_ = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			return refreshReceiveLease(tx, key, sequence, leaseUntil, backlogReserved)
+			return refreshReceiveLease(tx, key, sequence, leaseUntil, received, backlogReserved)
 		})
 		return
 	}
@@ -3275,9 +3282,13 @@ func heartbeatReceiveSequence(ctx context.Context, p string, sequence uint64, ex
 		if err := lockAdmissionFence(tx); err != nil {
 			return err
 		}
+		fenceUpdates := map[string]any{"receive_lease_until": &leaseUntil}
+		if received > 0 {
+			fenceUpdates["latest_received_size"] = received
+		}
 		if err := tx.Model(&model.WebDAVWritebackReceiveFence{}).
 			Where("path_key = ? AND active_receivers > 0", key).
-			Update("receive_lease_until", &leaseUntil).Error; err != nil {
+			Updates(fenceUpdates).Error; err != nil {
 			return err
 		}
 		progressBytes := receiveReservationProgressBytes(expected, received)
@@ -3573,7 +3584,7 @@ func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incom
 			total += int64(wn)
 			sinceCheck += int64(wn)
 			reservation.consume(uint64(wn))
-			if heartbeat != nil && time.Since(lastHeartbeat) >= receiveHeartbeatEvery {
+			if heartbeat != nil && time.Since(lastHeartbeat) >= receiveProgressHeartbeatEvery {
 				heartbeat(total)
 				lastHeartbeat = time.Now()
 			}
@@ -3607,6 +3618,9 @@ func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incom
 	}
 	if expected >= 0 && total != expected {
 		return total, "", fmt.Errorf("incomplete WebDAV PUT: expected %d bytes, received %d", expected, total)
+	}
+	if heartbeat != nil && total > 0 {
+		heartbeat(total)
 	}
 	return total, hex.EncodeToString(payloadHasher.Sum(nil)), nil
 }

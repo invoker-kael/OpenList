@@ -1653,6 +1653,13 @@ func TestReceiveFenceFinalizeUpdatesPreservesNewerMutation(t *testing.T) {
 	}
 }
 
+func TestReceiveFenceSchemaTracksReceiveProgress(t *testing.T) {
+	typ := reflect.TypeOf(model.WebDAVWritebackReceiveFence{})
+	if _, ok := typ.FieldByName("LatestReceivedSize"); !ok {
+		t.Fatal("receive fence must persist latest received size for active upload progress")
+	}
+}
+
 func TestReceiveFenceSchemaKeepsPathOrderingDurable(t *testing.T) {
 	typ := reflect.TypeOf(model.WebDAVWritebackReceiveFence{})
 	pathKeyField, ok := typ.FieldByName("PathKey")
@@ -2262,14 +2269,14 @@ func TestReceiveHeartbeatAdmissionOnlyForUnknownProgress(t *testing.T) {
 	}
 }
 
-func TestReceiveProgressHeartbeatOnlyForUnknownReservedUploads(t *testing.T) {
+func TestReceiveProgressHeartbeatForKnownLengthAndUnknownReservedUploads(t *testing.T) {
 	for _, tc := range []struct {
 		expected int64
 		reserved bool
 		want     bool
 	}{
-		{expected: 1024, reserved: true, want: false},
-		{expected: 1024, reserved: false, want: false},
+		{expected: 1024, reserved: true, want: true},
+		{expected: 1024, reserved: false, want: true},
 		{expected: -1, reserved: false, want: false},
 		{expected: -1, reserved: true, want: true},
 	} {

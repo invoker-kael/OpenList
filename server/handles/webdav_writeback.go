@@ -98,6 +98,7 @@ type webDAVWritebackMonitorRow struct {
 	Name                      string     `json:"name"`
 	IsDir                     bool       `json:"is_dir"`
 	Size                      int64      `json:"size"`
+	ReceivedBytes             int64      `json:"received_bytes,omitempty"`
 	ClientState               string     `json:"client_state"`
 	ProviderState             string     `json:"provider_state"`
 	EffectiveStatus           string     `json:"effective_status"`
@@ -554,6 +555,7 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 				Path:            fence.Path,
 				Name:            fence.Path,
 				Size:            fence.LatestExpectedSize,
+				ReceivedBytes:   fence.LatestReceivedSize,
 				ClientState:     "receiving",
 				ProviderState:   "not_started",
 				EffectiveStatus: webDAVStatusReceiving,
