@@ -9,6 +9,8 @@ on:
       - "internal/db/db.go"
       - "internal/conf/**"
       - "server/webdav/**"
+      - "server/handles/webdav_writeback.go"
+      - "server/router.go"
   pull_request:
     branches: ["main"]
     paths:
@@ -58,6 +60,8 @@ jobs:
             server/webdav/precondition_test.go
             server/webdav/util.go
             server/webdav/util_test.go
+            server/handles/webdav_writeback.go
+            server/router.go
             server/common/proxy.go
             server/common/proxy_test.go
             drivers/115_open/driver.go
@@ -71,7 +75,7 @@ jobs:
           fi
 
       - name: Unit and compile tests
-        run: go test ./internal/writeback ./server/webdav ./server/common ./drivers/115_open
+        run: go test ./internal/writeback ./server/webdav ./server/common ./server/handles ./server ./drivers/115_open
 
       - name: Format gate
         run: git diff --exit-code
