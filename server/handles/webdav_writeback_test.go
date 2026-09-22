@@ -328,7 +328,10 @@ func TestWebDAVHistoryStatusInCloudSyncGroups(t *testing.T) {
 		{"completed", webDAVStatusCompleted, webDAVActionNone, "completed", true},
 		{"recovered is completed", webDAVStatusRecovered, webDAVActionNone, "completed", true},
 		{"restart means waiting reupload", webDAVStatusRemoteMissing, webDAVActionRestartCloudSync, "waiting_reupload", true},
-		{"manual check is not waiting reupload", webDAVStatusRemoteHashMismatch, webDAVActionManualCheck, "waiting_reupload", false},
+		{"manual unresolved history is waiting reupload", webDAVStatusRemoteHashMismatch, webDAVActionManualCheck, "waiting_reupload", true},
+		{"reupload progress stays waiting in history", webDAVStatusReuploadUploading, webDAVActionNone, "waiting_reupload", true},
+		{"completed is not waiting reupload", webDAVStatusCompleted, webDAVActionNone, "waiting_reupload", false},
+		{"deleted is not waiting reupload", "deleted", webDAVActionNone, "waiting_reupload", false},
 		{"completed is not syncing", webDAVStatusCompleted, webDAVActionNone, "syncing", false},
 	}
 	for _, tc := range tests {

@@ -782,7 +782,9 @@ func webDAVHistoryStatusInGroup(status, action, group string) bool {
 	case "completed":
 		return status == webDAVStatusCompleted || status == webDAVStatusRecovered
 	case "waiting_reupload":
-		return action == webDAVActionRestartCloudSync
+		return status != webDAVStatusCompleted &&
+			status != webDAVStatusRecovered &&
+			status != "deleted"
 	case "processing":
 		return status != webDAVStatusCompleted &&
 			status != webDAVStatusRecovered &&
