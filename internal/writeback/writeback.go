@@ -1359,7 +1359,7 @@ func toObject(row *model.WebDAVWritebackObject) model.Obj {
 	}
 }
 
-const canonicalReadColumns = "id, path_key, parent_key, path, name, is_dir, size, mod_time, create_time, etag, payload_sha1, canonical_state, state"
+const canonicalReadColumns = "id, path_key, parent_key, path, name, is_dir, size, mod_time, create_time, e_tag, payload_sha1, canonical_state, state"
 
 func getByPath(p string) (*model.WebDAVWritebackObject, error) {
 	if !Enabled() {

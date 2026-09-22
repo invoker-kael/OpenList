@@ -15,6 +15,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"gorm.io/gorm/schema"
 )
 
 func TestUploadWorkerLimit(t *testing.T) {
@@ -136,6 +137,24 @@ func TestWritebackParentStateIndex(t *testing.T) {
 		if !strings.Contains(field.Tag.Get("gorm"), "idx_webdav_writeback_parent_state") {
 			t.Fatalf("%s must participate in parent/state verification index", fieldName)
 		}
+	}
+}
+
+func TestCanonicalReadColumnsUseGORMETagColumn(t *testing.T) {
+	etagColumn := schema.NamingStrategy{}.ColumnName("", "ETag")
+	if etagColumn != "e_tag" {
+		t.Fatalf("GORM ETag column = %q, want e_tag", etagColumn)
+	}
+
+	columns := map[string]struct{}{}
+	for _, column := range strings.Split(canonicalReadColumns, ",") {
+		columns[strings.TrimSpace(column)] = struct{}{}
+	}
+	if _, ok := columns[etagColumn]; !ok {
+		t.Fatalf("canonical read columns %q missing GORM ETag column %q", canonicalReadColumns, etagColumn)
+	}
+	if _, ok := columns["etag"]; ok {
+		t.Fatal("canonical read columns must not use non-GORM etag column")
 	}
 }
 
