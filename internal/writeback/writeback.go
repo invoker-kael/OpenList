@@ -7401,9 +7401,30 @@ func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
 	}
 }
 
-func providerRequiresPayloadHash(p string) bool {
+type providerVerificationCapability uint8
+
+const (
+	providerVerificationFreshListing providerVerificationCapability = iota
+	providerVerificationStrongSHA1
+)
+
+func providerVerificationCapabilityForPath(p string) providerVerificationCapability {
 	storage, err := fs.GetStorage(p, &fs.GetStoragesArgs{})
-	return err == nil && storage != nil && storage.Config().Name == "115 Open"
+	if err != nil || storage == nil {
+		return providerVerificationFreshListing
+	}
+	// 115 Open currently exposes reliable payload SHA1 evidence. Generic
+	// drivers intentionally remain on fresh listing + size/type evidence; when
+	// that evidence is incomplete, verification must stay inconclusive rather
+	// than pretending the replica is complete.
+	if storage.Config().Name == "115 Open" {
+		return providerVerificationStrongSHA1
+	}
+	return providerVerificationFreshListing
+}
+
+func providerRequiresPayloadHash(p string) bool {
+	return providerVerificationCapabilityForPath(p) == providerVerificationStrongSHA1
 }
 
 func remoteMatchesCanonical(row *model.WebDAVWritebackObject, remote model.Obj, requireHash bool) bool {
@@ -8121,20 +8142,24 @@ func completedSpoolReleaseEligible(row *model.WebDAVWritebackObject, cutoff time
 		row.RemoteGeneration == row.Generation
 }
 
-func releaseCompletedSpoolBatch(cutoff time.Time, limit int) (selected, released int, err error) {
+func completedSpoolReleaseSafe(row *model.WebDAVWritebackObject, cutoff time.Time) bool {
+	return completedSpoolReleaseEligible(row, cutoff) && !spoolIsActive(row.SpoolPath)
+}
+
+func releaseCompletedSpoolBatch(cutoff time.Time, limit int) (selected, released int, releasedBytes uint64, err error) {
 	if limit <= 0 {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	var rows []model.WebDAVWritebackObject
 	if err := db.GetDb().
-		Select("id", "generation", "spool_path", "completed_at", "remote_generation", "remote_verified_at", "state").
+		Select("id", "generation", "size", "spool_path", "completed_at", "remote_generation", "remote_verified_at", "state").
 		Where("state = ? AND spool_path <> '' AND completed_at IS NOT NULL AND completed_at <= ?", StateCompleted, cutoff).
 		Where("remote_verified_at IS NOT NULL AND remote_generation = generation").
 		Order("completed_at asc").
 		Order("id asc").
 		Limit(limit * 2).
 		Find(&rows).Error; err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	selected = len(rows)
 	cleared := make([]string, 0, min(len(rows), limit))
@@ -8143,7 +8168,7 @@ func releaseCompletedSpoolBatch(cutoff time.Time, limit int) (selected, released
 			break
 		}
 		row := &rows[i]
-		if !completedSpoolReleaseEligible(row, cutoff) || spoolIsActive(row.SpoolPath) {
+		if !completedSpoolReleaseSafe(row, cutoff) {
 			continue
 		}
 		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
@@ -8152,36 +8177,45 @@ func releaseCompletedSpoolBatch(cutoff time.Time, limit int) (selected, released
 			Where("remote_verified_at IS NOT NULL AND remote_generation = generation").
 			Update("spool_path", "")
 		if res.Error != nil {
-			return selected, released, res.Error
+			return selected, released, releasedBytes, res.Error
 		}
 		if res.RowsAffected == 0 {
 			continue
 		}
 		released++
+		if row.Size > 0 {
+			releasedBytes += uint64(row.Size)
+		}
 		cleared = append(cleared, row.SpoolPath)
 	}
 	if len(cleared) == 0 {
-		return selected, released, nil
+		return selected, released, releasedBytes, nil
 	}
 
 	removeSpoolsIfUnreferenced(cleared)
-	return selected, released, nil
+	return selected, released, releasedBytes, nil
 }
 
-func CleanupCompletedCacheNow() (int, error) {
+func CleanupCompletedCacheNowDetailed() (CacheCleanupResult, error) {
 	cutoff := time.Now()
-	totalReleased := 0
+	result := CacheCleanupResult{}
 	for batch := 0; batch < completedCleanupMaxBatches*4; batch++ {
-		selected, released, err := releaseCompletedSpoolBatch(cutoff, completedCleanupBatchSize)
+		selected, released, releasedBytes, err := releaseCompletedSpoolBatch(cutoff, completedCleanupBatchSize)
 		if err != nil {
-			return totalReleased, err
+			return result, err
 		}
-		totalReleased += released
+		result.Files += released
+		result.Bytes += releasedBytes
 		if selected == 0 || released == 0 || selected < completedCleanupBatchSize {
 			break
 		}
 	}
-	return totalReleased, nil
+	return result, nil
+}
+
+func CleanupCompletedCacheNow() (int, error) {
+	result, err := CleanupCompletedCacheNowDetailed()
+	return result.Files, err
 }
 
 func (m *workerManager) cleanupCompleted() {
@@ -8191,7 +8225,7 @@ func (m *workerManager) cleanupCompleted() {
 	}
 	cutoff := time.Now().Add(-time.Duration(ttl) * time.Minute)
 	for batch := 0; batch < completedCleanupMaxBatches; batch++ {
-		selected, released, err := releaseCompletedSpoolBatch(cutoff, completedCleanupBatchSize)
+		selected, released, _, err := releaseCompletedSpoolBatch(cutoff, completedCleanupBatchSize)
 		if err != nil {
 			log.Errorf("write-back completed spool cleanup failed: %v", err)
 			return

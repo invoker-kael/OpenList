@@ -195,6 +195,9 @@ func admin(g *gin.RouterGroup) {
 	webdavWriteback := g.Group("/webdav-writeback")
 	webdavWriteback.GET("/summary", handles.WebDAVWritebackMonitorSummary)
 	webdavWriteback.GET("/list", handles.WebDAVWritebackMonitorList)
+	webdavWriteback.GET("/settings", handles.WebDAVWritebackSettings)
+	webdavWriteback.POST("/settings", handles.WebDAVWritebackSaveSettings)
+	webdavWriteback.GET("/cleanup/preview", handles.WebDAVWritebackCleanupPreview)
 	webdavWriteback.POST("/cleanup", handles.WebDAVWritebackCleanupCompletedCache)
 }
 

@@ -53,6 +53,9 @@ jobs:
             internal/model/webdav_writeback.go
             internal/db/db.go
             internal/conf/config.go
+            internal/conf/persist.go
+            internal/writeback/admin.go
+            internal/writeback/admin_test.go
             internal/writeback/writeback.go
             internal/writeback/writeback_test.go
             server/webdav/file.go
@@ -63,6 +66,8 @@ jobs:
             server/webdav/util_test.go
             server/common/proxy.go
             server/common/proxy_test.go
+            server/handles/webdav_writeback.go
+            server/router.go
             drivers/115_open/driver.go
             drivers/115_open/types.go
             drivers/115_open/upload.go
