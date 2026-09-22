@@ -295,3 +295,32 @@ func TestWebDAVHistoryDurationsSeparateCloudSyncAndProviderTime(t *testing.T) {
 		t.Fatalf("timeline events=%d, want 5", len(item.EventTimeline))
 	}
 }
+
+
+func TestWebDAVHistoryStatusInCloudSyncGroups(t *testing.T) {
+	tests := []struct {
+		name   string
+		status string
+		action string
+		group  string
+		want   bool
+	}{
+		{"receiving", webDAVStatusReceiving, webDAVActionWait, "receiving", true},
+		{"reupload receiving", webDAVStatusReuploadReceiving, webDAVActionNone, "receiving", true},
+		{"durable ack syncing", webDAVStatusDurableAcked, webDAVActionWait, "syncing", true},
+		{"automatic recovery syncing", webDAVStatusAutomaticRecovery, webDAVActionRetryingAutomatically, "syncing", true},
+		{"reupload verify syncing", webDAVStatusReuploadVerifying, webDAVActionWait, "syncing", true},
+		{"completed", webDAVStatusCompleted, webDAVActionNone, "completed", true},
+		{"recovered is completed", webDAVStatusRecovered, webDAVActionNone, "completed", true},
+		{"restart means waiting reupload", webDAVStatusRemoteMissing, webDAVActionRestartCloudSync, "waiting_reupload", true},
+		{"manual check is not waiting reupload", webDAVStatusRemoteHashMismatch, webDAVActionManualCheck, "waiting_reupload", false},
+		{"completed is not syncing", webDAVStatusCompleted, webDAVActionNone, "syncing", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := webDAVHistoryStatusInGroup(tc.status, tc.action, tc.group); got != tc.want {
+				t.Fatalf("webDAVHistoryStatusInGroup(%q, %q, %q)=%v, want %v", tc.status, tc.action, tc.group, got, tc.want)
+			}
+		})
+	}
+}

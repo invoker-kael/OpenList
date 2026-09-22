@@ -744,12 +744,45 @@ type webDAVWritebackHistoryCleanupResult struct {
 	Deleted int64 `json:"deleted"`
 }
 
+func webDAVHistoryStatusInGroup(status, action, group string) bool {
+	switch group {
+	case "":
+		return true
+	case "receiving":
+		return status == webDAVStatusReceiving || status == webDAVStatusReuploadReceiving
+	case "syncing":
+		switch status {
+		case webDAVStatusDurableAcked,
+			webDAVStatusRemoteUploading,
+			webDAVStatusRemoteVerifying,
+			webDAVStatusAutomaticRecovery,
+			webDAVStatusReuploadReceived,
+			webDAVStatusReuploadUploading,
+			webDAVStatusReuploadVerifying:
+			return true
+		default:
+			return false
+		}
+	case "completed":
+		return status == webDAVStatusCompleted || status == webDAVStatusRecovered
+	case "waiting_reupload":
+		return action == webDAVActionRestartCloudSync
+	case "processing":
+		return status != webDAVStatusCompleted &&
+			status != webDAVStatusRecovered &&
+			status != "deleted" &&
+			action != webDAVActionRestartCloudSync
+	default:
+		return false
+	}
+}
+
 func WebDAVWritebackHistoryList(c *gin.Context) {
 	limit := webDAVMonitorLimit(c)
 	statusFilter := strings.ToLower(strings.TrimSpace(c.Query("status")))
 	statusGroupFilter := strings.ToLower(strings.TrimSpace(c.Query("status_group")))
 	switch statusGroupFilter {
-	case "", "completed", "processing":
+	case "", "receiving", "syncing", "completed", "waiting_reupload", "processing":
 	default:
 		common.ErrorResp(c, errors.New("unsupported status_group"), http.StatusBadRequest)
 		return
@@ -874,8 +907,14 @@ func WebDAVWritebackHistoryList(c *gin.Context) {
 		fence := fenceByPath[row.PathKey]
 		status, action := webDAVHistoryEffectiveStatus(row, current, fence, now)
 
-		if statusFilter != "" && status != statusFilter {
-			continue
+		if statusFilter != "" {
+			if statusFilter == webDAVStatusCompleted {
+				if status != webDAVStatusCompleted && status != webDAVStatusRecovered {
+					continue
+				}
+			} else if status != statusFilter {
+				continue
+			}
 		}
 		if currentStateFilter != "" && (current == nil || current.State != currentStateFilter) {
 			continue
@@ -884,25 +923,8 @@ func WebDAVWritebackHistoryList(c *gin.Context) {
 		if actionRequiredFilter != nil && actionRequired != *actionRequiredFilter {
 			continue
 		}
-		switch statusGroupFilter {
-		case "completed":
-			if status != webDAVStatusCompleted && status != webDAVStatusRecovered {
-				continue
-			}
-		case "processing":
-			switch status {
-			case webDAVStatusReceiving,
-				webDAVStatusDurableAcked,
-				webDAVStatusRemoteUploading,
-				webDAVStatusRemoteVerifying,
-				webDAVStatusAutomaticRecovery,
-				webDAVStatusReuploadReceiving,
-				webDAVStatusReuploadReceived,
-				webDAVStatusReuploadUploading,
-				webDAVStatusReuploadVerifying:
-			default:
-				continue
-			}
+		if !webDAVHistoryStatusInGroup(status, action, statusGroupFilter) {
+			continue
 		}
 
 		item := webDAVWritebackHistoryRow{
