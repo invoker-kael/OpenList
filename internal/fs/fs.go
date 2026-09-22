@@ -109,7 +109,15 @@ func Remove(ctx context.Context, path string) error {
 }
 
 func PutDirectly(ctx context.Context, dstDirPath string, file model.FileStreamer, skipHook ...bool) error {
-	err := putDirectly(ctx, dstDirPath, file, skipHook...)
+	err := putDirectly(ctx, dstDirPath, file, nil, skipHook...)
+	if err != nil {
+		log.Errorf("failed put %s: %+v", dstDirPath, err)
+	}
+	return err
+}
+
+func PutDirectlyWithProgress(ctx context.Context, dstDirPath string, file model.FileStreamer, up driver.UpdateProgress, skipHook ...bool) error {
+	err := putDirectly(ctx, dstDirPath, file, up, skipHook...)
 	if err != nil {
 		log.Errorf("failed put %s: %+v", dstDirPath, err)
 	}

@@ -19,7 +19,7 @@ import (
 const (
 	webDAVMonitorDefaultLimit     = 100
 	webDAVMonitorMaxLimit         = 500
-	webDAVWritebackMonitorColumns = "id, path, name, is_dir, size, e_tag, canonical_state, state, generation, remote_generation, payload_sha1, remote_sha1, remote_object_id, retry_count, verify_count, last_error, resolution_reason, retry_at, remote_verified_at, receive_started_at, ack_time, durable_at, provider_upload_started_at, provider_upload_completed_at, recovery_started_at, cloud_sync_reupload_required, provider_evidence_first_at, provider_evidence_last_at, provider_evidence_count, provider_evidence_result, completed_at, created_at, updated_at"
+	webDAVWritebackMonitorColumns = "id, path, name, is_dir, size, e_tag, canonical_state, state, generation, remote_generation, payload_sha1, remote_sha1, remote_object_id, retry_count, verify_count, last_error, resolution_reason, retry_at, remote_verified_at, receive_started_at, ack_time, durable_at, provider_upload_started_at, provider_upload_completed_at, provider_uploaded_bytes, recovery_started_at, cloud_sync_reupload_required, provider_evidence_first_at, provider_evidence_last_at, provider_evidence_count, provider_evidence_result, completed_at, created_at, updated_at"
 )
 
 type webDAVWritebackStateSummary struct {
@@ -124,6 +124,7 @@ type webDAVWritebackMonitorRow struct {
 	DurableAt                 *time.Time `json:"durable_at"`
 	ProviderUploadStartedAt   *time.Time `json:"provider_upload_started_at,omitempty"`
 	ProviderUploadCompletedAt *time.Time `json:"provider_upload_completed_at,omitempty"`
+	ProviderUploadedBytes     int64      `json:"provider_uploaded_bytes,omitempty"`
 	RecoveryStartedAt         *time.Time `json:"recovery_started_at,omitempty"`
 	CloudSyncReuploadRequired bool       `json:"cloudsync_reupload_required"`
 	ProviderEvidenceFirstAt   *time.Time `json:"provider_evidence_first_at,omitempty"`
@@ -648,6 +649,7 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 				DurableAt:                 row.DurableAt,
 				ProviderUploadStartedAt:   row.ProviderUploadStartedAt,
 				ProviderUploadCompletedAt: row.ProviderUploadCompletedAt,
+				ProviderUploadedBytes:     row.ProviderUploadedBytes,
 				RecoveryStartedAt:         row.RecoveryStartedAt,
 				CloudSyncReuploadRequired: row.CloudSyncReuploadRequired,
 				ProviderEvidenceFirstAt:   row.ProviderEvidenceFirstAt,

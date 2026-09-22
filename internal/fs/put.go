@@ -94,7 +94,7 @@ func putAsTask(ctx context.Context, dstDirPath string, file model.FileStreamer) 
 }
 
 // putDirect put the file and return after finish
-func putDirectly(ctx context.Context, dstDirPath string, file model.FileStreamer, skipHook ...bool) error {
+func putDirectly(ctx context.Context, dstDirPath string, file model.FileStreamer, up driver.UpdateProgress, skipHook ...bool) error {
 	storage, dstDirActualPath, err := op.GetStorageAndActualPath(dstDirPath)
 	if err != nil {
 		_ = file.Close()
@@ -107,7 +107,7 @@ func putDirectly(ctx context.Context, dstDirPath string, file model.FileStreamer
 	if utils.IsBool(skipHook...) {
 		ctx = context.WithValue(ctx, conf.SkipHookKey, struct{}{})
 	}
-	return op.Put(ctx, storage, dstDirActualPath, file, nil)
+	return op.Put(ctx, storage, dstDirActualPath, file, up)
 }
 
 func getDirectUploadInfo(ctx context.Context, tool, dstDirPath, dstName string, fileSize int64, overwrite bool) (any, error) {

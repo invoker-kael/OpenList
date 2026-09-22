@@ -29,6 +29,7 @@ type WebDAVWritebackObject struct {
 	DurableAt                 *time.Time `json:"durable_at"`
 	ProviderUploadStartedAt   *time.Time `json:"provider_upload_started_at"`
 	ProviderUploadCompletedAt *time.Time `json:"provider_upload_completed_at"`
+	ProviderUploadedBytes     int64      `json:"provider_uploaded_bytes"`
 	RecoveryStartedAt         *time.Time `json:"recovery_started_at"`
 	CloudSyncReuploadRequired bool       `json:"cloudsync_reupload_required" gorm:"index"`
 	ProviderEvidenceFirstAt   *time.Time `json:"provider_evidence_first_at"`

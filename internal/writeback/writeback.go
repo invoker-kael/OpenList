@@ -7740,6 +7740,16 @@ func (m *workerManager) processReplicaMove(row *model.WebDAVWritebackObject) {
 	m.enterReplicaMoveVerification(row, "")
 }
 
+func providerUploadProgressBytes(total int64, progress float64) int64 {
+	if total <= 0 || progress <= 0 {
+		return 0
+	}
+	if progress >= 100 {
+		return total
+	}
+	return min(total, max(int64(0), int64(float64(total)*progress/100.0)))
+}
+
 func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	if waiting, err := m.waitForCanonicalParent(row); err != nil {
 		m.failAfter(row, err, 2*time.Second)
@@ -7824,6 +7834,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 			"last_error":                   "",
 			"provider_upload_started_at":   &uploadStartedAt,
 			"provider_upload_completed_at": nil,
+			"provider_uploaded_bytes":      0,
 		})
 	if res.Error != nil || res.RowsAffected == 0 {
 		return
@@ -7843,7 +7854,27 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		Reader:   payload,
 		Mimetype: row.MimeType,
 	}
-	err = fs.PutDirectly(m.ctx, row.Parent, fsStream, true)
+	var progressMu sync.Mutex
+	var lastProgressAt time.Time
+	lastProgressBytes := int64(-1)
+	updateProviderProgress := func(progress float64) {
+		uploaded := providerUploadProgressBytes(row.Size, progress)
+		now := time.Now()
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		if uploaded <= lastProgressBytes && progress < 100 {
+			return
+		}
+		if progress < 100 && !lastProgressAt.IsZero() && now.Sub(lastProgressAt) < time.Second {
+			return
+		}
+		lastProgressAt = now
+		lastProgressBytes = uploaded
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+			Update("provider_uploaded_bytes", uploaded).Error
+	}
+	err = fs.PutDirectlyWithProgress(m.ctx, row.Parent, fsStream, updateProviderProgress, true)
 	if err != nil {
 		if errs.IsNotFoundError(err) {
 			m.failAfter(row, err, 2*time.Second)
@@ -7855,7 +7886,10 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	uploadCompletedAt := time.Now()
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
-		Update("provider_upload_completed_at", &uploadCompletedAt).Error
+		Updates(map[string]any{
+			"provider_upload_completed_at": &uploadCompletedAt,
+			"provider_uploaded_bytes":      row.Size,
+		}).Error
 	row.ProviderUploadCompletedAt = &uploadCompletedAt
 
 	var current model.WebDAVWritebackObject

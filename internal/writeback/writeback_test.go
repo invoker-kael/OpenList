@@ -4110,3 +4110,23 @@ func TestProviderEvidenceSnapshotKeepsFirstObservationAndCountsChecks(t *testing
 		t.Fatalf("evidence last=%v count=%d result=%q", lastAt, count, result)
 	}
 }
+
+
+func TestProviderUploadProgressBytes(t *testing.T) {
+	for _, tc := range []struct {
+		total    int64
+		progress float64
+		want     int64
+	}{
+		{total: 1000, progress: -1, want: 0},
+		{total: 1000, progress: 0, want: 0},
+		{total: 1000, progress: 25, want: 250},
+		{total: 1000, progress: 99.9, want: 999},
+		{total: 1000, progress: 100, want: 1000},
+		{total: 1000, progress: 120, want: 1000},
+	} {
+		if got := providerUploadProgressBytes(tc.total, tc.progress); got != tc.want {
+			t.Fatalf("total=%d progress=%v got=%d want=%d", tc.total, tc.progress, got, tc.want)
+		}
+	}
+}
