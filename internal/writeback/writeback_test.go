@@ -3533,12 +3533,12 @@ func TestCompletedSpoolReleaseEligibleRequiresVerifiedCurrentGeneration(t *testi
 	completed := now.Add(-time.Minute)
 	verified := now.Add(-30 * time.Second)
 	base := &model.WebDAVWritebackObject{
-		Generation:         7,
-		RemoteGeneration:   7,
-		State:              StateCompleted,
-		SpoolPath:          "/spool/current.data",
-		CompletedAt:        &completed,
-		RemoteVerifiedAt:   &verified,
+		Generation:       7,
+		RemoteGeneration: 7,
+		State:            StateCompleted,
+		SpoolPath:        "/spool/current.data",
+		CompletedAt:      &completed,
+		RemoteVerifiedAt: &verified,
 	}
 	if !completedSpoolReleaseEligible(base, now) {
 		t.Fatal("verified current-generation completed spool should be releasable")
