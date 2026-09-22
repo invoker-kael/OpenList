@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/writeback"
 	"gorm.io/gorm/schema"
 )
 
@@ -30,6 +31,20 @@ func TestWebDAVWritebackMonitorUsesGormETagColumnName(t *testing.T) {
 	}
 }
 
+
+func TestWebDAVMonitorCanonicalStateKeepsWaitingReuploadAcked(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		State: writeback.StateWaitingCloudSyncReupload,
+	}
+	if got := webDAVMonitorCanonicalState(row); got != writeback.CanonicalStateAcked {
+		t.Fatalf("canonical state=%q, want %q", got, writeback.CanonicalStateAcked)
+	}
+
+	row.State = writeback.StateDeleted
+	if got := webDAVMonitorCanonicalState(row); got != "deleted" {
+		t.Fatalf("deleted canonical state=%q, want deleted", got)
+	}
+}
 
 func TestWebDAVHistoryEffectiveStatusWaitsForCloudSync(t *testing.T) {
 	now := time.Unix(200, 0)

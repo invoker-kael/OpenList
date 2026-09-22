@@ -355,10 +355,10 @@ func webDAVMonitorCanonicalState(row *model.WebDAVWritebackObject) string {
 	if row.CanonicalState != "" {
 		return row.CanonicalState
 	}
-	if row.State == writeback.StateDeleted || row.State == writeback.StateWaitingCloudSyncReupload {
+	if row.State == writeback.StateDeleted {
 		return "deleted"
 	}
-	return "acked"
+	return writeback.CanonicalStateAcked
 }
 
 const (
@@ -593,10 +593,13 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 			})
 		case "waiting_reupload":
 			query = query.Where(
-				"state IN ? OR cloud_sync_reupload_required = ? OR resolution_reason IN ?",
-				[]string{writeback.StateWaitingCloudSyncReupload, writeback.StateWaitingRepair},
+				"state = ? OR cloud_sync_reupload_required = ? OR resolution_reason = ? OR (state = ? AND canonical_state = ? AND LOWER(last_error) LIKE ?)",
+				writeback.StateWaitingCloudSyncReupload,
 				true,
-				[]string{writeback.ResolutionRemoteMissing, writeback.ResolutionRemoteHashMismatch},
+				writeback.ResolutionNeedsCloudSyncRehydrate,
+				writeback.StateDeleted,
+				writeback.CanonicalStateDeleted,
+				"%cloud sync can re-upload%",
 			)
 		case "error":
 			query = query.Where("last_error <> ''")
