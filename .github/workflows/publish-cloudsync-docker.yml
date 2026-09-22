@@ -19,7 +19,7 @@ jobs:
       - name: Checkout validated source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ac3093a0387611f259cfd496c225c5e85875518d
+          ref: 33b3401656b6aace4fdb6e00d9b55d67ec86abb2
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
@@ -36,8 +36,11 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
+          build-args: |
+            FRONTEND_REPO=invoker-kael/OpenList-Frontend
+            FRONTEND_REF=c8f23446f4ea63ecbf19118fb440600c7075f338
           push: true
           tags: |
             invokerkael/openlist:cloudsync-writeback
-            invokerkael/openlist:ac3093a
+            invokerkael/openlist:33b3401
           provenance: false
