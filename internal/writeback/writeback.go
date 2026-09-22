@@ -8111,14 +8111,25 @@ func unreferencedSpoolPaths(candidates, referenced []string) []string {
 	return out
 }
 
+func completedSpoolReleaseEligible(row *model.WebDAVWritebackObject, cutoff time.Time) bool {
+	return row != nil &&
+		row.State == StateCompleted &&
+		row.SpoolPath != "" &&
+		row.CompletedAt != nil &&
+		!row.CompletedAt.After(cutoff) &&
+		row.RemoteVerifiedAt != nil &&
+		row.RemoteGeneration == row.Generation
+}
+
 func releaseCompletedSpoolBatch(cutoff time.Time, limit int) (selected, released int, err error) {
 	if limit <= 0 {
 		return 0, 0, nil
 	}
 	var rows []model.WebDAVWritebackObject
 	if err := db.GetDb().
-		Select("id", "generation", "spool_path", "completed_at").
+		Select("id", "generation", "spool_path", "completed_at", "remote_generation", "remote_verified_at", "state").
 		Where("state = ? AND spool_path <> '' AND completed_at IS NOT NULL AND completed_at <= ?", StateCompleted, cutoff).
+		Where("remote_verified_at IS NOT NULL AND remote_generation = generation").
 		Order("completed_at asc").
 		Order("id asc").
 		Limit(limit * 2).
@@ -8132,12 +8143,13 @@ func releaseCompletedSpoolBatch(cutoff time.Time, limit int) (selected, released
 			break
 		}
 		row := &rows[i]
-		if spoolIsActive(row.SpoolPath) {
+		if !completedSpoolReleaseEligible(row, cutoff) || spoolIsActive(row.SpoolPath) {
 			continue
 		}
 		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ? AND spool_path = ? AND completed_at IS NOT NULL AND completed_at <= ?",
 				row.ID, row.Generation, StateCompleted, row.SpoolPath, cutoff).
+			Where("remote_verified_at IS NOT NULL AND remote_generation = generation").
 			Update("spool_path", "")
 		if res.Error != nil {
 			return selected, released, res.Error
@@ -8154,6 +8166,22 @@ func releaseCompletedSpoolBatch(cutoff time.Time, limit int) (selected, released
 
 	removeSpoolsIfUnreferenced(cleared)
 	return selected, released, nil
+}
+
+func CleanupCompletedCacheNow() (int, error) {
+	cutoff := time.Now()
+	totalReleased := 0
+	for batch := 0; batch < completedCleanupMaxBatches*4; batch++ {
+		selected, released, err := releaseCompletedSpoolBatch(cutoff, completedCleanupBatchSize)
+		if err != nil {
+			return totalReleased, err
+		}
+		totalReleased += released
+		if selected == 0 || released == 0 || selected < completedCleanupBatchSize {
+			break
+		}
+	}
+	return totalReleased, nil
 }
 
 func (m *workerManager) cleanupCompleted() {

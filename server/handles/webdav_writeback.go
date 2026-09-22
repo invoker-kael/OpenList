@@ -26,14 +26,22 @@ type webDAVWritebackStateSummary struct {
 }
 
 type webDAVWritebackSummary struct {
-	Enabled                bool                                   `json:"enabled"`
-	Workers                int                                    `json:"workers"`
-	Receiving              int64                                  `json:"receiving"`
-	ReceivingExpectedBytes int64                                  `json:"receiving_expected_bytes"`
-	BacklogBytes           int64                                  `json:"backlog_bytes"`
-	Errors                 int64                                  `json:"errors"`
-	States                 map[string]webDAVWritebackStateSummary `json:"states"`
-	UpdatedAt              time.Time                              `json:"updated_at"`
+	Enabled                  bool                                   `json:"enabled"`
+	Workers                  int                                    `json:"workers"`
+	Receiving                int64                                  `json:"receiving"`
+	ReceivingExpectedBytes   int64                                  `json:"receiving_expected_bytes"`
+	BacklogBytes             int64                                  `json:"backlog_bytes"`
+	CompletedCacheBytes      int64                                  `json:"completed_cache_bytes"`
+	MaxPendingSpoolBytes     uint64                                 `json:"max_pending_spool_bytes"`
+	ReserveFreeSpaceBytes    uint64                                 `json:"reserve_free_space_bytes"`
+	CompletedCacheTTLMinutes int                                    `json:"completed_cache_ttl_minutes"`
+	Errors                   int64                                  `json:"errors"`
+	States                   map[string]webDAVWritebackStateSummary `json:"states"`
+	UpdatedAt                time.Time                              `json:"updated_at"`
+}
+
+type webDAVWritebackCleanupResult struct {
+	Released int `json:"released"`
 }
 
 type webDAVWritebackStateAggregate struct {
@@ -114,6 +122,17 @@ func WebDAVWritebackMonitorSummary(c *gin.Context) {
 		return
 	}
 
+	var completedCacheBytes int64
+	if err := db.GetDb().
+		Model(&model.WebDAVWritebackObject{}).
+		Where("state = ? AND spool_path <> ''", writeback.StateCompleted).
+		Where("remote_verified_at IS NOT NULL AND remote_generation = generation").
+		Select("COALESCE(SUM(size), 0)").
+		Scan(&completedCacheBytes).Error; err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError)
+		return
+	}
+
 	var errorsCount int64
 	if err := db.GetDb().
 		Model(&model.WebDAVWritebackObject{}).
@@ -128,11 +147,24 @@ func WebDAVWritebackMonitorSummary(c *gin.Context) {
 		Workers:                conf.Conf.WebDAVWriteback.Workers,
 		Receiving:              receiving,
 		ReceivingExpectedBytes: receivingExpectedBytes,
-		BacklogBytes:           backlogBytes,
-		Errors:                 errorsCount,
-		States:                 states,
-		UpdatedAt:              now,
+		BacklogBytes:             backlogBytes,
+		CompletedCacheBytes:      completedCacheBytes,
+		MaxPendingSpoolBytes:     conf.Conf.WebDAVWriteback.MaxPendingSpoolMB * uint64(1024*1024),
+		ReserveFreeSpaceBytes:    conf.Conf.WebDAVWriteback.ReserveFreeSpaceMB * uint64(1024*1024),
+		CompletedCacheTTLMinutes: conf.Conf.WebDAVWriteback.CompletedCacheTTLMinutes,
+		Errors:                   errorsCount,
+		States:                   states,
+		UpdatedAt:                now,
 	})
+}
+
+func WebDAVWritebackCleanupCompletedCache(c *gin.Context) {
+	released, err := writeback.CleanupCompletedCacheNow()
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError)
+		return
+	}
+	common.SuccessResp(c, webDAVWritebackCleanupResult{Released: released})
 }
 
 func webDAVMonitorLimit(c *gin.Context) int {
@@ -313,6 +345,7 @@ th{position:sticky;top:0;background:#f8fafc;z-index:1;color:#475467}
     </select>
     <input id="search" placeholder="Filter path">
     <button id="refresh">Refresh</button>
+    <button id="cleanup">Clean verified cache</button>
     <label class="small"><input id="auto" type="checkbox" checked> auto 2s</label>
     <span id="status" class="status"></span>
   </div>
@@ -323,10 +356,12 @@ th{position:sticky;top:0;background:#f8fafc;z-index:1;color:#475467}
     <div class="card"><div class="label">Verifying</div><div class="value" id="verifying">-</div></div>
     <div class="card"><div class="label">Completed</div><div class="value" id="completed">-</div></div>
     <div class="card"><div class="label">Errors</div><div class="value" id="errors">-</div></div>
-    <div class="card"><div class="label">Durable backlog</div><div class="value" id="backlog">-</div></div>
+    <div class="card"><div class="label">Durable backlog</div><div class="value" id="backlog">-</div><div class="small muted" id="backlogLimit"></div></div>
+    <div class="card"><div class="label">Completed cache</div><div class="value" id="completedCache">-</div><div class="small muted" id="cacheTTL"></div></div>
+    <div class="card"><div class="label">Disk reserve</div><div class="value" id="reserve">-</div></div>
     <div class="card"><div class="label">Workers</div><div class="value" id="workers">-</div></div>
   </div>
-  <div class="note">Receiving shows active WebDAV request admission. After durable ACK, provider state moves queued → uploading → verifying → completed. On restart, interrupted uploads verify the provider first; if the persistent spool still exists they can re-upload from local disk, while a confirmed missing spool/provider generation is exposed back to Cloud Sync for re-PUT. Byte-level provider progress is not fabricated; this page shows authoritative lifecycle state from MySQL.</div>
+  <div class="note">Receiving shows active WebDAV request admission. Backlog admission is bounded by Max Pending Spool and the configured free-space reserve; when the local durable buffer is full, OpenList applies WebDAV backpressure instead of accepting data it cannot persist. Clean verified cache removes only completed, current-generation, provider-verified local payload copies; pending/receiving/recovery spools are never removed. On restart, interrupted uploads verify the provider first and continue from the persistent spool or ask Cloud Sync to re-PUT only after local and remote loss are both confirmed.</div>
   <div class="table-wrap">
     <table>
       <thead><tr>
@@ -358,8 +393,9 @@ th{position:sticky;top:0;background:#f8fafc;z-index:1;color:#475467}
   };
   const fmtTime=(v)=>v?new Date(v).toLocaleString():"-";
   const badge=(v)=>'<span class="badge '+esc(v)+'">'+esc(v||"-")+'</span>';
-  async function getJSON(url){
-    const r=await fetch(url,{headers:{Authorization:token()}});
+  async function getJSON(url,options={}){
+    const headers=Object.assign({Authorization:token()},options.headers||{});
+    const r=await fetch(url,Object.assign({},options,{headers}));
     const j=await r.json().catch(()=>({}));
     if(!r.ok||j.code!==200) throw new Error(j.message||("HTTP "+r.status));
     return j.data;
@@ -382,6 +418,10 @@ th{position:sticky;top:0;background:#f8fafc;z-index:1;color:#475467}
       document.getElementById("completed").textContent=stateCount(summary,"completed");
       document.getElementById("errors").textContent=summary.errors||0;
       document.getElementById("backlog").textContent=fmtBytes(summary.backlog_bytes);
+      document.getElementById("backlogLimit").textContent=summary.max_pending_spool_bytes?("limit "+fmtBytes(summary.max_pending_spool_bytes)):"unlimited";
+      document.getElementById("completedCache").textContent=fmtBytes(summary.completed_cache_bytes);
+      document.getElementById("cacheTTL").textContent=summary.completed_cache_ttl_minutes<0?"automatic cleanup disabled":("TTL "+summary.completed_cache_ttl_minutes+" min");
+      document.getElementById("reserve").textContent=fmtBytes(summary.reserve_free_space_bytes);
       document.getElementById("workers").textContent=summary.workers||0;
       rows.innerHTML=(list||[]).length?(list||[]).map(x=>
         '<tr>'+
@@ -404,6 +444,19 @@ th{position:sticky;top:0;background:#f8fafc;z-index:1;color:#475467}
     }
   }
   document.getElementById("refresh").addEventListener("click",refresh);
+  document.getElementById("cleanup").addEventListener("click",async()=>{
+    if(!confirm("Remove only completed, provider-verified local WebDAV cache files? Pending uploads will be kept."))return;
+    status.className="status";
+    status.textContent="Cleaning verified cache…";
+    try{
+      const result=await getJSON(api+"/cleanup",{method:"POST"});
+      status.textContent="Released "+(result?.released||0)+" completed cache entries";
+      await refresh();
+    }catch(e){
+      status.className="status error";
+      status.textContent=e.message;
+    }
+  });
   state.addEventListener("change",refresh);
   search.addEventListener("keydown",(e)=>{if(e.key==="Enter")refresh()});
   setInterval(()=>{if(document.getElementById("auto").checked)refresh()},2000);

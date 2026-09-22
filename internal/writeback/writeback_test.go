@@ -3528,6 +3528,44 @@ func TestFreshParentCompletedEvidenceBatchIsBounded(t *testing.T) {
 	}
 }
 
+func TestCompletedSpoolReleaseEligibleRequiresVerifiedCurrentGeneration(t *testing.T) {
+	now := time.Now()
+	completed := now.Add(-time.Minute)
+	verified := now.Add(-30 * time.Second)
+	base := &model.WebDAVWritebackObject{
+		Generation:         7,
+		RemoteGeneration:   7,
+		State:              StateCompleted,
+		SpoolPath:          "/spool/current.data",
+		CompletedAt:        &completed,
+		RemoteVerifiedAt:   &verified,
+	}
+	if !completedSpoolReleaseEligible(base, now) {
+		t.Fatal("verified current-generation completed spool should be releasable")
+	}
+
+	cases := []struct {
+		name string
+		edit func(*model.WebDAVWritebackObject)
+	}{
+		{"pending provider state", func(r *model.WebDAVWritebackObject) { r.State = StateVerifying }},
+		{"missing spool path", func(r *model.WebDAVWritebackObject) { r.SpoolPath = "" }},
+		{"missing completion", func(r *model.WebDAVWritebackObject) { r.CompletedAt = nil }},
+		{"completion newer than cutoff", func(r *model.WebDAVWritebackObject) { future := now.Add(time.Minute); r.CompletedAt = &future }},
+		{"missing provider verification", func(r *model.WebDAVWritebackObject) { r.RemoteVerifiedAt = nil }},
+		{"stale provider generation", func(r *model.WebDAVWritebackObject) { r.RemoteGeneration = r.Generation - 1 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row := *base
+			tc.edit(&row)
+			if completedSpoolReleaseEligible(&row, now) {
+				t.Fatal("unsafe completed spool was eligible for release")
+			}
+		})
+	}
+}
+
 func TestUnreferencedSpoolPaths(t *testing.T) {
 	candidates := []string{"/spool/a.data", "/spool/b.data", "/spool/a.data", "", "/spool/c.data"}
 	referenced := []string{"/spool/b.data"}
