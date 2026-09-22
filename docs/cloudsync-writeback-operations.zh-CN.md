@@ -2,55 +2,36 @@
 
 本文档用于运维 **Synology Cloud Sync 单向上传**场景下的 WebDAV Durable Write-back。
 
+> **开发说明：** 本功能由 AI 辅助开发，并经过人工测试验证。
+
 ## 核心规则
 
 **`needs_cloudsync_rehydrate` 是正常写回恢复流程中唯一需要 Cloud Sync 或人工介入的状态。其他正常写回恢复状态都应由 OpenList 自动恢复。**
 
 基础设施故障不属于这条规则。如果数据库不可用、spool 文件系统已满或损坏、远端存储凭据失效、网络链路异常，应先修复基础设施。
 
+
 ## 1. 组件要求
 
 ### 数据库
 
-**WebDAV Durable Write-back 明确不支持 SQLite。**
+**本 fork 的 Durable Write-back 仅支持 MySQL。**
 
-必须使用具备事务和行级锁语义的服务端数据库：
-
-- **MySQL：已验证并推荐**
-- **PostgreSQL：属于 OpenList 支持的服务端数据库目标；生产使用前应针对实际部署版本运行 write-back 测试**
-- **SQLite / sqlite3：不支持**
-
-不要因为 OpenList 本身可以使用默认 SQLite 正常启动，就认为 Durable Write-back 也适用。
-
-写回一致性模型依赖数据库事务完成：
-
-- 同路径接收 fence；
-- generation 顺序与发布；
-- durable receive lease；
-- admission reservation 与 backlog 统计；
-- provider COPY/MOVE intent 恢复；
-- 多 worker 和多实例协调；
-- 重启后的安全状态恢复。
-
-这些路径依赖服务端数据库的事务和行级锁行为。SQLite 的文件/进程锁模型不视为本组件的等价实现。
+- MySQL：已支持并经过验证。
+- SQLite / sqlite3：不支持。
+- 其他数据库后端：不属于当前 Durable Write-back 支持范围。
 
 ### Durable spool
 
-配置的 `spool_dir` 必须位于可靠的本地持久存储上。持续大量 Cloud Sync 上传建议使用 SSD 或 NVMe。
-
-当 generation 尚未完成时，spool 不是可以随意删除的临时目录。OpenList 已经对 PUT 返回成功后，spool 可能是后台自动重试时唯一完整的数据副本。
+必须使用可靠的本地持久存储。持续大量上传建议使用 SSD/NVMe。活动 generation 的 spool 不应手工删除。
 
 ### Cloud Sync 模式
 
-本实现针对 **Synology Cloud Sync 到 WebDAV/OpenList 的单向上传**。
-
-双向同步或下载任务不能默认套用本文的恢复语义，除非已经单独验证。
+本设计针对 **Synology Cloud Sync -> WebDAV/OpenList 单向上传**，包括 Cloud Sync 客户端加密任务。
 
 ### 远端存储
 
-远端可以是 115，也可以是通过 OpenList 正常 storage driver 路径访问的其他后端。
-
-只要 durable spool 仍可用，provider 失败属于后台复制失败，不会自动否定已经成功 ACK 给 Cloud Sync 的 generation。
+115 Open 是当前主要验证对象。其他 OpenList storage driver 可以走同一 Write-back 流程，但远端验证能力可能不同。
 
 ## 2. 为什么 Cloud Sync 显示“完成”，OpenList 仍可能继续工作
 
@@ -91,26 +72,34 @@ WebDAV PUT 成功表示：
 
 这是有意设计，用来避免大文件因为远端最终一致性或速度问题产生重复上传。
 
-## 3. 状态与操作矩阵
 
-| 状态 / Recovery State | 含义 | 自动恢复 | 人工操作 |
-|---|---|---:|---|
-| `queued` | 等待 provider worker | 是 | 无 |
-| `uploading` | 正在上传远端 | 是 | 无 |
-| `verifying` | 正在验证当前 generation 的远端状态 | 是 | 无 |
-| `waiting_provider_verification` | 当前 provider 证据不足，OpenList 会等待后重新获取新证据 | 是 | 无 |
-| `restart_recovery` | OpenList 重启后正在恢复中断 generation | 是 | 无 |
-| 普通 provider error | upload/list/token/网络操作失败，但 durable payload 或恢复证据仍存在 | 是 | 通常无需操作 |
-| `missing_spool` | 本地 spool 缺失；OpenList 会先确认远端是否已经存在正确 generation | 初始阶段是 | 暂时不要重启 Cloud Sync |
-| `completed` | 当前 generation 已获得远端验证证据 | 已完成 | 无 |
-| 正常 `deleted` | 正常删除或 tombstone 生命周期 | 是 | 无 |
-| **`needs_cloudsync_rehydrate`** | OpenList 已无可用本地 payload，且刷新后的 provider 证据确认正确对象无法恢复 | **否** | **彻底停止/停用后重新启动/启用对应 Cloud Sync 任务，强制重新扫描并上传** |
+## 3. 用户看到的状态与进度
 
-`last_error` 非空**不等于必须人工处理**。
+### 活动任务
 
-运维判断应优先看 Recovery State。绝大多数 provider 错误都应该留在 OpenList 自己的自动重试闭环中。
+| 用户状态 | 含义 | 操作 |
+|---|---|---|
+| **接收中** | Cloud Sync 正在把 PUT 数据发送给 OpenList | 无 |
+| **后台同步中** | OpenList 已持久化数据，正在排队、上传、验证或自动恢复 provider 副本 | 无 |
+| **等待 Cloud Sync 重传** | 旧 generation 已无法安全自动收敛，需要 Cloud Sync 重新 PUT | 完整停止/停用后重新启动/启用同一个 Cloud Sync 任务 |
+| **已删除** | 删除生命周期 | 无 |
 
-升级时，旧记录不会仅因为 `retry_count` 很高就直接判定需要 Cloud Sync 重传。只有网络/API 失败、没有形成 provider 上传完成或验证差异证据的旧任务，仍继续 OP 自动重试；已经存在 provider 上传完成、验证、Hash/缺失/不一致证据的高重试旧任务，会先进入一次 fresh provider verification，并且不会再次盲目上传。若 fresh evidence 已恢复一致则直接完成；若仍明确缺失/不一致，则收敛到当前统一的 Cloud Sync re-upload 最终恢复路径。
+活动任务状态筛选放在表格标题中，采用 Excel 风格下拉。内部的 `queued/uploading/verifying`、重试、恢复类型、Hash、resolution reason 等仍保留在“高级信息”。
+
+**进度**列只显示真实进度：
+- 接收中：Cloud Sync 已发送字节 / PUT 声明大小。
+- Provider 上传中：OpenList storage driver 原生上传进度回调。
+- 排队、验证阶段：不伪造百分比。
+
+### 历史记录
+
+历史记录是 generation 级审计，不是实时任务页。普通用户看到的“最终状态”只保留：
+
+- **已完成**：正常完成和恢复后完成统一归为已完成，不再单独显示 `recovered`。
+- **等待 Cloud Sync 重传**：旧 generation 尚未解决，等待同路径的新 PUT。
+- **已删除**：删除已经完成。
+
+接收中、上传中、验证中、自动恢复中不再作为历史记录“最终状态”。详细内部状态仍可在“高级信息”查看。
 
 ## 4. 正常自动恢复
 
@@ -188,70 +177,25 @@ missing_spool
 
 此时过早重启 Cloud Sync，可能在远端其实已经存在正确对象的情况下制造一次重复 PUT。
 
-## 6. `needs_cloudsync_rehydrate`：唯一需要人工介入的正常恢复状态
 
-只有在正常自动恢复已经无法重建先前 ACK 的 generation 时，才会进入 `needs_cloudsync_rehydrate`：
+## 6. 最终 Cloud Sync 重传恢复
 
-```text
-Cloud Sync 之前已经收到成功响应
-        |
-        v
-本地 durable spool 已不可用
-        |
-        v
-刷新后的 provider 证据明确显示缺失或不一致
-        |
-        v
-OpenList 已经没有 payload 可以自行重新上传
-        |
-        v
-canonical Durable ACK 继续对 WebDAV 可见，
-同时该 row 明确进入 waiting_cloudsync_reupload
-        |
-        v
-needs_cloudsync_rehydrate / restart_cloudsync_required
-```
+当 OpenList 已经耗尽安全的 Provider 自动恢复路径时，旧 generation 进入最终的 Cloud Sync 重传等待状态。
 
-此时 OpenList 不再删除 canonical WebDAV 视图中的对象，也不会继续 Provider 无限重试。运维动作是完整停止/停用并重新启动/启用对应 Cloud Sync 任务，强制 fresh reconciliation；只要 Cloud Sync 对同一路径重新发起 PUT，新 generation 就会接管旧异常 generation。
+**canonical Durable ACK 会继续对 WebDAV 可见。OpenList 不再通过隐藏/删除 canonical 对象来强迫 Cloud Sync 重扫。**
 
 ### 必须执行的人工步骤
 
-1. 确认 Recovery State 确实是 `needs_cloudsync_rehydrate`。
-2. **不要删除 Cloud Sync 任务，也不要 unlink 后重建整个任务。**
-3. 彻底停止或停用对应的 Cloud Sync 任务。
-4. 等待任务完全停止，确认没有正在进行的传输。
-5. 重新启动或启用**同一个** Cloud Sync 任务。
-6. 等待 Cloud Sync 做一次新的 reconciliation 扫描。
-7. 确认受影响路径重新出现 PUT。
-8. 确认 PUT 之后出现 PROPFIND 验证。
-9. 确认新的 OpenList generation 按 `queued -> uploading -> verifying -> completed` 收敛。
+1. 完整停止或停用受影响的 Cloud Sync 任务。
+2. 确认传输停止。
+3. 重新启动或启用同一个 Cloud Sync 任务。
+4. 等待 fresh reconciliation scan。
+5. 确认异常路径出现新的 PUT。
+6. 确认新 generation 最终进入“已完成”。
 
-### 预期 WebDAV trace
+新的同路径 PUT 会按 generation/ACK 顺序接管旧 incident。由于 Cloud Sync 加密或合法本地变更，新 payload 的大小或 SHA-1 不需要和旧 generation 相同。
 
-正常 rehydrate 大致应表现为：
-
-```text
-PROPFIND 父目录（Depth: 1）
-    |
-    +--> 受影响对象已经从 canonical WebDAV view 消失
-    |
-    v
-Cloud Sync 发现本地存在、远端不存在
-    |
-    v
-PUT 受影响文件
-    |
-    v
-HTTP 201/204
-    |
-    v
-PROPFIND 文件（Depth: 0）
-    |
-    v
-canonical 对象重新出现
-```
-
-如果 Cloud Sync 已经多次通过 PROPFIND 明确看到文件缺失，但始终没有重新 PUT，请先保留 trace，不要手工修改 OpenList 或数据库状态。
+OpenList 不提供“手动重传”按钮。
 
 ## 7. 正常 `deleted` 与 `needs_cloudsync_rehydrate` 的区别
 
@@ -381,17 +325,16 @@ Recovery State 是否为 needs_cloudsync_rehydrate？
 等待 OpenList 自动 retry/verify -----------+
 ```
 
+
 ## 13. 运维总结
 
-- Cloud Sync 负责保留源文件。
-- OpenList 负责 durable 接收、provider 上传、重试和验证。
+- Cloud Sync 保留源文件。
+- OpenList 负责 durable 接收、Provider 上传、重试、验证和恢复。
 - 本 fork 的 Durable Write-back 仅支持 MySQL。
-- SQLite 不支持 Durable Write-back。
-- 其他数据库后端不属于当前 Durable Write-back 支持范围。
-- 普通 provider 错误不要重启 Cloud Sync。
-- `missing_spool` 仍在验证 provider 时不要重启 Cloud Sync。
-- 只有自动 Provider 恢复已经失败并进入 Cloud Sync re-upload 等待态时，才需要完整停止/停用并重新启动/启用对应 Cloud Sync 任务，以强制重新扫描。
-
+- 普通 Provider 错误继续由 OpenList 自动恢复。
+- 活动任务只展示简化后的 Cloud Sync 生命周期，并显示真实接收/上传进度。
+- 历史记录只展示有意义的最终结果；恢复成功统一显示“已完成”。
+- 最终 fallback 保持 canonical ACK 可见，等待 Cloud Sync 对同一路径发起新的 PUT。
 
 ## 远端 Hash 差异与最终恢复
 

@@ -2,6 +2,8 @@
 
 This fork adds a WebDAV write-back path intended for **one-way Synology Cloud Sync uploads**, including Cloud Sync client-side encrypted jobs.
 
+> **Development note:** This feature was developed with AI assistance and validated through human testing.
+
 > **Operations:** See the [English operations guide](./cloudsync-writeback-operations.md) for the state/action matrix, recovery procedures, and Cloud Sync rehydrate workflow. A separate [Chinese operations guide](./cloudsync-writeback-operations.zh-CN.md) is also available.
 
 ## Design
@@ -43,27 +45,22 @@ After the complete PUT body is fsynced and atomically installed in the spool, th
 
 Failed remote uploads retry in the background. An interrupted `UPLOADING` row is deliberately re-queued from the durable spool after restart. This can duplicate a provider upload after a crash, but it avoids treating an older same-sized encrypted object as proof that the newest generation arrived. The remote write contract is therefore **at-least-once across crashes**, with the local canonical generation remaining authoritative to Cloud Sync.
 
+
 ## Database requirement
 
-> **SQLite is not supported for WebDAV durable write-back.** Use a server database with transactional row-level locking. **MySQL is the validated and recommended backend. PostgreSQL is the other supported OpenList server-database target, but deployments should run the write-back test suite before production use.** Do not enable this feature on the default SQLite database even if OpenList itself starts successfully.
+> **Durable Write-back in this fork is MySQL-only. SQLite is unsupported, and other database backends are outside the supported Durable Write-back path.**
 
-The reason is correctness rather than raw performance: receive fences, admission reservations, generation publication, provider-operation recovery, and multi-worker/multi-instance coordination rely on transactional locking semantics that are not equivalent to SQLite's process/file locking model.
+This is a correctness requirement, not only a performance recommendation. Receive fences, admission reservations, generation publication, provider-operation recovery, live progress persistence, and multi-worker/multi-instance coordination depend on MySQL transaction and row-lock behavior validated by the Write-back test suite.
 
 ### MySQL
 
-The write-back queue and canonical metadata use the normal OpenList GORM database. With a MySQL deployment no SQLite side database is created.
+The queue, canonical metadata, receive fences, reservations, history, provider-operation intents, and live progress fields use the normal OpenList GORM MySQL database. No SQLite side database is created.
 
-Paths are stored as text, while SHA-256 path keys are indexed. This avoids MySQL `utf8mb4` index-length problems for long WebDAV paths.
+The receive fence carries the active receive lease, expected size, and current received-byte count. This both prevents provider workers from racing a still-running Cloud Sync PUT and provides real Cloud Sync -> OpenList progress to the admin UI.
 
-Same-path PUT publication is also fenced in MySQL. Each WebDAV path has one small receive-fence row with a monotonically increasing start sequence and the last sequence that successfully published canonical state. A PUT receives its sequence before the body is accepted; after the complete payload is durable, canonical publication locks that fence and cannot move behind a newer committed PUT. This replaces process-local ordering as the correctness authority, so overlapping large-file retries converge the same way after restart or across multiple OpenList instances.
+Provider upload progress is stored on the current write-back object and comes from OpenList's native storage-driver progress callback. No estimated timer is used.
 
-The same fence now carries a crash-expiring `RECEIVING` lease and active-receiver count. A long PUT refreshes that lease periodically while streaming. Provider workers consult the durable lease as well as the local fast-path map, so another OpenList instance cannot start uploading an older queued generation while the NAS is still sending a newer large file. A crashed receiver stops blocking automatically when its lease expires. This is coordination only: OpenList never returns success for a partial body.
-
-The same fence is advanced by canonical MKCOL and DELETE mutations. Directory DELETE advances every already-known descendant fence in the same MySQL transaction as the tombstones. Therefore an older PUT that started before a later delete cannot finish late and resurrect the deleted path, including when the PUT and DELETE were handled by different OpenList instances.
-
-MOVE and COPY use the same ordering domain. MOVE advances both source and destination fence trees before canonical metadata changes; COPY advances only its destination tree. Multi-root mutations lock fence roots in deterministic path order, so opposite-direction operations do not introduce a new A-to-B/B-to-A lock-order cycle. Provider-backed MOVE/COPY metadata reconciliation applies the same fence update after the durable provider-operation intent has protected the paths.
-
-The queue table has composite indexes on `(state, retry_at)` plus a dispatch-class index on `(state, is_dir, retry_at)`, a sibling-verification index on `(parent_key, state)`, and `(state, completed_at)` for completed-spool cleanup. They are declared in the GORM model, so the normal OpenList MySQL `AutoMigrate` path creates them automatically on upgrade; no separate SQLite database or manual migration is required. Dispatch no longer asks MySQL to `CASE ORDER BY` the entire due queue. It performs small indexed scans for DELETE, VERIFY, directory work and file work, then applies the small-vs-large file preference in memory. The hot scans select only the scheduling fields they consume (`id/path/size/type/state`), completed-cache cleanup selects only the four fields it actually consumes, and provider-intent protection scans select only routing/fence columns instead of large recovery snapshots and TEXT errors. This avoids repeated transfer/allocation of cold columns on large MySQL tables. Subtree mutation queries also use an escaped `root/%` LIKE pattern (`~` escape) instead of `root%`, so encrypted names containing `_`/`%` cannot expand into SQL wildcards and sibling prefixes such as `/a` versus `/ab` are excluded before row locking.
+The normal OpenList MySQL `AutoMigrate` path creates and upgrades these tables and indexes. For an intentional clean re-test, the Write-back-only tables can be dropped while OpenList is stopped and will be recreated at the next startup. Do not drop the OpenList database itself.
 
 ## Configuration
 
@@ -323,16 +320,37 @@ This fork also hardens the 115 Open driver under the write-back workload:
 The focused WebDAV write-back workflow is intentionally not triggered by ordinary pushes to `feature/cloudsync-writeback`. During compatibility work, related changes can accumulate without repeatedly canceling/rerunning the same CI. Validation remains available through `workflow_dispatch`, and pull requests targeting `main` still run the focused write-back suite automatically.
 
 
+
 ## State-machine simplification
 
-Provider replication now uses one persisted lifecycle column, `state`, with four active values: `queued`, `uploading`, `verifying`, and `completed`. Provider errors return the generation to `queued`; retry intent is carried by `retry_count`, `retry_at`, and `last_error` instead of a separate `failed` state. Startup recovery migrates historical `failed` rows to `queued` without losing their retry metadata.
+Internal correctness state remains detailed, but the normal admin UI intentionally presents a smaller Cloud Sync-oriented lifecycle.
 
-The former `remote_sync_state` model field duplicated `state` and is no longer read or written. Existing MySQL columns are intentionally left in place rather than automatically dropped, avoiding an upgrade-time table rebuild or metadata lock.
+### User-facing Active states
 
-Receive ownership is derived from `active_receivers` plus the crash-expiring `receive_lease_until`. The redundant `receive_state` and `receive_updated_at` model fields are no longer used; normal `updated_at` remains available for diagnostics. This reduces transition and heartbeat write amplification.
+- **Receiving** — Cloud Sync is still sending the PUT body.
+- **Syncing** — the payload is durable/ACKed and OpenList is queueing, uploading, verifying, or automatically recovering the provider replica.
+- **Waiting for Cloud Sync re-upload** — OpenList has stopped automatic provider recovery for the old generation and needs Cloud Sync to issue a fresh PUT.
+- **Deleted** — delete lifecycle.
 
-Client-visible canonical state remains compact and independent: `durable_acked`, `deleted`, and `lock_null`. The historical `acked` value is accepted only for upgrade compatibility.
+The Active status filter is an Excel-style dropdown in the table header. Internal values such as `queued`, `uploading`, `verifying`, retry counters, recovery types, hashes, and resolution reasons stay under Advanced information.
 
+### Live progress
+
+The Active **Progress** column shows only real progress:
+
+- Cloud Sync -> OpenList: received bytes divided by the declared PUT size.
+- OpenList -> provider: the native OpenList provider-upload progress callback.
+- Queueing and verification do not fabricate a percentage.
+
+### History final states
+
+History is audit data for completed/closed generations, not a live task view. Its normal final-status filter is limited to:
+
+- **Completed** — includes normal completion and completion after recovery. `recovered` is not a separate normal-user status.
+- **Waiting for Cloud Sync re-upload** — the old generation remains unresolved while waiting for a newer same-path PUT.
+- **Deleted** — completed delete outcome.
+
+Receiving/uploading/verifying/automatic-recovery states belong to Active and are not presented as History "final status". Internal audit detail remains available under Advanced information.
 
 ### Receive and scheduler hot-path performance
 
@@ -431,18 +449,43 @@ Canonical-first directory MOVE now treats provider-only children as divergence. 
 Trace-contract regression tests now encode the observed Cloud Sync sequence directly: PUT followed by stale/zero-size PROPFIND snapshots must still return the canonical size/mtime/ETag; MOVE must hide the source and expose the destination before provider propagation; DELETE must hide a stale provider object immediately.
 
 
+
 ## Admin History and cache boundaries
 
-The WebDAV Writeback admin surface is organized as **Overview | Active | History | Settings**. The canonical object table remains an internal client-visible/current-state authority and is intentionally not exposed as a standalone Canonical page.
+The WebDAV Writeback admin surface is **Overview | Active | History | Settings**. The internal canonical object table is not exposed as a separate Canonical page.
 
-`WebDAVWritebackHistory` is an audit-only, per-generation record keyed uniquely by `PathKey + Generation`. It is written only for meaningful final outcomes such as completed replication, confirmed recovery, confirmed remote loss/rehydration, and confirmed deletion. History persistence is best-effort and never participates in Durable ACK, PROPFIND, provider verification, or retry decisions.
+History is per-generation audit data keyed by `PathKey + Generation`. It never participates in Durable ACK, PROPFIND, provider verification, or retry decisions.
 
-**Release Completed Cache** removes only safe, provider-verified completed `.data` spool files. **Delete History** removes only History rows. History cleanup never removes or changes the current canonical object, current generation, spool files, provider objects, recovery state, or Cloud Sync visibility.
+The redundant History summary cards and helper text have been removed. Path search, Excel-style header filters, Advanced filters, per-row Advanced diagnostics, and History cleanup remain.
 
-`CompletedRemoteProbeSeconds` is exposed in Settings as the existing interval controlling how long released completed objects may reuse fresh provider evidence before background reconciliation checks the provider again. The reconciliation algorithm and the two-stage confirmed-loss behavior are unchanged.
+A final Cloud Sync fallback **does not hide or delete the canonical Durable ACK**. The operator fully stops/disables and then starts/enables the same Cloud Sync task. A fresh same-path PUT creates a newer generation and supersedes the old recovery incident. Recovery correlation uses same-path generation/ACK ordering and does not require encrypted payload size or SHA-1 equality.
+
+Once the newer generation completes, the normal UI treats the old incident as **Completed**. The original recovery/root-cause evidence remains in Advanced information for audit.
+
+There is no OpenList "manual retransmit" button because a WebDAV server cannot command Synology Cloud Sync to upload an arbitrary file.
+
+### Clean test reset
+
+For a deliberate full re-upload test, stop Cloud Sync and OpenList first, back up MySQL, clear the Write-back spool, and drop only these tables:
+
+```sql
+SET FOREIGN_KEY_CHECKS = 0;
+
+DROP TABLE IF EXISTS web_dav_provider_operations;
+DROP TABLE IF EXISTS web_dav_writeback_receive_reservations;
+DROP TABLE IF EXISTS web_dav_writeback_receive_fences;
+DROP TABLE IF EXISTS web_dav_writeback_admission_fences;
+DROP TABLE IF EXISTS web_dav_writeback_histories;
+DROP TABLE IF EXISTS web_dav_writeback_objects;
+
+SET FOREIGN_KEY_CHECKS = 1;
+```
+
+Start the current OpenList build before restarting Cloud Sync. MySQL AutoMigrate recreates the tables. Do not drop the OpenList database or unrelated OpenList tables.
 
 ### Native admin frontend integration
 
-The experimental standalone `/@manage/webdav-writeback` HTML handler has been removed. The same path is now owned by the normal OpenList SolidJS management router, with an admin-only **WebDAV Writeback** side-menu entry on the Go backend. The page keeps the existing **Overview | Active | History | Settings** information architecture and consumes only the authenticated `/api/admin/webdav-writeback/*` APIs.
+The management page is owned by the normal OpenList SolidJS admin router and uses authenticated `/api/admin/webdav-writeback/*` APIs.
 
-CloudSync Docker builds pin both halves of the test surface: the backend commit and frontend commit `c8f23446f4ea63ecbf19118fb440600c7075f338` from `invoker-kael/OpenList-Frontend`. The Docker build compiles that frontend source into `public/dist` and tells `build.sh` to use the prebuilt dist instead of downloading an unrelated upstream frontend release. This keeps long-running test images reproducible and prevents upstream UI changes from silently changing the writeback test environment.
+CloudSync Docker builds pin both a validated backend source commit and a validated `invoker-kael/OpenList-Frontend` commit so the test image is reproducible.
+

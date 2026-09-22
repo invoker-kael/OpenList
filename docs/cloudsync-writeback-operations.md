@@ -2,55 +2,36 @@
 
 This guide is for operating WebDAV Durable Write-back with **one-way Synology Cloud Sync** jobs.
 
+> **Development note:** This feature was developed with AI assistance and validated through human testing.
+
 ## Core rule
 
 **`needs_cloudsync_rehydrate` is the only normal write-back recovery state that requires Cloud Sync or operator intervention. All other normal write-back recovery states are designed to self-heal.**
 
 Infrastructure failures are outside this rule. If the database service is unavailable, the spool filesystem is full or damaged, provider credentials are invalid, or the provider/network path is broken, repair that infrastructure first.
 
+
 ## 1. Component requirements
 
 ### Database
 
-**SQLite is not supported for WebDAV Durable Write-back.**
+**Durable Write-back in this fork is MySQL-only.**
 
-Use a server database with transactional row-level locking semantics:
-
-- **MySQL: validated and recommended**
-- **PostgreSQL: supported as an OpenList server-database target; run the write-back test suite against the exact deployment before production use**
-- **SQLite / sqlite3: unsupported**
-
-Do not enable Durable Write-back on the default SQLite database merely because OpenList itself starts successfully.
-
-The consistency model depends on database transactions for:
-
-- same-path receive fencing;
-- generation ordering and publication;
-- durable receive leases;
-- admission reservations and backlog accounting;
-- provider COPY/MOVE intent recovery;
-- multi-worker and multi-instance coordination;
-- restart-safe state transitions.
-
-These paths rely on server-database transaction and row-locking behavior. SQLite's file/process locking model is not treated as equivalent for this component.
+- MySQL: supported and validated.
+- SQLite / sqlite3: unsupported.
+- Other database backends: outside the supported Durable Write-back path for this fork.
 
 ### Durable spool
 
-The configured `spool_dir` must be on durable local storage. SSD or NVMe is recommended for sustained Cloud Sync workloads.
-
-The spool is not a disposable temporary directory while a generation is pending. After OpenList acknowledges a PUT, the spool may be the only complete payload available for automatic provider retry.
+Use reliable persistent local storage. SSD/NVMe is recommended for sustained Cloud Sync uploads. Do not manually delete spool payloads for active generations.
 
 ### Cloud Sync mode
 
-This implementation is designed for **one-way upload from Synology Cloud Sync to WebDAV/OpenList**.
-
-Do not assume identical recovery behavior for bidirectional or download jobs unless those modes have been separately tested.
+This design targets **one-way Synology Cloud Sync upload to WebDAV/OpenList**, including client-side encrypted jobs.
 
 ### Provider
 
-The provider may be 115 or another OpenList storage backend reached through the normal storage-driver path.
-
-Provider failures are background replication failures. They do not invalidate a successfully acknowledged Cloud Sync generation while the durable spool remains available.
+115 Open is the primary validated provider. Other OpenList drivers can use the same flow, but provider verification capability may differ.
 
 ## 2. Why Cloud Sync can show "Completed" while OpenList is still working
 
@@ -87,26 +68,34 @@ It does **not** mean the backing provider has already completed upload and verif
 
 This separation is intentional. It prevents a slow or eventually consistent provider from forcing Cloud Sync to retransmit large files unnecessarily.
 
-## 3. State and action matrix
 
-| State / recovery state | Meaning | Automatic recovery | Operator action |
-|---|---|---:|---|
-| `queued` | Waiting for a provider worker | Yes | None |
-| `uploading` | Provider upload in progress | Yes | None |
-| `verifying` | Checking provider state for the current generation | Yes | None |
-| `waiting_provider_verification` | Provider evidence is currently inconclusive; OpenList will retry with fresh evidence | Yes | None |
-| `restart_recovery` | An interrupted generation is being recovered after OpenList restart | Yes | None |
-| ordinary provider error | Upload/list/token/network work failed but durable payload or recovery evidence still exists | Yes | Normally none |
-| `missing_spool` | Local spool is missing; OpenList first checks whether the provider already contains the correct generation | Yes, initially | Do not restart Cloud Sync yet |
-| `completed` | Current generation has verified provider evidence | Completed | None |
-| normal `deleted` | Normal delete or tombstone lifecycle | Yes | None |
-| **`needs_cloudsync_rehydrate`** | OpenList has no usable local payload and fresh provider evidence confirms the correct object cannot be recovered | **No** | **Stop/disable and then start/enable the Cloud Sync task to force a fresh reconciliation scan and re-upload** |
+## 3. User-facing states and progress
 
-A non-empty `last_error` is **not automatically a manual-action signal**.
+### Active tasks
 
-The recovery classification is more important than a raw error string. Most provider failures should remain inside OpenList's automatic retry loop.
+| User status | Meaning | Action |
+|---|---|---|
+| **Receiving** | Cloud Sync is sending the PUT body | None |
+| **Syncing** | OpenList is queueing, uploading, verifying, or auto-recovering the provider replica | None |
+| **Waiting for Cloud Sync re-upload** | The old generation cannot safely converge and needs a fresh Cloud Sync PUT | Stop/disable, then start/enable the same Cloud Sync task |
+| **Deleted** | Delete lifecycle | None |
 
-On upgrade, legacy rows with a high `retry_count` are not judged by the counter alone. Rows that only show transport/API failures continue automatic retry. Rows that already contain provider-upload or verification/divergence evidence are first moved to a fresh provider verification pass without another blind upload. If the provider now matches, the row completes normally; if fresh evidence still proves missing/divergent content, the row converges to the current Cloud Sync re-upload recovery path.
+The Active status filter is an Excel-style table-header dropdown. Internal states remain available in Advanced information.
+
+The **Progress** column shows real progress only:
+- Receiving = Cloud Sync bytes received / declared PUT size.
+- Uploading = native OpenList provider upload progress.
+- Queueing / verification = no fake percentage.
+
+### History
+
+History is per-generation audit data. Its normal final statuses are only:
+
+- **Completed** — includes normal completion and recovered completion.
+- **Waiting for Cloud Sync re-upload** — old generation unresolved, waiting for a newer same-path PUT.
+- **Deleted** — completed delete outcome.
+
+Transient states such as receiving/uploading/verifying are not History final statuses.
 
 ## 4. Normal automatic recovery
 
@@ -184,69 +173,25 @@ fresh provider verification
 
 Restarting Cloud Sync at this stage can create an unnecessary duplicate PUT even though the provider may already contain the correct object.
 
-## 6. `needs_cloudsync_rehydrate`: manual recovery
 
-OpenList reaches `needs_cloudsync_rehydrate` only after the normal automatic recovery path can no longer reconstruct the acknowledged generation:
+## 6. Final Cloud Sync re-upload recovery
 
-```text
-Cloud Sync previously received success
-        |
-        v
-local durable spool is no longer usable
-        |
-        v
-fresh provider verification is conclusively missing/divergent
-        |
-        v
-OpenList has no payload left to upload by itself
-        |
-        v
-canonical Durable ACK remains visible while the row explicitly waits for a fresh Cloud Sync generation
-        |
-        v
-needs_cloudsync_rehydrate
-```
+When OpenList has exhausted safe automatic provider recovery, the generation moves to the final Cloud Sync re-upload path.
 
-At this point OpenList intentionally makes the object absent from the canonical WebDAV view so that a fresh Cloud Sync reconciliation can rediscover the local source file and PUT it again.
+The canonical Durable ACK remains visible. OpenList does **not** hide/delete the object simply to force a rescan.
 
 ### Required operator procedure
 
-1. Confirm the recovery state is exactly `needs_cloudsync_rehydrate`.
-2. Do **not** delete the Cloud Sync task and do not unlink/recreate the entire job.
-3. Stop or disable the affected Cloud Sync task completely.
-4. Wait until the task is fully stopped and no transfer is active.
-5. Start or enable the same Cloud Sync task again.
-6. Allow Cloud Sync to perform a fresh reconciliation scan.
-7. Confirm the affected path produces a new PUT.
-8. Confirm the PUT is followed by PROPFIND verification.
-9. Confirm the new OpenList generation progresses through `queued -> uploading -> verifying -> completed`.
+1. Fully stop/disable the affected Cloud Sync task.
+2. Wait until transfers stop.
+3. Start/enable the same task.
+4. Let Cloud Sync perform a fresh reconciliation scan.
+5. Confirm a new PUT is issued for the affected path.
+6. Confirm the newer generation reaches Completed.
 
-### Expected WebDAV trace
+A newer same-path PUT supersedes the old incident by generation/ACK ordering. Its encrypted payload size or SHA-1 does not need to equal the old generation.
 
-A successful rehydrate should broadly look like:
-
-```text
-PROPFIND parent (Depth: 1)
-    |
-    +--> affected object remains in the canonical WebDAV view with an explicit Cloud Sync re-upload recovery state
-    |
-    v
-Cloud Sync detects a local-only file
-    |
-    v
-PUT affected-file
-    |
-    v
-HTTP 201/204
-    |
-    v
-PROPFIND affected-file (Depth: 0)
-    |
-    v
-canonical object visible again
-```
-
-If Cloud Sync repeatedly sees the object as missing through PROPFIND but never issues a PUT, capture the trace before modifying OpenList or database state manually.
+There is no OpenList manual retransmit button.
 
 ## 7. Normal `deleted` versus `needs_cloudsync_rehydrate`
 
@@ -376,17 +321,16 @@ Do not touch Cloud Sync                   |
 Let OpenList retry/verify automatically --+
 ```
 
+
 ## 13. Operational summary
 
 - Cloud Sync owns the source copy.
-- OpenList owns durable acceptance, provider upload, retry, and verification.
-- Durable Write-back is MySQL-only in this fork.
-- SQLite is unsupported for Durable Write-back.
-- Other database backends are outside the supported Durable Write-back path.
-- Do not restart Cloud Sync for ordinary provider errors.
-- Do not restart Cloud Sync for `missing_spool` while OpenList is still verifying the provider.
-- Restart the affected Cloud Sync task only for `needs_cloudsync_rehydrate`, by fully stopping/disabling and then starting/enabling the same task to force a fresh scan.
-
+- OpenList owns durable acceptance, provider upload, retry, verification, and recovery.
+- Durable Write-back in this fork is MySQL-only.
+- Normal provider errors stay inside OpenList automatic recovery.
+- Active shows the simplified Cloud Sync lifecycle and real receive/upload progress.
+- History shows only meaningful final outcomes; recovered completion is simply Completed.
+- The final fallback keeps canonical ACK visible and waits for a fresh same-path Cloud Sync PUT.
 
 ## Remote hash difference and final recovery
 
