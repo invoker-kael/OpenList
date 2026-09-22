@@ -93,30 +93,30 @@ type webDAVWritebackStateAggregate struct {
 }
 
 type webDAVWritebackMonitorRow struct {
-	ID               string     `json:"id"`
-	Path             string     `json:"path"`
-	Name             string     `json:"name"`
-	IsDir            bool       `json:"is_dir"`
-	Size             int64      `json:"size"`
-	ClientState      string     `json:"client_state"`
-	ProviderState    string     `json:"provider_state"`
-	EffectiveStatus  string     `json:"effective_status"`
-	OperatorAction   string     `json:"operator_action"`
-	RecoveryType     string     `json:"recovery_type"`
-	TaskHealth       string     `json:"task_health"`
-	Generation       uint64     `json:"generation"`
-	RemoteGeneration uint64     `json:"remote_generation"`
-	ETag             string     `json:"etag"`
-	PayloadSHA1      string     `json:"payload_sha1"`
-	RemoteSHA1       string     `json:"remote_sha1"`
-	RemoteObjectID   string     `json:"remote_object_id"`
-	RetryCount       int        `json:"retry_count"`
-	VerifyCount      int        `json:"verify_count"`
-	ActiveReceivers  int        `json:"active_receivers,omitempty"`
-	LastError        string     `json:"last_error"`
-	ResolutionReason string     `json:"resolution_reason,omitempty"`
-	RetryAt          *time.Time `json:"retry_at"`
-	RecoveryState    string     `json:"recovery_state,omitempty"`
+	ID                        string     `json:"id"`
+	Path                      string     `json:"path"`
+	Name                      string     `json:"name"`
+	IsDir                     bool       `json:"is_dir"`
+	Size                      int64      `json:"size"`
+	ClientState               string     `json:"client_state"`
+	ProviderState             string     `json:"provider_state"`
+	EffectiveStatus           string     `json:"effective_status"`
+	OperatorAction            string     `json:"operator_action"`
+	RecoveryType              string     `json:"recovery_type"`
+	TaskHealth                string     `json:"task_health"`
+	Generation                uint64     `json:"generation"`
+	RemoteGeneration          uint64     `json:"remote_generation"`
+	ETag                      string     `json:"etag"`
+	PayloadSHA1               string     `json:"payload_sha1"`
+	RemoteSHA1                string     `json:"remote_sha1"`
+	RemoteObjectID            string     `json:"remote_object_id"`
+	RetryCount                int        `json:"retry_count"`
+	VerifyCount               int        `json:"verify_count"`
+	ActiveReceivers           int        `json:"active_receivers,omitempty"`
+	LastError                 string     `json:"last_error"`
+	ResolutionReason          string     `json:"resolution_reason,omitempty"`
+	RetryAt                   *time.Time `json:"retry_at"`
+	RecoveryState             string     `json:"recovery_state,omitempty"`
 	RemoteVerifiedAt          *time.Time `json:"remote_verified_at"`
 	ReceiveStartedAt          *time.Time `json:"receive_started_at,omitempty"`
 	AckTime                   *time.Time `json:"ack_time"`
@@ -131,8 +131,8 @@ type webDAVWritebackMonitorRow struct {
 	ProviderEvidenceResult    string     `json:"provider_evidence_result,omitempty"`
 	CompletedAt               *time.Time `json:"completed_at"`
 	StartedAt                 *time.Time `json:"started_at,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
 }
 
 func WebDAVWritebackMonitorSummary(c *gin.Context) {
@@ -608,29 +608,29 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 			row := &objects[i]
 			effectiveStatus, operatorAction := webDAVCurrentEffectiveStatus(row)
 			rows = append(rows, webDAVWritebackMonitorRow{
-				ID:               strconv.FormatUint(uint64(row.ID), 10),
-				Path:             row.Path,
-				Name:             row.Name,
-				IsDir:            row.IsDir,
-				Size:             row.Size,
-				ClientState:      webDAVMonitorCanonicalState(row),
-				ProviderState:    row.State,
-				EffectiveStatus:  effectiveStatus,
-				OperatorAction:   operatorAction,
-				RecoveryType:     writeback.RecoveryType(row),
-				TaskHealth:       writeback.TaskHealth(row),
-				Generation:       row.Generation,
-				RemoteGeneration: row.RemoteGeneration,
-				ETag:             row.ETag,
-				PayloadSHA1:      row.PayloadSHA1,
-				RemoteSHA1:       row.RemoteSHA1,
-				RemoteObjectID:   row.RemoteObjectID,
-				RetryCount:       row.RetryCount,
-				VerifyCount:      row.VerifyCount,
-				LastError:        row.LastError,
-				ResolutionReason: row.ResolutionReason,
-				RetryAt:          row.RetryAt,
-				RecoveryState:    writeback.RecoveryLabel(row),
+				ID:                        strconv.FormatUint(uint64(row.ID), 10),
+				Path:                      row.Path,
+				Name:                      row.Name,
+				IsDir:                     row.IsDir,
+				Size:                      row.Size,
+				ClientState:               webDAVMonitorCanonicalState(row),
+				ProviderState:             row.State,
+				EffectiveStatus:           effectiveStatus,
+				OperatorAction:            operatorAction,
+				RecoveryType:              writeback.RecoveryType(row),
+				TaskHealth:                writeback.TaskHealth(row),
+				Generation:                row.Generation,
+				RemoteGeneration:          row.RemoteGeneration,
+				ETag:                      row.ETag,
+				PayloadSHA1:               row.PayloadSHA1,
+				RemoteSHA1:                row.RemoteSHA1,
+				RemoteObjectID:            row.RemoteObjectID,
+				RetryCount:                row.RetryCount,
+				VerifyCount:               row.VerifyCount,
+				LastError:                 row.LastError,
+				ResolutionReason:          row.ResolutionReason,
+				RetryAt:                   row.RetryAt,
+				RecoveryState:             writeback.RecoveryLabel(row),
 				RemoteVerifiedAt:          row.RemoteVerifiedAt,
 				ReceiveStartedAt:          row.ReceiveStartedAt,
 				AckTime:                   row.AckTime,
@@ -646,7 +646,7 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 				CompletedAt:               row.CompletedAt,
 				StartedAt:                 row.ReceiveStartedAt,
 				CreatedAt:                 row.CreatedAt,
-				UpdatedAt:        row.UpdatedAt,
+				UpdatedAt:                 row.UpdatedAt,
 			})
 		}
 	}

@@ -1723,11 +1723,11 @@ func deleteCompletedCanonical(row *model.WebDAVWritebackObject) (bool, error) {
 		"canonical_state":              CanonicalStateAcked,
 		"state":                        StateWaitingCloudSyncReupload,
 		"cloud_sync_reupload_required": true,
-		"recovery_started_at":           recoveryStartedAt,
-		"retry_at":                      nil,
-		"last_error":                    reason,
-		"resolution_reason":             resolution,
-		"completed_at":                  nil,
+		"recovery_started_at":          recoveryStartedAt,
+		"retry_at":                     nil,
+		"last_error":                   reason,
+		"resolution_reason":            resolution,
+		"completed_at":                 nil,
 	}
 	updates = mergeUpdateMaps(updates, applyProviderEvidence(row, now, evidenceResult))
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
@@ -2118,15 +2118,15 @@ func settleCompletedRemoteHashMismatch(row *model.WebDAVWritebackObject, remote 
 		"canonical_state":              CanonicalStateAcked,
 		"state":                        StateWaitingCloudSyncReupload,
 		"cloud_sync_reupload_required": true,
-		"recovery_started_at":           recoveryStartedAt,
-		"retry_at":                      nil,
-		"last_error":                    remoteHashMismatchMessage(row, remote),
-		"resolution_reason":             ResolutionRemoteHashMismatch,
-		"completed_at":                  nil,
-		"remote_object_id":              evidence.objectID,
-		"remote_sha1":                   evidence.sha1,
-		"remote_generation":             0,
-		"remote_verified_at":            nil,
+		"recovery_started_at":          recoveryStartedAt,
+		"retry_at":                     nil,
+		"last_error":                   remoteHashMismatchMessage(row, remote),
+		"resolution_reason":            ResolutionRemoteHashMismatch,
+		"completed_at":                 nil,
+		"remote_object_id":             evidence.objectID,
+		"remote_sha1":                  evidence.sha1,
+		"remote_generation":            0,
+		"remote_verified_at":           nil,
 	}
 	updates = mergeUpdateMaps(updates, applyProviderEvidence(row, now, ResolutionRemoteHashMismatch))
 	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
@@ -3903,21 +3903,21 @@ func DeleteTree(p string) (bool, error) {
 			if err := tx.Model(&model.WebDAVWritebackObject{}).
 				Where("id = ?", row.ID).
 				Updates(map[string]any{
-					"generation":         gorm.Expr("generation + 1"),
+					"generation":                   gorm.Expr("generation + 1"),
 					"canonical_state":              CanonicalStateDeleted,
 					"state":                        StateDeleted,
 					"cloud_sync_reupload_required": false,
-					"recovery_started_at":           nil,
-					"retry_at":                      &now,
-					"last_error":                    "",
-					"resolution_reason":             "",
-					"retry_count":                   0,
-					"verify_count":       0,
-					"completed_at":       nil,
-					"remote_object_id":   "",
-					"remote_sha1":        "",
-					"remote_generation":  0,
-					"remote_verified_at": nil,
+					"recovery_started_at":          nil,
+					"retry_at":                     &now,
+					"last_error":                   "",
+					"resolution_reason":            "",
+					"retry_count":                  0,
+					"verify_count":                 0,
+					"completed_at":                 nil,
+					"remote_object_id":             "",
+					"remote_sha1":                  "",
+					"remote_generation":            0,
+					"remote_verified_at":           nil,
 				}).Error; err != nil {
 				return err
 			}
@@ -6038,16 +6038,16 @@ func forceCloudSyncRepairForMissingPayload(row *model.WebDAVWritebackObject, cur
 			"canonical_state":              CanonicalStateAcked,
 			"state":                        StateWaitingCloudSyncReupload,
 			"cloud_sync_reupload_required": true,
-			"recovery_started_at":           recoveryStartedAt,
-			"spool_path":                    "",
-			"retry_at":                      nil,
-			"last_error":                    reason,
-			"resolution_reason":             ResolutionNeedsCloudSyncRehydrate,
-			"retry_count":                   0,
-			"verify_count":                  0,
-			"completed_at":                  nil,
-			"remote_generation":             0,
-			"remote_verified_at":            nil,
+			"recovery_started_at":          recoveryStartedAt,
+			"spool_path":                   "",
+			"retry_at":                     nil,
+			"last_error":                   reason,
+			"resolution_reason":            ResolutionNeedsCloudSyncRehydrate,
+			"retry_count":                  0,
+			"verify_count":                 0,
+			"completed_at":                 nil,
+			"remote_generation":            0,
+			"remote_verified_at":           nil,
 		})
 	if res.Error != nil || res.RowsAffected == 0 {
 		return false
@@ -6158,8 +6158,8 @@ func (m *workerManager) recoverInterrupted() error {
 		Updates(map[string]any{
 			"canonical_state":              CanonicalStateAcked,
 			"cloud_sync_reupload_required": true,
-			"retry_at":                      nil,
-			"recovery_started_at":           gorm.Expr("COALESCE(recovery_started_at, updated_at, created_at)"),
+			"retry_at":                     nil,
+			"recovery_started_at":          gorm.Expr("COALESCE(recovery_started_at, updated_at, created_at)"),
 		}).Error; err != nil {
 		return err
 	}
