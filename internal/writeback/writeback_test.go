@@ -4111,7 +4111,6 @@ func TestProviderEvidenceSnapshotKeepsFirstObservationAndCountsChecks(t *testing
 	}
 }
 
-
 func TestProviderUploadProgressBytes(t *testing.T) {
 	for _, tc := range []struct {
 		total    int64
