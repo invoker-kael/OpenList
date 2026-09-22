@@ -26,14 +26,14 @@ type webDAVWritebackStateSummary struct {
 }
 
 type webDAVWritebackSummary struct {
-	Enabled                bool                               `json:"enabled"`
-	Workers                int                                `json:"workers"`
-	Receiving              int64                              `json:"receiving"`
-	ReceivingExpectedBytes int64                              `json:"receiving_expected_bytes"`
-	BacklogBytes           int64                              `json:"backlog_bytes"`
-	Errors                 int64                              `json:"errors"`
+	Enabled                bool                                   `json:"enabled"`
+	Workers                int                                    `json:"workers"`
+	Receiving              int64                                  `json:"receiving"`
+	ReceivingExpectedBytes int64                                  `json:"receiving_expected_bytes"`
+	BacklogBytes           int64                                  `json:"backlog_bytes"`
+	Errors                 int64                                  `json:"errors"`
 	States                 map[string]webDAVWritebackStateSummary `json:"states"`
-	UpdatedAt              time.Time                          `json:"updated_at"`
+	UpdatedAt              time.Time                              `json:"updated_at"`
 }
 
 type webDAVWritebackStateAggregate struct {
