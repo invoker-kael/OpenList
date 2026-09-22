@@ -59,22 +59,22 @@ type webDAVWritebackCleanupResult struct {
 }
 
 type webDAVWritebackSettingsUpdate struct {
-	Enabled                    bool   `json:"enabled"`
-	ReserveFreeSpaceMB         uint64 `json:"reserve_free_space_mb"`
-	MaxPendingSpoolMB          uint64 `json:"max_pending_spool_mb"`
-	IncomingReservationChunkMB uint64 `json:"incoming_reservation_chunk_mb"`
-	Workers                    int    `json:"workers"`
-	UploadWorkers              int    `json:"upload_workers"`
-	LargeUploadWorkers         int    `json:"large_upload_workers"`
-	ProviderProbeWorkers       int    `json:"provider_probe_workers"`
+	Enabled                     bool   `json:"enabled"`
+	ReserveFreeSpaceMB          uint64 `json:"reserve_free_space_mb"`
+	MaxPendingSpoolMB           uint64 `json:"max_pending_spool_mb"`
+	IncomingReservationChunkMB  uint64 `json:"incoming_reservation_chunk_mb"`
+	Workers                     int    `json:"workers"`
+	UploadWorkers               int    `json:"upload_workers"`
+	LargeUploadWorkers          int    `json:"large_upload_workers"`
+	ProviderProbeWorkers        int    `json:"provider_probe_workers"`
 	CompletedCacheTTLMinutes    int    `json:"completed_cache_ttl_minutes"`
 	CompletedRemoteProbeSeconds int    `json:"completed_remote_probe_seconds"`
 	CloudSyncSettleMillis       int    `json:"cloudsync_settle_millis"`
-	CloudSyncPlaceholderMillis int    `json:"cloudsync_placeholder_millis"`
-	RetryInitialSeconds        int    `json:"retry_initial_seconds"`
-	RetryMaxSeconds            int    `json:"retry_max_seconds"`
-	VerifyIntervalSeconds      int    `json:"verify_interval_seconds"`
-	VerifyAttempts             int    `json:"verify_attempts"`
+	CloudSyncPlaceholderMillis  int    `json:"cloudsync_placeholder_millis"`
+	RetryInitialSeconds         int    `json:"retry_initial_seconds"`
+	RetryMaxSeconds             int    `json:"retry_max_seconds"`
+	VerifyIntervalSeconds       int    `json:"verify_interval_seconds"`
+	VerifyAttempts              int    `json:"verify_attempts"`
 }
 
 type webDAVWritebackSettings struct {
@@ -253,22 +253,22 @@ func WebDAVWritebackCleanupCompletedCache(c *gin.Context) {
 func webDAVWritebackSettingsFromConfig(cfg conf.WebDAVWritebackConfig, restartFields []string) webDAVWritebackSettings {
 	return webDAVWritebackSettings{
 		webDAVWritebackSettingsUpdate: webDAVWritebackSettingsUpdate{
-			Enabled:                    cfg.Enabled,
-			ReserveFreeSpaceMB:         cfg.ReserveFreeSpaceMB,
-			MaxPendingSpoolMB:          cfg.MaxPendingSpoolMB,
-			IncomingReservationChunkMB: cfg.IncomingReservationChunkMB,
-			Workers:                    cfg.Workers,
-			UploadWorkers:              cfg.UploadWorkers,
-			LargeUploadWorkers:         cfg.LargeUploadWorkers,
-			ProviderProbeWorkers:       cfg.ProviderProbeWorkers,
+			Enabled:                     cfg.Enabled,
+			ReserveFreeSpaceMB:          cfg.ReserveFreeSpaceMB,
+			MaxPendingSpoolMB:           cfg.MaxPendingSpoolMB,
+			IncomingReservationChunkMB:  cfg.IncomingReservationChunkMB,
+			Workers:                     cfg.Workers,
+			UploadWorkers:               cfg.UploadWorkers,
+			LargeUploadWorkers:          cfg.LargeUploadWorkers,
+			ProviderProbeWorkers:        cfg.ProviderProbeWorkers,
 			CompletedCacheTTLMinutes:    cfg.CompletedCacheTTLMinutes,
 			CompletedRemoteProbeSeconds: cfg.CompletedRemoteProbeSeconds,
 			CloudSyncSettleMillis:       cfg.CloudSyncSettleMillis,
-			CloudSyncPlaceholderMillis: cfg.CloudSyncPlaceholderMillis,
-			RetryInitialSeconds:        cfg.RetryInitialSeconds,
-			RetryMaxSeconds:            cfg.RetryMaxSeconds,
-			VerifyIntervalSeconds:      cfg.VerifyIntervalSeconds,
-			VerifyAttempts:             cfg.VerifyAttempts,
+			CloudSyncPlaceholderMillis:  cfg.CloudSyncPlaceholderMillis,
+			RetryInitialSeconds:         cfg.RetryInitialSeconds,
+			RetryMaxSeconds:             cfg.RetryMaxSeconds,
+			VerifyIntervalSeconds:       cfg.VerifyIntervalSeconds,
+			VerifyAttempts:              cfg.VerifyAttempts,
 		},
 		SpoolDir:              cfg.SpoolDir,
 		RestartRequiredFields: restartFields,
@@ -441,7 +441,6 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 	}
 	common.SuccessResp(c, rows)
 }
-
 
 type webDAVWritebackHistoryAggregate struct {
 	Value string

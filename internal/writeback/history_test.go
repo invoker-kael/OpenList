@@ -35,7 +35,7 @@ func TestHistoryUpsertIsIdempotentPerPathGeneration(t *testing.T) {
 		PathKey: "path-key", Path: "/backup/a.zip", Generation: 7,
 		Result: HistoryResultRemoteMissing, FinalState: StateDeleted,
 		RecoveryType: HistoryRecoveryCloudSyncRehydrateRequired,
-		RetryCount: 2, VerifyCount: 3, LastError: "confirmed provider loss",
+		RetryCount:   2, VerifyCount: 3, LastError: "confirmed provider loss",
 	}
 	if err := upsertWritebackHistory(database, second); err != nil {
 		t.Fatal(err)

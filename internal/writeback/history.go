@@ -19,8 +19,8 @@ const (
 	HistoryResultRemoteMissing    = "remote_missing"
 	HistoryResultRecoveryRequired = "recovery_required"
 
-	HistoryRecoveryRestart                   = "restart_recovery"
-	HistoryRecoveryMissingSpoolProvider      = "missing_spool_provider_recovered"
+	HistoryRecoveryRestart                    = "restart_recovery"
+	HistoryRecoveryMissingSpoolProvider       = "missing_spool_provider_recovered"
 	HistoryRecoveryCloudSyncRehydrateRequired = "cloudsync_rehydrate_required"
 )
 
