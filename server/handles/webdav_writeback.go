@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	webDAVMonitorDefaultLimit       = 100
-	webDAVMonitorMaxLimit           = 500
-	webDAVWritebackMonitorColumns   = "id, path, name, is_dir, size, e_tag, canonical_state, state, generation, remote_generation, payload_sha1, remote_sha1, remote_object_id, retry_count, verify_count, last_error, retry_at, remote_verified_at, ack_time, durable_at, completed_at, created_at, updated_at"
+	webDAVMonitorDefaultLimit     = 100
+	webDAVMonitorMaxLimit         = 500
+	webDAVWritebackMonitorColumns = "id, path, name, is_dir, size, e_tag, canonical_state, state, generation, remote_generation, payload_sha1, remote_sha1, remote_object_id, retry_count, verify_count, last_error, retry_at, remote_verified_at, ack_time, durable_at, completed_at, created_at, updated_at"
 )
 
 type webDAVWritebackStateSummary struct {
