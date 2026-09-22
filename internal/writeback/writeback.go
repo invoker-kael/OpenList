@@ -181,6 +181,8 @@ func clearRemoteVerification(row *model.WebDAVWritebackObject) {
 	row.RemoteSHA1 = ""
 	row.RemoteGeneration = 0
 	row.RemoteVerifiedAt = nil
+	row.ProviderUploadStartedAt = nil
+	row.ProviderUploadCompletedAt = nil
 }
 
 func canonicalContentSHA1(row *model.WebDAVWritebackObject) string {
@@ -7383,12 +7385,21 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		_ = payload.Close()
 	}()
 
+	uploadStartedAt := time.Now()
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued}).
-		Updates(map[string]any{"state": StateUploading, "retry_at": nil, "last_error": ""})
+		Updates(map[string]any{
+			"state":                        StateUploading,
+			"retry_at":                     nil,
+			"last_error":                   "",
+			"provider_upload_started_at":   &uploadStartedAt,
+			"provider_upload_completed_at": nil,
+		})
 	if res.Error != nil || res.RowsAffected == 0 {
 		return
 	}
+	row.ProviderUploadStartedAt = &uploadStartedAt
+	row.ProviderUploadCompletedAt = nil
 
 	obj := &model.Object{
 		Name:     row.Name,
@@ -7411,6 +7422,11 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		}
 		return
 	}
+	uploadCompletedAt := time.Now()
+	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+		Update("provider_upload_completed_at", &uploadCompletedAt).Error
+	row.ProviderUploadCompletedAt = &uploadCompletedAt
 
 	var current model.WebDAVWritebackObject
 	if err := db.GetDb().

@@ -93,8 +93,10 @@ func buildWritebackHistory(row *model.WebDAVWritebackObject, result, finalState,
 		IsDir:            row.IsDir,
 		StartedAt:        startedAt,
 		AckTime:          ackTime,
-		DurableAt:        durableAt,
-		CompletedAt:      completedAt,
+		DurableAt:                 durableAt,
+		ProviderUploadStartedAt:   cloneHistoryTime(row.ProviderUploadStartedAt),
+		ProviderUploadCompletedAt: cloneHistoryTime(row.ProviderUploadCompletedAt),
+		CompletedAt:               completedAt,
 		Result:           result,
 		FinalState:       finalState,
 		RecoveryType:     recovery,
@@ -153,6 +155,12 @@ func upsertWritebackHistory(database *gorm.DB, value *model.WebDAVWritebackHisto
 	}
 	if existing.DurableAt == nil && value.DurableAt != nil {
 		updates["durable_at"] = value.DurableAt
+	}
+	if existing.ProviderUploadStartedAt == nil && value.ProviderUploadStartedAt != nil {
+		updates["provider_upload_started_at"] = value.ProviderUploadStartedAt
+	}
+	if existing.ProviderUploadCompletedAt == nil && value.ProviderUploadCompletedAt != nil {
+		updates["provider_upload_completed_at"] = value.ProviderUploadCompletedAt
 	}
 	if existing.CompletedAt == nil && value.CompletedAt != nil {
 		updates["completed_at"] = value.CompletedAt

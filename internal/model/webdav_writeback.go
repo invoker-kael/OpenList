@@ -24,9 +24,11 @@ type WebDAVWritebackObject struct {
 	// the provider-replication lifecycle so ACKed WebDAV identity cannot flap as
 	// the backing provider moves through queued/uploading/verifying/completed.
 	CanonicalState   string     `json:"canonical_state" gorm:"size:24"`
-	AckTime          *time.Time `json:"ack_time"`
-	DurableAt        *time.Time `json:"durable_at"`
-	State            string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1;index:idx_webdav_writeback_parent_state,priority:2;index:idx_webdav_writeback_state_size,priority:1"`
+	AckTime                   *time.Time `json:"ack_time"`
+	DurableAt                 *time.Time `json:"durable_at"`
+	ProviderUploadStartedAt   *time.Time `json:"provider_upload_started_at"`
+	ProviderUploadCompletedAt *time.Time `json:"provider_upload_completed_at"`
+	State                     string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1;index:idx_webdav_writeback_parent_state,priority:2;index:idx_webdav_writeback_state_size,priority:1"`
 	SpoolPath        string     `json:"spool_path" gorm:"type:text"`
 	PayloadSHA1      string     `json:"payload_sha1" gorm:"size:40"`
 	RemoteObjectID   string     `json:"remote_object_id" gorm:"size:255"`
@@ -57,9 +59,11 @@ type WebDAVWritebackHistory struct {
 	Size             int64      `json:"size"`
 	IsDir            bool       `json:"is_dir"`
 	StartedAt        *time.Time `json:"started_at"`
-	AckTime          *time.Time `json:"ack_time"`
-	DurableAt        *time.Time `json:"durable_at"`
-	CompletedAt      *time.Time `json:"completed_at" gorm:"index"`
+	AckTime                   *time.Time `json:"ack_time"`
+	DurableAt                 *time.Time `json:"durable_at"`
+	ProviderUploadStartedAt   *time.Time `json:"provider_upload_started_at"`
+	ProviderUploadCompletedAt *time.Time `json:"provider_upload_completed_at"`
+	CompletedAt               *time.Time `json:"completed_at" gorm:"index"`
 	Result           string     `json:"result" gorm:"size:32;index"`
 	FinalState       string     `json:"final_state" gorm:"size:24"`
 	RecoveryType     string     `json:"recovery_type" gorm:"size:48;index"`

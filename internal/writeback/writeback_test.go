@@ -3852,7 +3852,6 @@ func TestNextReceiveGenerationUsesDurableSequenceAcrossRecreate(t *testing.T) {
 	}
 }
 
-
 func TestRemoteHashMismatchRequiresStrongSameSizeEvidence(t *testing.T) {
 	shaA := strings.Repeat("a", 40)
 	shaB := strings.Repeat("b", 40)

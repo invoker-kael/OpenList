@@ -149,3 +149,37 @@ func TestSuccessfulHistoryCleanupPreservesRecoveryEvidence(t *testing.T) {
 		t.Fatalf("remaining=%d, want recovery and remote-missing rows", len(remaining))
 	}
 }
+
+func TestBuildWritebackHistoryKeepsPerFileProviderUploadTiming(t *testing.T) {
+	ack := time.Unix(100, 0)
+	durable := time.Unix(101, 0)
+	providerStarted := time.Unix(110, 0)
+	providerCompleted := time.Unix(125, 0)
+	finalAt := time.Unix(140, 0)
+	row := &model.WebDAVWritebackObject{
+		PathKey:                   "timing-key",
+		Path:                      "/backup/timing.bin",
+		Generation:                3,
+		Size:                      4096,
+		AckTime:                   &ack,
+		DurableAt:                 &durable,
+		ProviderUploadStartedAt:    &providerStarted,
+		ProviderUploadCompletedAt:  &providerCompleted,
+	}
+	h := buildWritebackHistory(row, HistoryResultCompleted, StateCompleted, "", finalAt, "")
+	if h == nil {
+		t.Fatal("history is nil")
+	}
+	if h.StartedAt == nil || !h.StartedAt.Equal(ack) {
+		t.Fatalf("end-to-end start=%v, want ACK %v", h.StartedAt, ack)
+	}
+	if h.ProviderUploadStartedAt == nil || !h.ProviderUploadStartedAt.Equal(providerStarted) {
+		t.Fatalf("provider upload start=%v, want %v", h.ProviderUploadStartedAt, providerStarted)
+	}
+	if h.ProviderUploadCompletedAt == nil || !h.ProviderUploadCompletedAt.Equal(providerCompleted) {
+		t.Fatalf("provider upload completion=%v, want %v", h.ProviderUploadCompletedAt, providerCompleted)
+	}
+	if h.CompletedAt == nil || !h.CompletedAt.Equal(finalAt) {
+		t.Fatalf("final completion=%v, want %v", h.CompletedAt, finalAt)
+	}
+}
