@@ -282,7 +282,7 @@ OpenList 重启通常**不需要**同时重启 Cloud Sync。
 
 以下情况不是普通 write-back recovery state，需要先处理基础设施：
 
-- MySQL/PostgreSQL 不可用或异常；
+- MySQL 不可用或异常；
 - spool 文件系统已满、只读、损坏或丢失；
 - provider 凭据过期或撤销；
 - provider storage 被禁用；
@@ -350,6 +350,6 @@ OpenList 必须先取得连续、稳定的 fresh provider evidence 才会确认 
 4. 确认 Cloud Sync 对异常路径重新发起 PUT；
 5. 确认新 generation 最终进入 `completed`。
 
-只要 OpenList 接收到同一路径的更新 PUT，新 generation 就会接管旧 recovery incident。后台/History 应随新 generation 依次显示 `reupload_receiving`、`reupload_received`、`reupload_uploading`、`reupload_verifying`，最终变为 `recovered`。这里不再要求新 payload 的 SHA-1 或大小必须与失败 generation 完全一致，因为 Cloud Sync 加密重新生成或本地文件的正常变更都可能改变实际字节；恢复判断以同一路径的 generation/ACK 顺序为准。旧 incident 仍保留在 History 作为审计记录，但不再属于待人工处理状态。
+只要 OpenList 接收到同一路径的更新 PUT，新 generation 就会接管旧 recovery incident。活动任务页负责展示当前接收/后台同步进度；History 继续保留旧 incident 作为审计记录，并在新 generation 收敛后把普通用户看到的最终结果统一显示为 **已完成**。这里不要求新 payload 的 SHA-1 或大小必须与失败 generation 完全一致，因为 Cloud Sync 加密重新生成或本地文件的正常变更都可能改变实际字节；恢复判断以同一路径的 generation/ACK 顺序为准。
 
 OpenList 不提供“手动重传”动作。当 OpenList 已无法安全地让 Provider 副本收敛时，最终恢复数据来源必须回到 Cloud Sync。

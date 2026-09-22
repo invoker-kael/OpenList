@@ -278,7 +278,7 @@ Avoid these actions unless performing deliberate incident recovery:
 
 The following are not ordinary write-back recovery states and may require manual infrastructure work:
 
-- MySQL/PostgreSQL unavailable or unhealthy;
+- MySQL unavailable or unhealthy;
 - spool filesystem full, read-only, corrupted, or missing;
 - provider credentials expired or revoked;
 - provider storage disabled;
@@ -346,6 +346,6 @@ If the same generation still cannot converge after that single automatic repair,
 4. confirm Cloud Sync issues a new PUT for the affected path;
 5. verify the new generation reaches `completed`.
 
-Once OpenList accepts a newer PUT for the same path, that newer generation supersedes the old recovery incident. The monitor/history should move through `reupload_receiving` / `reupload_received` / `reupload_uploading` / `reupload_verifying` and finally `recovered` as the newer generation progresses. Recovery correlation does not require the new payload SHA-1 or size to equal the failed generation, because Cloud Sync encryption or a legitimate local edit can change the bytes; same-path generation/ACK ordering is authoritative. The old incident remains in History for audit, but it is no longer action-required.
+Once OpenList accepts a newer PUT for the same path, that newer generation supersedes the old recovery incident. Active shows the current receive/sync progress, while History keeps the old incident as audit data and presents the normal user-facing final outcome as **Completed** after the newer generation converges. Recovery correlation does not require the new payload SHA-1 or size to equal the failed generation, because Cloud Sync encryption or a legitimate local edit can change the bytes; same-path generation/ACK ordering is authoritative.
 
 There is no manual re-upload action in OpenList. When OpenList can no longer safely converge the provider replica, Cloud Sync is the source-of-truth recovery path.
