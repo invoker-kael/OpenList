@@ -55,8 +55,8 @@ const (
 	// are represented by retry_count, retry_at and last_error.
 	legacyStateFailed = "failed"
 
-	receiveLeaseDuration         = 15 * time.Minute
-	receiveHeartbeatEvery        = time.Minute
+	receiveLeaseDuration          = 15 * time.Minute
+	receiveHeartbeatEvery         = time.Minute
 	receiveProgressHeartbeatEvery = time.Second
 )
 
