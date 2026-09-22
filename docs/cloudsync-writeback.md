@@ -421,3 +421,14 @@ Startup recovery now recognizes metadata-only MOVE control rows explicitly. Inte
 Canonical-first directory MOVE now treats provider-only children as divergence. Every fresh provider directory listing is compared with the current canonical namespace: canonical tombstones and pending locally-spooled files authorize temporary source names, but a name with no canonical row blocks the root MOVE. Empty canonical directories are also listed, so hidden objects inside them cannot ride along unnoticed. Later directory or no-spool file generations are treated as inconclusive rather than allowing an older MOVE snapshot to mutate the provider tree.
 
 Trace-contract regression tests now encode the observed Cloud Sync sequence directly: PUT followed by stale/zero-size PROPFIND snapshots must still return the canonical size/mtime/ETag; MOVE must hide the source and expose the destination before provider propagation; DELETE must hide a stale provider object immediately.
+
+
+## Admin History and cache boundaries
+
+The WebDAV Writeback admin surface is organized as **Overview | Active | History | Settings**. The canonical object table remains an internal client-visible/current-state authority and is intentionally not exposed as a standalone Canonical page.
+
+`WebDAVWritebackHistory` is an audit-only, per-generation record keyed uniquely by `PathKey + Generation`. It is written only for meaningful final outcomes such as completed replication, confirmed recovery, confirmed remote loss/rehydration, and confirmed deletion. History persistence is best-effort and never participates in Durable ACK, PROPFIND, provider verification, or retry decisions.
+
+**Release Completed Cache** removes only safe, provider-verified completed `.data` spool files. **Delete History** removes only History rows. History cleanup never removes or changes the current canonical object, current generation, spool files, provider objects, recovery state, or Cloud Sync visibility.
+
+`CompletedRemoteProbeSeconds` is exposed in Settings as the existing interval controlling how long released completed objects may reuse fresh provider evidence before background reconciliation checks the provider again. The reconciliation algorithm and the two-stage confirmed-loss behavior are unchanged.

@@ -44,6 +44,36 @@ type WebDAVWritebackObject struct {
 	UpdatedAt        time.Time  `json:"updated_at" gorm:"index:idx_webdav_writeback_dispatch,priority:4"`
 }
 
+// WebDAVWritebackHistory is the append-by-generation audit plane for durable
+// writeback. It never participates in client-visible canonical decisions.
+type WebDAVWritebackHistory struct {
+	ID               uint       `json:"id" gorm:"primaryKey"`
+	PathKey          string     `json:"path_key" gorm:"size:64;uniqueIndex:idx_webdav_writeback_history_generation,priority:1"`
+	Path             string     `json:"path" gorm:"type:text"`
+	Parent           string     `json:"parent" gorm:"type:text"`
+	Name             string     `json:"name" gorm:"size:1024"`
+	Generation       uint64     `json:"generation" gorm:"uniqueIndex:idx_webdav_writeback_history_generation,priority:2"`
+	Size             int64      `json:"size"`
+	IsDir            bool       `json:"is_dir"`
+	StartedAt        *time.Time `json:"started_at"`
+	AckTime          *time.Time `json:"ack_time"`
+	DurableAt        *time.Time `json:"durable_at"`
+	CompletedAt      *time.Time `json:"completed_at" gorm:"index"`
+	Result           string     `json:"result" gorm:"size:32;index"`
+	FinalState       string     `json:"final_state" gorm:"size:24"`
+	RecoveryType     string     `json:"recovery_type" gorm:"size:48;index"`
+	PayloadSHA1      string     `json:"payload_sha1" gorm:"size:40"`
+	RemoteSHA1       string     `json:"remote_sha1" gorm:"size:40"`
+	RemoteObjectID   string     `json:"remote_object_id" gorm:"size:255"`
+	RemoteVerifiedAt *time.Time `json:"remote_verified_at"`
+	RetryCount       int        `json:"retry_count"`
+	VerifyCount      int        `json:"verify_count"`
+	LastError        string     `json:"last_error" gorm:"type:text"`
+	MimeType         string     `json:"mime_type" gorm:"size:255"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at" gorm:"index"`
+}
+
 // WebDAVWritebackReceiveFence serializes same-path PUT publication through
 // MySQL. NextSequence is allocated when a PUT starts; LastCommittedSequence is
 // advanced only when that receive publishes canonical state. Keeping the fence

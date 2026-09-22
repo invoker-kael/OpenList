@@ -1664,7 +1664,22 @@ func deleteCompletedCanonical(row *model.WebDAVWritebackObject) (bool, error) {
 	if res.Error != nil {
 		return false, res.Error
 	}
-	return res.RowsAffected > 0, nil
+	deleted := res.RowsAffected > 0
+	if deleted && !row.IsDir {
+		reason := row.LastError
+		if reason == "" {
+			reason = "confirmed remote provider loss or divergence; canonical shadow removed so Cloud Sync can re-upload"
+		}
+		recordHistoryOutcomeBestEffort(
+			row,
+			HistoryResultRemoteMissing,
+			StateDeleted,
+			HistoryRecoveryCloudSyncRehydrateRequired,
+			time.Now(),
+			reason,
+		)
+	}
+	return deleted, nil
 }
 
 func completedDivergenceConfirmationDelay() time.Duration {
@@ -5836,6 +5851,14 @@ func forceCloudSyncRepairForMissingPayload(row *model.WebDAVWritebackObject, cur
 	if res.Error != nil || res.RowsAffected == 0 {
 		return false
 	}
+	recordHistoryOutcomeBestEffort(
+		row,
+		HistoryResultRecoveryRequired,
+		StateDeleted,
+		HistoryRecoveryCloudSyncRehydrateRequired,
+		now,
+		reason,
+	)
 	wake()
 	return true
 }
@@ -6783,7 +6806,7 @@ func (m *workerManager) finishReplicaTreeMove(row *model.WebDAVWritebackObject, 
 	now := time.Now()
 	dst := utils.FixAndCleanPath(row.Path)
 	src = utils.FixAndCleanPath(src)
-	return db.GetDb().Transaction(func(tx *gorm.DB) error {
+	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var rows []model.WebDAVWritebackObject
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("path = ? OR path LIKE ? ESCAPE '~'", dst, descendantLikePattern(dst)).
@@ -6828,6 +6851,10 @@ func (m *workerManager) finishReplicaTreeMove(row *model.WebDAVWritebackObject, 
 				"last_error": "",
 			}).Error
 	})
+	if err == nil {
+		recordHistoryOutcomeBestEffort(row, HistoryResultCompleted, StateCompleted, historyRecoveryForCompletion(row), now, row.LastError)
+	}
+	return err
 }
 
 func (m *workerManager) fallbackReplicaTreeMove(row *model.WebDAVWritebackObject, src, reason string) error {
@@ -7393,6 +7420,7 @@ func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
 	if res.Error != nil || res.RowsAffected == 0 {
 		return
 	}
+	recordHistoryOutcomeBestEffort(row, HistoryResultCompleted, StateCompleted, historyRecoveryForCompletion(row), now, row.LastError)
 	if row.CleanupPath != "" && row.CleanupPath != row.Path {
 		_ = fs.Remove(m.ctx, row.CleanupPath)
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
@@ -7563,7 +7591,6 @@ func (m *workerManager) completeMatchingVerifySiblings(trigger *model.WebDAVWrit
 	}
 	var rows []model.WebDAVWritebackObject
 	if err := db.GetDb().
-		Select("id", "path", "name", "is_dir", "size", "payload_sha1", "remote_sha1", "remote_generation", "generation", "cleanup_path", "state").
 		Where("parent_key = ? AND state = ? AND is_dir = ? AND id <> ?", pathKey(trigger.Parent), StateVerifying, false, trigger.ID).
 		Order("retry_at asc").
 		Limit(verificationSiblingBatchLimit).
@@ -7661,6 +7688,10 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 	if res.Error != nil || res.RowsAffected == 0 {
 		return false
 	}
+	// History is deliberately best-effort and runs only after correctness state
+	// has committed. A History failure must never turn a provider success into a
+	// Cloud Sync retry.
+	recordCompletedHistoryBestEffort(row, evidence, now)
 	if row.CleanupPath != "" && row.CleanupPath != row.Path {
 		_ = fs.Remove(m.ctx, row.CleanupPath)
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
@@ -7924,6 +7955,7 @@ func collectConfirmedTombstoneSubtree(root *model.WebDAVWritebackObject, rows []
 
 func deleteConfirmedTombstoneSubtree(root *model.WebDAVWritebackObject) (bool, error) {
 	var spoolPaths []string
+	var deletedRows []model.WebDAVWritebackObject
 	deleted := false
 	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var candidates []model.WebDAVWritebackObject
@@ -7938,6 +7970,15 @@ func deleteConfirmedTombstoneSubtree(root *model.WebDAVWritebackObject) (bool, e
 			return nil
 		}
 		spoolPaths = spools
+		selected := make(map[uint]struct{}, len(ids))
+		for _, id := range ids {
+			selected[id] = struct{}{}
+		}
+		for i := range candidates {
+			if _, ok := selected[candidates[i].ID]; ok {
+				deletedRows = append(deletedRows, candidates[i])
+			}
+		}
 		res := tx.Where("id IN ? AND state = ?", ids, StateDeleted).
 			Delete(&model.WebDAVWritebackObject{})
 		if res.Error != nil {
@@ -7948,6 +7989,10 @@ func deleteConfirmedTombstoneSubtree(root *model.WebDAVWritebackObject) (bool, e
 	})
 	if err != nil || !deleted {
 		return deleted, err
+	}
+	finalAt := time.Now()
+	for i := range deletedRows {
+		recordHistoryOutcomeBestEffort(&deletedRows[i], HistoryResultDeleted, StateDeleted, "", finalAt, deletedRows[i].LastError)
 	}
 	removeSpoolsIfUnreferenced(spoolPaths)
 	return true, nil

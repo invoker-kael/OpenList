@@ -56,6 +56,8 @@ jobs:
             internal/conf/persist.go
             internal/writeback/admin.go
             internal/writeback/admin_test.go
+            internal/writeback/history.go
+            internal/writeback/history_test.go
             internal/writeback/writeback.go
             internal/writeback/writeback_test.go
             server/webdav/file.go
