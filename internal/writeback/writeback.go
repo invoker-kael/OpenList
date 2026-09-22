@@ -39,6 +39,9 @@ const (
 	StateDeleted   = "deleted"
 	StateLockNull  = "lock_null"
 
+	ResolutionRemoteHashMismatch      = "remote_hash_mismatch"
+	ResolutionNeedsCloudSyncRehydrate = "needs_cloudsync_rehydrate"
+
 	CanonicalStateAcked     = "durable_acked"
 	canonicalStateLegacyAck = "acked"
 	CanonicalStateDeleted   = "deleted"
@@ -1682,8 +1685,10 @@ func deleteCompletedCanonical(row *model.WebDAVWritebackObject) (bool, error) {
 		if reason == "" {
 			reason = "confirmed remote provider loss or divergence; canonical shadow removed so Cloud Sync can re-upload"
 		}
+		historyRow := *row
+		historyRow.ResolutionReason = ResolutionNeedsCloudSyncRehydrate
 		recordHistoryOutcomeBestEffort(
-			row,
+			&historyRow,
 			HistoryResultRemoteMissing,
 			StateDeleted,
 			HistoryRecoveryCloudSyncRehydrateRequired,
@@ -3864,6 +3869,7 @@ func tombstoneMovedSource(row *model.WebDAVWritebackObject, now time.Time) {
 	row.PayloadSHA1 = ""
 	row.CleanupPath = ""
 	row.LastError = ""
+	row.ResolutionReason = ""
 	row.RetryCount = 0
 	row.VerifyCount = 0
 	row.RetryAt = &now
@@ -4500,6 +4506,7 @@ func refreshUnknownProviderOverwrite(row *model.WebDAVWritebackObject, now time.
 	row.SpoolPath = ""
 	row.CleanupPath = ""
 	row.LastError = ""
+	row.ResolutionReason = ""
 	row.RetryCount = 0
 	row.VerifyCount = 0
 	clearRemoteVerification(row)
@@ -4535,6 +4542,7 @@ func setProviderCompletedRoot(row *model.WebDAVWritebackObject, dst string, sour
 	}
 	row.CleanupPath = ""
 	row.LastError = ""
+	row.ResolutionReason = ""
 	row.RetryCount = 0
 	row.VerifyCount = 0
 	clearRemoteVerification(row)
@@ -4572,6 +4580,7 @@ func setMovedDestinationFromSource(row, source *model.WebDAVWritebackObject, dst
 	row.MimeType = source.MimeType
 	row.CleanupPath = ""
 	row.LastError = ""
+	row.ResolutionReason = ""
 	row.RetryCount = 0
 	row.VerifyCount = 0
 	clearRemoteVerification(row)
@@ -5848,6 +5857,7 @@ func forceCloudSyncRepairForMissingPayload(row *model.WebDAVWritebackObject, cur
 			"spool_path":         "",
 			"retry_at":           &now,
 			"last_error":         reason,
+			"resolution_reason":  ResolutionNeedsCloudSyncRehydrate,
 			"retry_count":        0,
 			"verify_count":       0,
 			"completed_at":       nil,
@@ -5859,6 +5869,8 @@ func forceCloudSyncRepairForMissingPayload(row *model.WebDAVWritebackObject, cur
 	if res.Error != nil || res.RowsAffected == 0 {
 		return false
 	}
+	row.ResolutionReason = ResolutionNeedsCloudSyncRehydrate
+	row.LastError = reason
 	recordHistoryOutcomeBestEffort(
 		row,
 		HistoryResultRecoveryRequired,
@@ -7455,11 +7467,12 @@ func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
 	res = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND is_dir = ?", row.ID, row.Generation, true).
 		Updates(map[string]any{
-			"state":        StateCompleted,
-			"completed_at": &now,
-			"retry_at":     nil,
-			"last_error":   "",
-			"retry_count":  0,
+			"state":             StateCompleted,
+			"completed_at":      &now,
+			"retry_at":          nil,
+			"last_error":        "",
+			"resolution_reason": "",
+			"retry_count":       0,
 		})
 	if res.Error != nil || res.RowsAffected == 0 {
 		return
@@ -7504,6 +7517,60 @@ func remoteMatchesCanonical(row *model.WebDAVWritebackObject, remote model.Obj, 
 		return false
 	}
 	return compareRemoteContent(row, remote, requireHash) == remoteContentMatch
+}
+
+func remoteHashMismatch(row *model.WebDAVWritebackObject, remote model.Obj, requireHash bool) bool {
+	if !requireHash || row == nil || row.IsDir || remote == nil || remote.IsDir() || remote.GetSize() != row.Size {
+		return false
+	}
+	expectedSHA1 := canonicalContentSHA1(row)
+	remoteSHA1 := remote.GetHash().GetHash(utils.SHA1)
+	return expectedSHA1 != "" && remoteSHA1 != "" && !strings.EqualFold(expectedSHA1, remoteSHA1)
+}
+
+const remoteHashMismatchMaxAttempts = 3
+
+func remoteHashMismatchVerificationAttempts() int {
+	attempts := remoteHashMismatchMaxAttempts
+	if conf.Conf != nil && conf.Conf.WebDAVWriteback.VerifyAttempts > 0 {
+		attempts = min(attempts, max(1, conf.Conf.WebDAVWriteback.VerifyAttempts))
+	}
+	return attempts
+}
+
+func advanceRemoteHashMismatch(row *model.WebDAVWritebackObject, remote model.Obj) (next int, terminal bool) {
+	attempts := remoteHashMismatchVerificationAttempts()
+	current := 0
+	if row != nil {
+		current = max(0, row.VerifyCount)
+		remoteID := ""
+		remoteSHA1 := ""
+		if remote != nil {
+			remoteID = remote.GetID()
+			remoteSHA1 = remote.GetHash().GetHash(utils.SHA1)
+		}
+		if current > 0 {
+			if row.RemoteObjectID != "" && remoteID != "" && row.RemoteObjectID != remoteID {
+				current = 0
+			}
+			if row.RemoteSHA1 != "" && remoteSHA1 != "" && !strings.EqualFold(row.RemoteSHA1, remoteSHA1) {
+				current = 0
+			}
+		}
+	}
+	next = min(current+1, attempts)
+	return next, next >= attempts
+}
+
+func remoteHashMismatchMessage(row *model.WebDAVWritebackObject, remote model.Obj) string {
+	if row == nil || remote == nil {
+		return "provider hash differs from canonical hash"
+	}
+	return fmt.Sprintf(
+		"remote sha1 %s does not match canonical sha1 %s",
+		remote.GetHash().GetHash(utils.SHA1),
+		canonicalContentSHA1(row),
+	)
 }
 
 type remoteVerificationState uint8
@@ -7722,6 +7789,7 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 			"completed_at":       &now,
 			"retry_at":           nil,
 			"last_error":         "",
+			"resolution_reason":  "",
 			"retry_count":        0,
 			"verify_count":       0,
 			"remote_object_id":   evidence.objectID,
@@ -7736,6 +7804,60 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 	// has committed. A History failure must never turn a provider success into a
 	// Cloud Sync retry.
 	recordCompletedHistoryBestEffort(row, evidence, now)
+	if row.CleanupPath != "" && row.CleanupPath != row.Path {
+		_ = fs.Remove(m.ctx, row.CleanupPath)
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ?", row.ID, row.Generation).
+			Update("cleanup_path", "").Error
+	}
+	return true
+}
+
+func (m *workerManager) completeRemoteHashMismatch(row *model.WebDAVWritebackObject, remote model.Obj, currentState string, verifyCount int, diagnostic string) bool {
+	if row == nil || remote == nil {
+		return false
+	}
+	now := time.Now()
+	evidence := captureRemoteVerification(row, remote, now)
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
+		Updates(map[string]any{
+			"state":              StateCompleted,
+			"completed_at":       &now,
+			"retry_at":           nil,
+			"last_error":         "",
+			"resolution_reason":  ResolutionRemoteHashMismatch,
+			"verify_count":       verifyCount,
+			"remote_object_id":   evidence.objectID,
+			"remote_sha1":        evidence.sha1,
+			"remote_generation":  0,
+			"remote_verified_at": nil,
+		})
+	if res.Error != nil || res.RowsAffected == 0 {
+		return false
+	}
+
+	final := *row
+	final.State = StateCompleted
+	final.CompletedAt = &now
+	final.RetryAt = nil
+	final.LastError = ""
+	final.ResolutionReason = ResolutionRemoteHashMismatch
+	final.VerifyCount = verifyCount
+	final.RemoteObjectID = evidence.objectID
+	final.RemoteSHA1 = evidence.sha1
+	final.RemoteGeneration = 0
+	final.RemoteVerifiedAt = nil
+	history := buildWritebackHistory(
+		&final,
+		HistoryResultCompleted,
+		ResolutionRemoteHashMismatch,
+		historyRecoveryForCompletion(row),
+		now,
+		diagnostic,
+	)
+	recordWritebackHistoryBestEffort(history)
+
 	if row.CleanupPath != "" && row.CleanupPath != row.Path {
 		_ = fs.Remove(m.ctx, row.CleanupPath)
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
@@ -7789,6 +7911,64 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 			Updates(verifyingUpdates(currentState, map[string]any{
 				"retry_at":   &next,
 				"last_error": msg,
+			})).Error
+		return
+	}
+
+	if remoteHashMismatch(row, remote, requireHash) {
+		nextCount, terminal := advanceRemoteHashMismatch(row, remote)
+		diagnostic := remoteHashMismatchMessage(row, remote)
+		remoteID := remote.GetID()
+		remoteSHA1 := strings.ToLower(remote.GetHash().GetHash(utils.SHA1))
+		if terminal {
+			availability, payloadErr := inspectDurableLocalPayload(row)
+			if payloadErr != nil {
+				next := time.Now().Add(remoteVerificationInconclusiveDelay())
+				_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+					Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
+					Updates(verifyingUpdates(currentState, map[string]any{
+						"retry_at":         &next,
+						"verify_count":     nextCount,
+						"remote_object_id": remoteID,
+						"remote_sha1":      remoteSHA1,
+						"last_error":       fmt.Sprintf("cannot inspect durable spool while resolving provider hash difference: %v", payloadErr),
+					})).Error
+				return
+			}
+			if availability == durablePayloadMissing && row.CleanupPath == "" {
+				forceCloudSyncRepairForMissingPayload(
+					row,
+					currentState,
+					"durable spool is missing while provider hash differs from canonical content; exposing the loss so Cloud Sync can re-upload",
+				)
+				return
+			}
+			if availability == durablePayloadAvailable && m.completeRemoteHashMismatch(row, remote, currentState, nextCount, diagnostic) {
+				return
+			}
+			next := time.Now().Add(remoteVerificationInconclusiveDelay())
+			_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
+				Updates(verifyingUpdates(currentState, map[string]any{
+					"retry_at":         &next,
+					"verify_count":     nextCount,
+					"remote_object_id": remoteID,
+					"remote_sha1":      remoteSHA1,
+					"last_error":       diagnostic + "; durable local payload is not available for a safe terminal hash-difference state",
+				})).Error
+			return
+		}
+
+		interval := time.Duration(max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)) * time.Second
+		next := time.Now().Add(interval)
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
+			Updates(verifyingUpdates(currentState, map[string]any{
+				"retry_at":         &next,
+				"verify_count":     nextCount,
+				"remote_object_id": remoteID,
+				"remote_sha1":      remoteSHA1,
+				"last_error":       diagnostic,
 			})).Error
 		return
 	}

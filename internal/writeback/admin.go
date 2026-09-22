@@ -29,6 +29,8 @@ type AdminRuntimeStats struct {
 	RestartRecovery             int64  `json:"restart_recovery"`
 	WaitingProviderVerification int64  `json:"waiting_provider_verification"`
 	NeedsCloudSyncRehydrate     int64  `json:"needs_cloudsync_rehydrate"`
+	AutomaticRecovery           int64  `json:"automatic_recovery"`
+	RemoteHashMismatch          int64  `json:"remote_hash_mismatch"`
 }
 
 func ValidateAdminConfig(cfg conf.WebDAVWritebackConfig) error {
@@ -109,7 +111,12 @@ func RecoveryLabel(row *model.WebDAVWritebackObject) string {
 	if row == nil {
 		return ""
 	}
+	if row.ResolutionReason == ResolutionNeedsCloudSyncRehydrate {
+		return "needs_cloudsync_rehydrate"
+	}
 	msg := strings.ToLower(row.LastError)
+	// Legacy rows created before resolution_reason existed keep the exact old
+	// diagnostic fallback so upgrades preserve operator visibility.
 	if row.State == StateDeleted && canonicalDeleted(row) && strings.Contains(msg, "cloud sync can re-upload") {
 		return "needs_cloudsync_rehydrate"
 	}
@@ -166,8 +173,22 @@ func AdminRuntimeSnapshot() (AdminRuntimeStats, error) {
 		return stats, err
 	}
 	stats.NeedsCloudSyncRehydrate, err = count(
-		"state = ? AND canonical_state = ? AND LOWER(last_error) LIKE ?",
-		StateDeleted, CanonicalStateDeleted, "%cloud sync can re-upload%",
+		"state = ? AND canonical_state = ? AND (resolution_reason = ? OR LOWER(last_error) LIKE ?)",
+		StateDeleted, CanonicalStateDeleted, ResolutionNeedsCloudSyncRehydrate, "%cloud sync can re-upload%",
+	)
+	if err != nil {
+		return stats, err
+	}
+	stats.AutomaticRecovery, err = count(
+		"state IN ? AND (retry_count > 0 OR verify_count > 0 OR last_error <> '')",
+		[]string{StateQueued, StateUploading, StateVerifying},
+	)
+	if err != nil {
+		return stats, err
+	}
+	stats.RemoteHashMismatch, err = count(
+		"state = ? AND resolution_reason = ?",
+		StateCompleted, ResolutionRemoteHashMismatch,
 	)
 	if err != nil {
 		return stats, err

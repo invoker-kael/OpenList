@@ -105,6 +105,7 @@ func buildWritebackHistory(row *model.WebDAVWritebackObject, result, finalState,
 		RetryCount:       row.RetryCount,
 		VerifyCount:      row.VerifyCount,
 		LastError:        lastError,
+		ResolutionReason: row.ResolutionReason,
 		MimeType:         row.MimeType,
 	}
 }
@@ -186,6 +187,12 @@ func upsertWritebackHistory(database *gorm.DB, value *model.WebDAVWritebackHisto
 	if existing.LastError == "" && value.LastError != "" {
 		updates["last_error"] = value.LastError
 	}
+	if existing.ResolutionReason == "" && value.ResolutionReason != "" {
+		updates["resolution_reason"] = value.ResolutionReason
+		if value.FinalState != "" {
+			updates["final_state"] = value.FinalState
+		}
+	}
 	if existing.MimeType == "" && value.MimeType != "" {
 		updates["mime_type"] = value.MimeType
 	}
@@ -211,7 +218,12 @@ func recordHistoryOutcomeBestEffort(row *model.WebDAVWritebackObject, result, fi
 }
 
 func recordCompletedHistoryBestEffort(row *model.WebDAVWritebackObject, evidence remoteVerificationEvidence, now time.Time) {
-	history := buildWritebackHistory(row, HistoryResultCompleted, StateCompleted, historyRecoveryForCompletion(row), now, row.LastError)
+	if row == nil {
+		return
+	}
+	final := *row
+	final.ResolutionReason = ""
+	history := buildWritebackHistory(&final, HistoryResultCompleted, StateCompleted, historyRecoveryForCompletion(row), now, row.LastError)
 	if history == nil {
 		return
 	}

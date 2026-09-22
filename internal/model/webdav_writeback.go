@@ -36,6 +36,7 @@ type WebDAVWritebackObject struct {
 	MimeType         string     `json:"mime_type" gorm:"size:255"`
 	CleanupPath      string     `json:"cleanup_path" gorm:"type:text"`
 	LastError        string     `json:"last_error" gorm:"type:text"`
+	ResolutionReason string     `json:"resolution_reason" gorm:"size:64"`
 	RetryCount       int        `json:"retry_count"`
 	VerifyCount      int        `json:"verify_count"`
 	RetryAt          *time.Time `json:"retry_at" gorm:"index;index:idx_webdav_writeback_queue,priority:2;index:idx_webdav_writeback_dispatch,priority:3"`
@@ -69,6 +70,7 @@ type WebDAVWritebackHistory struct {
 	RetryCount       int        `json:"retry_count"`
 	VerifyCount      int        `json:"verify_count"`
 	LastError        string     `json:"last_error" gorm:"type:text"`
+	ResolutionReason string     `json:"resolution_reason" gorm:"size:64"`
 	MimeType         string     `json:"mime_type" gorm:"size:255"`
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at" gorm:"index"`
