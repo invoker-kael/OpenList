@@ -3933,6 +3933,24 @@ func TestCompletedRemoteHashMismatchEvidenceRequiresStableIdentity(t *testing.T)
 	}
 }
 
+func TestShouldAutomaticallyRepairHashMismatchOnlyOnce(t *testing.T) {
+	row := &model.WebDAVWritebackObject{RetryCount: 0}
+	if !shouldAutomaticallyRepairHashMismatch(row, durablePayloadAvailable) {
+		t.Fatal("first confirmed mismatch with a durable spool should auto-repair")
+	}
+	row.RetryCount = 1
+	if shouldAutomaticallyRepairHashMismatch(row, durablePayloadAvailable) {
+		t.Fatal("automatic hash repair must have a one-upload budget")
+	}
+	row.RetryCount = 0
+	if shouldAutomaticallyRepairHashMismatch(row, durablePayloadMissing) {
+		t.Fatal("missing durable payload cannot be repaired by OpenList")
+	}
+	if shouldAutomaticallyRepairHashMismatch(nil, durablePayloadAvailable) {
+		t.Fatal("nil row cannot schedule an automatic repair")
+	}
+}
+
 func TestCompletedRemoteEvidenceKindChangeRestartsConfirmation(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
 		VerifyCount:            2,

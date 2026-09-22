@@ -2265,23 +2265,39 @@ func recordCompletedRemoteEvidence(row *model.WebDAVWritebackObject, remote mode
 	return nextCount, nil
 }
 
+func claimCompletedRemoteEvidenceProbe(row *model.WebDAVWritebackObject, now time.Time) (bool, error) {
+	if row == nil || row.IsDir || row.State != StateCompleted || row.SpoolPath != "" {
+		return false, nil
+	}
+	ops, err := activeProviderOperations()
+	if err != nil {
+		return false, err
+	}
+	if providerOperationProtectsCanonicalPath(ops, row.Path, now) {
+		return false, nil
+	}
+
+	next := now.Add(completedDivergenceConfirmationDelay())
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
+		Where("(retry_at IS NULL OR retry_at <= ?)", now).
+		Update("retry_at", &next)
+	return res.RowsAffected > 0, res.Error
+}
+
 func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWritebackObject, now time.Time) (bool, error) {
 	if row == nil || row.IsDir {
 		return false, nil
 	}
 
-	confirmationClaimed := false
-	if row.VerifyCount > 0 || row.RetryAt != nil || row.LastError != "" {
-		ready, observeErr := observeCompletedFileDivergence(row, now)
-		if observeErr != nil || !ready {
-			return false, observeErr
-		}
-		confirmationClaimed = true
+	claimed, claimErr := claimCompletedRemoteEvidenceProbe(row, now)
+	if claimErr != nil || !claimed {
+		return false, claimErr
 	}
 
-	// do() is fresh-only: it never consults the provider snapshot cache. Reuse
-	// the main parent group so health reconciliation, VERIFY, and WebDAV refresh
-	// cannot issue parallel Refresh:true LIST calls for the same parent.
+	// One fresh parent listing is one evidence observation. The retry_at claim
+	// above is only a cross-instance throttle; it deliberately does not alter
+	// verify_count or provider evidence.
 	objs, listErr := providerParentSnapshots.do(ctx.Done(), row.Parent, func() ([]model.Obj, error) {
 		fresh, listErr := fs.List(ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
 		if listErr == nil {
@@ -2290,7 +2306,8 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 		return fresh, listErr
 	})
 	if listErr != nil {
-		// Provider/network failures are not evidence of remote loss.
+		// Provider/network failures are not evidence of remote loss. retry_at
+		// already throttles the next probe without creating a fake observation.
 		return false, nil
 	}
 	remote := exactRemoteByName(objs, row.Name)
@@ -2302,11 +2319,8 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 		refreshMatchingCompletedSiblings(row, objs, true, now)
 		return false, nil
 	case remoteContentInconclusive:
-		if confirmationClaimed {
-			// The claimed confirmation remains throttled by retry_at. Missing
-			// 115 SHA-1 still cannot prove identity or loss.
-			return false, nil
-		}
+		// Missing provider SHA-1 is not evidence. Keep the existing streak and
+		// wait for the next throttled fresh observation.
 		return false, nil
 	}
 
@@ -2323,8 +2337,8 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 
 	if kind == ResolutionRemoteMissing {
 		// Only pay for a per-file provider lookup after three consistent fresh
-		// parent-listing misses. This both lowers 115 request volume and prevents
-		// short metadata visibility gaps from becoming REMOTE_MISSING.
+		// parent-listing misses. This keeps the common path at one LIST and
+		// reserves GET for the final missing-object confirmation.
 		missing, direct, directErr := confirmCompletedRemoteMissing(ctx, row)
 		if directErr != nil {
 			_, recordErr := recordCompletedRemoteEvidence(row, remote, kind, now)
@@ -2347,14 +2361,12 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 		return deleteCompletedCanonical(&missingRow)
 	}
 
-	// Persistent non-hash metadata divergence must also be a consistent streak;
-	// a transient size/type view must not borrow confirmation from an earlier
-	// hash mismatch or missing observation.
+	// Persistent non-hash metadata divergence also requires one consistent
+	// evidence streak; mismatch/missing observations cannot be mixed together.
 	missingRow := *row
 	missingRow.ResolutionReason = ResolutionNeedsCloudSyncRehydrate
 	return deleteCompletedCanonical(&missingRow)
 }
-
 func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	if !Enabled() {
 		return false, nil
@@ -8187,6 +8199,10 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 	return true
 }
 
+func shouldAutomaticallyRepairHashMismatch(row *model.WebDAVWritebackObject, availability durablePayloadAvailability) bool {
+	return row != nil && availability == durablePayloadAvailable && row.RetryCount < 1
+}
+
 func (m *workerManager) completeRemoteHashMismatch(row *model.WebDAVWritebackObject, remote model.Obj, currentState string, verifyCount int, diagnostic string) bool {
 	if row == nil || remote == nil {
 		return false
@@ -8317,6 +8333,30 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 					currentState,
 					"durable spool is missing while provider hash differs from canonical content; exposing the loss so Cloud Sync can re-upload",
 				)
+				return
+			}
+			if shouldAutomaticallyRepairHashMismatch(row, availability) {
+				// The payload is still durable locally, so manual intervention
+				// is unnecessary. Re-queue exactly once. processUpload performs
+				// one fresh provider probe before sending bytes, which can skip
+				// the repair upload if the provider converged in the meantime.
+				next := time.Now()
+				updates := map[string]any{
+					"state":               StateQueued,
+					"retry_at":            &next,
+					"retry_count":         row.RetryCount + 1,
+					"verify_count":        0,
+					"last_error":          "confirmed provider hash mismatch; scheduling one automatic repair upload",
+					"resolution_reason":   "",
+					"recovery_started_at": gorm.Expr("COALESCE(recovery_started_at, ?)", evidenceAt),
+					"remote_object_id":    remoteID,
+					"remote_sha1":         remoteSHA1,
+					"remote_generation":   0,
+					"remote_verified_at":  nil,
+				}
+				_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+					Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
+					Updates(mergeUpdateMaps(updates, evidenceUpdates)).Error
 				return
 			}
 			if availability == durablePayloadAvailable && m.completeRemoteHashMismatch(row, remote, currentState, nextCount, diagnostic) {
