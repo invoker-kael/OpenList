@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -1742,16 +1743,12 @@ func observeCompletedFileDivergenceWithOps(row *model.WebDAVWritebackObject, now
 			return nil
 		}
 		needsFreshConfirmation = claimFresh
-		lastError := "remote divergence observed once; waiting for force-refreshed confirmation"
-		if claimFresh {
-			lastError = "remote divergence fresh confirmation claimed; throttling additional provider refreshes"
-		}
 		return tx.Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", current.ID, current.Generation, StateCompleted).
 			Updates(map[string]any{
 				"verify_count": nextCount,
 				"retry_at":     nextRetryAt,
-				"last_error":   lastError,
+				"last_error":   "",
 			}).Error
 	})
 	return needsFreshConfirmation, err
@@ -5869,6 +5866,19 @@ func (m *workerManager) recoverInterrupted() error {
 		return err
 	}
 
+	// Older builds exposed completed-provider recheck evidence through LastError,
+	// which made a healthy transient confirmation look like a red failure in the
+	// admin monitor. Keep verify_count/retry_at as the durable recheck evidence
+	// and clear only those exact legacy diagnostic strings.
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("state = ? AND last_error IN ?", StateCompleted, []string{
+			"remote divergence observed once; waiting for force-refreshed confirmation",
+			"remote divergence fresh confirmation claimed; throttling additional provider refreshes",
+		}).
+		Update("last_error", "").Error; err != nil {
+		return err
+	}
+
 	// Backfill the client-visible lifecycle for rows created before the ACK-state
 	// split. This does not change the existing provider replication State.
 	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
@@ -6520,7 +6530,7 @@ func (m *workerManager) worker() {
 			return
 		case job := <-m.jobs:
 			if !m.consumeBatchCompleted(job.id) {
-				m.process(job.id)
+				m.processSafely(job.id)
 			}
 			releaseWorkerSlot(m.largeUploads, job.largeUpload)
 			releaseWorkerSlot(m.uploads, job.upload)
@@ -6534,6 +6544,29 @@ func (m *workerManager) worker() {
 			}
 		}
 	}
+}
+
+func (m *workerManager) processSafely(id uint) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			stack := debug.Stack()
+			log.Errorf("write-back worker panic: id=%d panic=%v\n%s", id, recovered, stack)
+
+			var row model.WebDAVWritebackObject
+			if err := db.GetDb().Take(&row, id).Error; err != nil {
+				log.Errorf("write-back worker panic recovery could not load id=%d: %v", id, err)
+				return
+			}
+			panicErr := fmt.Errorf("write-back worker panic: %v", recovered)
+			switch row.State {
+			case StateDeleted:
+				m.failDeleted(&row, panicErr)
+			case StateQueued, StateUploading, StateVerifying:
+				m.fail(&row, panicErr)
+			}
+		}
+	}()
+	m.process(id)
 }
 
 func (m *workerManager) process(id uint) {
@@ -8118,6 +8151,13 @@ func retryDelay(retry int) time.Duration {
 }
 
 func (m *workerManager) failAfter(row *model.WebDAVWritebackObject, err error, delay time.Duration) {
+	if row == nil || err == nil {
+		return
+	}
+	log.Errorf(
+		"write-back provider retry: id=%d path=%q generation=%d state=%s size=%d retry=%d error=%v",
+		row.ID, row.Path, row.Generation, row.State, row.Size, row.RetryCount+1, err,
+	)
 	next := time.Now().Add(delay)
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ?", row.ID, row.Generation).
@@ -8134,6 +8174,13 @@ func (m *workerManager) fail(row *model.WebDAVWritebackObject, err error) {
 }
 
 func (m *workerManager) failDeleted(row *model.WebDAVWritebackObject, err error) {
+	if row == nil || err == nil {
+		return
+	}
+	log.Errorf(
+		"write-back delete retry: id=%d path=%q generation=%d size=%d retry=%d error=%v",
+		row.ID, row.Path, row.Generation, row.Size, row.RetryCount+1, err,
+	)
 	next := time.Now().Add(retryDelay(row.RetryCount))
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateDeleted).

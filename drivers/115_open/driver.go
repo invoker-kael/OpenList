@@ -309,68 +309,94 @@ func (d *Open115) Remove(ctx context.Context, obj model.Obj) error {
 	return nil
 }
 
-func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
-	err := d.WaitLimit(ctx)
-	if err != nil {
-		return err
+func parseSignCheckRange(signCheck string, fileSize int64) (start, length int64, err error) {
+	if fileSize < 0 {
+		return 0, 0, fmt.Errorf("invalid file size %d", fileSize)
 	}
+	parts := strings.Split(signCheck, "-")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return 0, 0, fmt.Errorf("invalid sign_check %q", signCheck)
+	}
+	start, err = strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid sign_check start %q: %w", parts[0], err)
+	}
+	end, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid sign_check end %q: %w", parts[1], err)
+	}
+	if start < 0 || end < start || start >= fileSize || end >= fileSize {
+		return 0, 0, fmt.Errorf("sign_check range %q is outside file size %d", signCheck, fileSize)
+	}
+	return start, end - start + 1, nil
+}
+
+func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
+	if err := d.WaitLimit(ctx); err != nil {
+		return fmt.Errorf("115 Open rate limit: %w", err)
+	}
+	fileSize := file.GetSize()
+	if fileSize < 0 {
+		return fmt.Errorf("115 Open upload has invalid file size %d", fileSize)
+	}
+
 	sha1 := file.GetHash().GetHash(utils.SHA1)
 	if len(sha1) != utils.SHA1.Width {
+		var err error
 		_, sha1, err = stream.CacheFullAndHash(file, &up, utils.SHA1)
 		if err != nil {
-			return err
+			return fmt.Errorf("115 Open full-file SHA1: %w", err)
 		}
 	}
-	const PreHashSize int64 = 128 * utils.KB
-	hashSize := PreHashSize
-	if file.GetSize() < PreHashSize {
-		hashSize = file.GetSize()
-	}
+
+	const preHashSize int64 = 128 * utils.KB
+	hashSize := min(preHashSize, fileSize)
 	reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
 	if err != nil {
-		return err
+		return fmt.Errorf("115 Open prehash range read (file_size=%d length=%d): %w", fileSize, hashSize, err)
 	}
 	sha1128k, err := utils.HashReader(utils.SHA1, reader)
 	if err != nil {
-		return err
+		return fmt.Errorf("115 Open prehash SHA1 (file_size=%d length=%d): %w", fileSize, hashSize, err)
 	}
-	// 1. Init
+
 	resp, err := d.client.UploadInit(ctx, &sdk.UploadInitReq{
 		FileName: file.GetName(),
-		FileSize: file.GetSize(),
+		FileSize: fileSize,
 		Target:   dstDir.GetID(),
 		FileID:   strings.ToUpper(sha1),
 		PreID:    strings.ToUpper(sha1128k),
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("115 Open upload init: %w", err)
 	}
 	if resp.Status == 2 {
 		up(100)
 		return nil
 	}
-	// 2. two way verify
+
 	if utils.SliceContains([]int{6, 7, 8}, resp.Status) {
-		signCheck := strings.Split(resp.SignCheck, "-") //"sign_check": "2392148-2392298" 取2392148-2392298之间的内容(包含2392148、2392298)的sha1
-		start, err := strconv.ParseInt(signCheck[0], 10, 64)
-		if err != nil {
-			return err
+		start, length, rangeErr := parseSignCheckRange(resp.SignCheck, fileSize)
+		if rangeErr != nil {
+			return fmt.Errorf("115 Open sign_check validation: %w", rangeErr)
 		}
-		end, err := strconv.ParseInt(signCheck[1], 10, 64)
+		reader, err = file.RangeRead(http_range.Range{Start: start, Length: length})
 		if err != nil {
-			return err
+			return fmt.Errorf(
+				"115 Open sign_check range read (sign_check=%q start=%d length=%d file_size=%d): %w",
+				resp.SignCheck, start, length, fileSize, err,
+			)
 		}
-		reader, err = file.RangeRead(http_range.Range{Start: start, Length: end - start + 1})
-		if err != nil {
-			return err
-		}
-		signVal, err := utils.HashReader(utils.SHA1, reader)
-		if err != nil {
-			return err
+		signVal, hashErr := utils.HashReader(utils.SHA1, reader)
+		if hashErr != nil {
+			return fmt.Errorf(
+				"115 Open sign_check SHA1 (sign_check=%q start=%d length=%d file_size=%d): %w",
+				resp.SignCheck, start, length, fileSize, hashErr,
+			)
 		}
 		resp, err = d.client.UploadInit(ctx, &sdk.UploadInitReq{
 			FileName: file.GetName(),
-			FileSize: file.GetSize(),
+			FileSize: fileSize,
 			Target:   dstDir.GetID(),
 			FileID:   strings.ToUpper(sha1),
 			PreID:    strings.ToUpper(sha1128k),
@@ -378,22 +404,20 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 			SignVal:  strings.ToUpper(signVal),
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("115 Open sign_check upload init: %w", err)
 		}
 		if resp.Status == 2 {
 			up(100)
 			return nil
 		}
 	}
-	// 3. get upload token
+
 	tokenResp, err := d.client.UploadGetToken(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("115 Open upload token: %w", err)
 	}
-	// 4. upload
-	err = d.multpartUpload(ctx, file, up, tokenResp, resp)
-	if err != nil {
-		return err
+	if err := d.multpartUpload(ctx, file, up, tokenResp, resp); err != nil {
+		return fmt.Errorf("115 Open multipart upload: %w", err)
 	}
 	return nil
 }
