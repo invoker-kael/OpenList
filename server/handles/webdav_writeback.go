@@ -383,19 +383,20 @@ th{position:sticky;top:0;background:#f8fafc;z-index:1;color:#475467}
       document.getElementById("errors").textContent=summary.errors||0;
       document.getElementById("backlog").textContent=fmtBytes(summary.backlog_bytes);
       document.getElementById("workers").textContent=summary.workers||0;
-      rows.innerHTML=(list||[]).length?(list||[]).map(x=>`
-        <tr>
-          <td class="path"><strong>${esc(x.path)}</strong><div class="small muted">${x.is_dir?"directory":"file"}</div></td>
-          <td>${badge(x.client_state)}</td>
-          <td>${badge(x.provider_state)}</td>
-          <td>${esc(fmtBytes(x.size))}</td>
-          <td>${esc(x.generation)}</td>
-          <td>${esc(x.remote_generation)}</td>
-          <td>${esc(x.retry_count)}</td>
-          <td>${esc(x.verify_count)}</td>
-          <td class="small">${esc(fmtTime(x.updated_at))}</td>
-          <td class="err">${esc(x.last_error||"")}</td>
-        </tr>`).join(""):'<tr><td colspan="10" class="muted">No matching WebDAV writeback entries.</td></tr>';
+      rows.innerHTML=(list||[]).length?(list||[]).map(x=>
+        '<tr>'+
+          '<td class="path"><strong>'+esc(x.path)+'</strong><div class="small muted">'+(x.is_dir?"directory":"file")+'</div></td>'+
+          '<td>'+badge(x.client_state)+'</td>'+
+          '<td>'+badge(x.provider_state)+'</td>'+
+          '<td>'+esc(fmtBytes(x.size))+'</td>'+
+          '<td>'+esc(x.generation)+'</td>'+
+          '<td>'+esc(x.remote_generation)+'</td>'+
+          '<td>'+esc(x.retry_count)+'</td>'+
+          '<td>'+esc(x.verify_count)+'</td>'+
+          '<td class="small">'+esc(fmtTime(x.updated_at))+'</td>'+
+          '<td class="err">'+esc(x.last_error||"")+'</td>'+
+        '</tr>'
+      ).join(""):'<tr><td colspan="10" class="muted">No matching WebDAV writeback entries.</td></tr>';
       status.textContent="Updated "+new Date().toLocaleTimeString();
     }catch(e){
       status.className="status error";
