@@ -1,5 +1,10 @@
 # Cloud Sync Write-back Operations Guide
 
+> [!WARNING]
+> **This feature is only for one-way upload/backup jobs. Bidirectional Cloud Sync is unsupported.**
+>
+> Do not enable two-way synchronization against a Durable Write-back path. The design assumes Cloud Sync is the source of truth and the provider is a background replica. Remote-side changes are not intended to be merged back into Cloud Sync and may be masked, conflict with canonical state, or be overwritten by a later upload.
+
 This guide covers day-to-day operation of WebDAV Durable Write-back with **one-way Synology Cloud Sync** jobs. Most recovery is automatic; the sections below focus on what the UI means and when operator action is genuinely useful.
 
 > **Development note:** This feature was developed with AI assistance and validated through human testing.
@@ -29,7 +34,7 @@ Use reliable persistent local storage. SSD/NVMe is recommended for sustained Clo
 
 ### Cloud Sync mode
 
-This design targets **one-way Synology Cloud Sync upload to WebDAV/OpenList**, including client-side encrypted jobs.
+This design targets **one-way Synology Cloud Sync upload/backup to WebDAV/OpenList**, including client-side encrypted jobs. **Bidirectional sync is not supported.** If the same provider path is also modified from the remote side, treat those changes as outside the supported consistency model.
 
 ### Provider
 
