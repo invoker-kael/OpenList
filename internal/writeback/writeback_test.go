@@ -4172,15 +4172,18 @@ func TestSummarizeProviderProbeErrorStripsBlockedHTML(t *testing.T) {
 func TestProviderProbeCooldownBackoffAndReset(t *testing.T) {
 	var group providerProbeCooldownGroup
 	now := time.Unix(1000, 0)
-	err := errors.New("HTTP 405 request has been blocked")
-	want := []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 30 * time.Minute}
+	err := errors.New(`failed get objs: <title>405</title> request has been blocked errors.aliyun.com`)
+	want := []time.Duration{2 * time.Hour, 4 * time.Hour, 8 * time.Hour, 8 * time.Hour}
 
 	for i, expected := range want {
 		state := group.fail("/115open/Backup", err, now)
-		if got := state.until.Sub(now); got != expected {
-			t.Fatalf("failure %d cooldown=%v, want %v", i+1, got, expected)
+		got := state.until.Sub(now)
+		min := expected * 9 / 10
+		max := expected * 11 / 10
+		if got < min || got > max {
+			t.Fatalf("failure %d cooldown=%v, want %v with +/-10%% jitter", i+1, got, expected)
 		}
-		if current, cooling := group.remaining("/115open/Backup", now.Add(expected/2)); !cooling || !current.until.Equal(state.until) {
+		if current, cooling := group.remaining("/115open/Backup", now.Add(got/2)); !cooling || !current.until.Equal(state.until) {
 			t.Fatalf("failure %d must keep the parent circuit open until %v", i+1, state.until)
 		}
 		now = state.until.Add(time.Second)
@@ -4189,6 +4192,37 @@ func TestProviderProbeCooldownBackoffAndReset(t *testing.T) {
 	group.success("/115open/Backup")
 	if _, cooling := group.remaining("/115open/Backup", now); cooling {
 		t.Fatal("a successful provider LIST must reset the parent cooldown")
+	}
+}
+
+func TestProviderProbeBackoffClasses(t *testing.T) {
+	waf := errors.New(`<title>405</title> request has been blocked errors.aliyun.com`)
+	if got := providerProbeBackoff(waf, 1); got != 2*time.Hour {
+		t.Fatalf("first WAF cooldown=%v, want 2h", got)
+	}
+	if got := providerProbeBackoff(waf, 2); got != 4*time.Hour {
+		t.Fatalf("second WAF cooldown=%v, want 4h", got)
+	}
+	if got := providerProbeBackoff(waf, 3); got != 8*time.Hour {
+		t.Fatalf("third WAF cooldown=%v, want 8h", got)
+	}
+	if got := providerProbeBackoff(errors.New("HTTP 429 Too Many Requests"), 1); got != 5*time.Minute {
+		t.Fatalf("first rate-limit cooldown=%v, want 5m", got)
+	}
+	if got := providerProbeBackoff(errors.New("HTTP 503 Service Unavailable"), 1); got != time.Minute {
+		t.Fatalf("ordinary transient cooldown=%v, want 1m", got)
+	}
+}
+
+func TestProviderProbeJitterIsStableAndBounded(t *testing.T) {
+	base := 2 * time.Hour
+	first := providerProbeJitter("/115open/Backup/A", 1, base)
+	second := providerProbeJitter("/115open/Backup/A", 1, base)
+	if first != second {
+		t.Fatalf("jitter must be deterministic: first=%v second=%v", first, second)
+	}
+	if first < base*9/10 || first > base*11/10 {
+		t.Fatalf("jitter=%v outside +/-10%% of %v", first, base)
 	}
 }
 

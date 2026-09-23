@@ -293,3 +293,44 @@ func PreviewCompletedCacheNow() (CacheCleanupResult, error) {
 	}
 	return result, nil
 }
+
+func VerifyNow(ids []uint) (int64, error) {
+	if len(ids) == 0 {
+		return 0, fmt.Errorf("ids must not be empty")
+	}
+
+	var rows []model.WebDAVWritebackObject
+	if err := db.GetDb().
+		Select("id", "parent").
+		Where("id IN ? AND state = ? AND is_dir = ?", ids, StateVerifying, false).
+		Find(&rows).Error; err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	rowIDs := make([]uint, 0, len(rows))
+	parents := make(map[string]struct{}, len(rows))
+	for i := range rows {
+		rowIDs = append(rowIDs, rows[i].ID)
+		if rows[i].Parent != "" {
+			parents[rows[i].Parent] = struct{}{}
+		}
+	}
+
+	for parent := range parents {
+		providerProbeCooldowns.success(parent)
+		providerParentSnapshots.invalidate(parent)
+	}
+
+	now := time.Now()
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id IN ? AND state = ? AND is_dir = ?", rowIDs, StateVerifying, false).
+		Update("retry_at", &now)
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	wake()
+	return res.RowsAffected, nil
+}

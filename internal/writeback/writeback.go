@@ -5765,7 +5765,52 @@ type providerProbeCooldownGroup struct {
 
 const providerProbeCooldownMaxEntries = 256
 
-func providerProbeBackoff(failures int) time.Duration {
+func providerProbeIsWAFBlock(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	status := providerProbeHTTPStatus(message)
+	if status != "403" && status != "405" {
+		return false
+	}
+	return strings.Contains(message, "errors.aliyun.com") ||
+		strings.Contains(message, "request has been blocked") ||
+		strings.Contains(message, "访问被阻断") ||
+		strings.Contains(message, "block_message")
+}
+
+func providerProbeBackoff(err error, failures int) time.Duration {
+	if providerProbeIsWAFBlock(err) {
+		switch {
+		case failures <= 1:
+			return 2 * time.Hour
+		case failures == 2:
+			return 4 * time.Hour
+		default:
+			return 8 * time.Hour
+		}
+	}
+
+	status := ""
+	if err != nil {
+		status = providerProbeHTTPStatus(err.Error())
+	}
+	if status == "429" {
+		switch {
+		case failures <= 1:
+			return 5 * time.Minute
+		case failures == 2:
+			return 15 * time.Minute
+		case failures == 3:
+			return 30 * time.Minute
+		case failures == 4:
+			return time.Hour
+		default:
+			return 2 * time.Hour
+		}
+	}
+
 	switch {
 	case failures <= 1:
 		return time.Minute
@@ -5778,6 +5823,17 @@ func providerProbeBackoff(failures int) time.Duration {
 	default:
 		return 30 * time.Minute
 	}
+}
+
+func providerProbeJitter(parent string, failures int, base time.Duration) time.Duration {
+	if base <= 0 {
+		return base
+	}
+	key := fmt.Sprintf("%s:%d", utils.FixAndCleanPath(parent), failures)
+	sum := sha256.Sum256([]byte(key))
+	bucket := int(sum[0])<<8 | int(sum[1])
+	permille := int64(bucket%201) - 100
+	return base + time.Duration(int64(base)*permille/1000)
 }
 
 func providerProbeHTTPStatus(message string) string {
@@ -5946,9 +6002,10 @@ func (g *providerProbeCooldownGroup) fail(parent string, err error, now time.Tim
 	if previous.failures == 0 || (!previous.until.IsZero() && now.After(previous.until.Add(30*time.Minute))) {
 		failures = 1
 	}
+	baseBackoff := providerProbeBackoff(err, failures)
 	state := providerProbeCooldownState{
 		failures: failures,
-		until:    now.Add(providerProbeBackoff(failures)),
+		until:    now.Add(providerProbeJitter(parent, failures, baseBackoff)),
 		summary:  summarizeProviderProbeError(err),
 	}
 
