@@ -368,7 +368,6 @@ func webDAVMonitorLimit(c *gin.Context) int {
 	return limit
 }
 
-
 func webDAVMonitorPage(c *gin.Context) (int, bool, error) {
 	raw := strings.TrimSpace(c.Query("page"))
 	if raw == "" {
@@ -563,7 +562,6 @@ func webDAVHistoryEffectiveStatus(history *model.WebDAVWritebackHistory, current
 	return history.Result, ""
 }
 
-
 func WebDAVWritebackMonitorList(c *gin.Context) {
 	now := time.Now()
 	limit := webDAVMonitorLimit(c)
@@ -754,6 +752,7 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 	}
 	common.SuccessResp(c, rows)
 }
+
 type webDAVWritebackHistoryAggregate struct {
 	Value string
 	Count int64
@@ -880,7 +879,6 @@ func webDAVHistoryStatusInGroup(status, action, group string) bool {
 	}
 }
 
-
 type webDAVHistoryViewFilter struct {
 	Status         string
 	StatusGroup    string
@@ -976,7 +974,6 @@ func webDAVHistoryView(
 	}
 	return view, nil
 }
-
 
 func WebDAVWritebackHistoryList(c *gin.Context) {
 	limit := webDAVMonitorLimit(c)
