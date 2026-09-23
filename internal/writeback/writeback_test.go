@@ -4138,3 +4138,85 @@ func TestProviderUploadProgressBytes(t *testing.T) {
 		}
 	}
 }
+
+
+func TestProviderTransientProbeErrorRecognizesWAFAndRateLimit(t *testing.T) {
+	blocked := errors.New(`failed get objs: failed to list objs: <!doctypehtml><html lang="zh-cn"><title>405</title><script>var x={"traceid":"784e2ca117901350881961589e96dc","lang":"cn"}</script>很抱歉，由于您访问的URL有可能对网站造成安全威胁，您的访问被阻断。 errors.aliyun.com`)
+	if !providerTransientProbeError(blocked) {
+		t.Fatal("Aliyun 405 block page must be treated as a transient provider failure")
+	}
+	if !providerTransientProbeError(errors.New("HTTP 429 Too Many Requests")) {
+		t.Fatal("HTTP 429 must be treated as a transient provider failure")
+	}
+	if providerTransientProbeError(errors.New("object not found")) {
+		t.Fatal("ordinary missing-object evidence must not be converted into a transient provider failure")
+	}
+}
+
+func TestSummarizeProviderProbeErrorStripsBlockedHTML(t *testing.T) {
+	err := errors.New(`failed get objs: <!doctypehtml><html><title>405</title><textarea>{"traceid":"784e2ca117901350881961589e96dc","lang":"cn"}</textarea> request has been blocked errors.aliyun.com`)
+	summary := summarizeProviderProbeError(err)
+	if strings.Contains(strings.ToLower(summary), "<!doctype") || strings.Contains(strings.ToLower(summary), "<html") {
+		t.Fatalf("provider error summary leaked HTML: %q", summary)
+	}
+	if !strings.Contains(summary, "HTTP 405") {
+		t.Fatalf("provider error summary must retain HTTP status: %q", summary)
+	}
+	if !strings.Contains(summary, "784e2ca117901350881961589e96dc") {
+		t.Fatalf("provider error summary must retain trace id: %q", summary)
+	}
+	if !strings.Contains(summary, "without re-upload") {
+		t.Fatalf("provider error summary must make the safe recovery behavior explicit: %q", summary)
+	}
+}
+
+func TestProviderProbeCooldownBackoffAndReset(t *testing.T) {
+	var group providerProbeCooldownGroup
+	now := time.Unix(1000, 0)
+	err := errors.New("HTTP 405 request has been blocked")
+	want := []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 30 * time.Minute}
+
+	for i, expected := range want {
+		state := group.fail("/115open/Backup", err, now)
+		if got := state.until.Sub(now); got != expected {
+			t.Fatalf("failure %d cooldown=%v, want %v", i+1, got, expected)
+		}
+		if current, cooling := group.remaining("/115open/Backup", now.Add(expected/2)); !cooling || !current.until.Equal(state.until) {
+			t.Fatalf("failure %d must keep the parent circuit open until %v", i+1, state.until)
+		}
+		now = state.until.Add(time.Second)
+	}
+
+	group.success("/115open/Backup")
+	if _, cooling := group.remaining("/115open/Backup", now); cooling {
+		t.Fatal("a successful provider LIST must reset the parent cooldown")
+	}
+}
+
+func TestProviderProbeCooldownDoesNotCountAsDivergence(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		Size:        123,
+		PayloadSHA1: strings.Repeat("a", 40),
+		VerifyCount: 2,
+	}
+	deferred := &providerProbeDeferredError{
+		summary: "provider/WAF blocked remote listing (HTTP 405); verification deferred without re-upload",
+		retryAt: time.Now().Add(time.Minute),
+	}
+	if got := classifyRemoteVerification(row, nil, deferred, true); got != remoteVerificationInconclusive {
+		t.Fatalf("provider cooldown must remain inconclusive, got %v", got)
+	}
+	next, retryUpload := advanceRemoteVerification(remoteVerificationInconclusive, row.VerifyCount, 3)
+	if next != row.VerifyCount || retryUpload {
+		t.Fatalf("provider cooldown must not advance destructive evidence: count=%d retryUpload=%v", next, retryUpload)
+	}
+}
+
+func TestRemoteVerificationRetryDelayUsesProviderCooldown(t *testing.T) {
+	retryAt := time.Now().Add(2 * time.Minute)
+	err := &providerProbeDeferredError{summary: "provider cooldown", retryAt: retryAt}
+	delay := remoteVerificationRetryDelay(err)
+	if delay < 119*time.Second || delay > 121*time.Second {
+		t.Fatalf("retry delay=%v, want approximately 2m", delay)
+	}
+}

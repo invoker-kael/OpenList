@@ -588,7 +588,7 @@ func ProviderOperationCopyUsesNative(src, dst string, depth int) bool {
 }
 
 func providerOperationTreeObjects(ctx context.Context, current string, overlay bool) ([]model.Obj, error) {
-	objs, err := fs.List(ctx, current, &fs.ListArgs{Refresh: true, NoLog: true})
+	objs, err := providerFreshList(ctx, ctx.Done(), currentProviderProbeSlots(), current)
 	if !overlay {
 		return objs, err
 	}
@@ -866,7 +866,7 @@ func providerOperationDestinationObject(ctx context.Context, p string) (model.Ob
 	// A refreshed parent listing is the recovery authority. 115 single-object
 	// lookups can expose the deleted overwrite target or incomplete metadata
 	// after a COPY failure, which is unsafe evidence for automated cleanup.
-	objs, listErr := fs.List(ctx, path.Dir(p), &fs.ListArgs{Refresh: true, NoLog: true})
+	objs, listErr := providerFreshList(ctx, ctx.Done(), currentProviderProbeSlots(), path.Dir(p))
 	if listErr != nil {
 		if errs.IsObjectNotFound(listErr) {
 			return nil, false, nil
@@ -1012,7 +1012,7 @@ func providerOperationPathState(ctx context.Context, p string, op *model.WebDAVP
 		return providerOperationRemoteInconclusive, nil, getErr
 	}
 
-	objs, listErr := fs.List(ctx, path.Dir(p), &fs.ListArgs{Refresh: true, NoLog: true})
+	objs, listErr := providerFreshList(ctx, ctx.Done(), currentProviderProbeSlots(), path.Dir(p))
 	if listErr != nil {
 		if errs.IsObjectNotFound(listErr) {
 			return providerOperationRemoteAbsent, nil, nil
@@ -1055,7 +1055,7 @@ func providerOperationSourcePathState(ctx context.Context, op *model.WebDAVProvi
 		return providerOperationRemoteInconclusive, nil, getErr
 	}
 
-	objs, listErr := fs.List(ctx, path.Dir(p), &fs.ListArgs{Refresh: true, NoLog: true})
+	objs, listErr := providerFreshList(ctx, ctx.Done(), currentProviderProbeSlots(), path.Dir(p))
 	if listErr != nil {
 		if errs.IsObjectNotFound(listErr) {
 			return providerOperationRemoteAbsent, nil, nil
@@ -2343,7 +2343,7 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 	// above is only a cross-instance throttle; it deliberately does not alter
 	// verify_count or provider evidence.
 	objs, listErr := providerParentSnapshots.do(ctx.Done(), row.Parent, func() ([]model.Obj, error) {
-		fresh, listErr := fs.List(ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
+		fresh, listErr := providerFreshList(ctx, ctx.Done(), currentProviderProbeSlots(), row.Parent)
 		if listErr == nil {
 			refreshFreshParentCompletedEvidence(row.Parent, fresh, time.Now())
 		}
@@ -2463,7 +2463,7 @@ func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 		}
 	}
 
-	objs, listErr := fs.List(ctx, row.Parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	objs, listErr := providerFreshList(ctx, ctx.Done(), currentProviderProbeSlots(), row.Parent)
 	if listErr != nil {
 		return false, nil
 	}
@@ -5424,7 +5424,7 @@ func providerOperationPathAbsent(ctx context.Context, p string) (bool, error) {
 	if getErr != nil && !errs.IsObjectNotFound(getErr) {
 		return false, getErr
 	}
-	objs, listErr := fs.List(ctx, path.Dir(p), &fs.ListArgs{Refresh: true, NoLog: true})
+	objs, listErr := providerFreshList(ctx, ctx.Done(), currentProviderProbeSlots(), path.Dir(p))
 	if listErr != nil {
 		if errs.IsObjectNotFound(listErr) {
 			return true, nil
@@ -5752,6 +5752,260 @@ type providerRefreshGroup struct {
 	revisions map[string]uint64
 }
 
+type providerProbeCooldownState struct {
+	failures int
+	until    time.Time
+	summary  string
+}
+
+type providerProbeCooldownGroup struct {
+	mu      sync.Mutex
+	entries map[string]providerProbeCooldownState
+}
+
+const providerProbeCooldownMaxEntries = 256
+
+func providerProbeBackoff(failures int) time.Duration {
+	switch {
+	case failures <= 1:
+		return time.Minute
+	case failures == 2:
+		return 2 * time.Minute
+	case failures == 3:
+		return 5 * time.Minute
+	case failures == 4:
+		return 10 * time.Minute
+	default:
+		return 30 * time.Minute
+	}
+}
+
+func providerProbeHTTPStatus(message string) string {
+	lower := strings.ToLower(message)
+	for _, code := range []string{"429", "405", "403", "502", "503", "504"} {
+		for _, marker := range []string{
+			"<title>" + code + "</title>",
+			"status code: " + code,
+			"status code " + code,
+			"http " + code,
+			"http/" + code,
+		} {
+			if strings.Contains(lower, marker) {
+				return code
+			}
+		}
+	}
+	return ""
+}
+
+func providerProbeTraceID(message string) string {
+	lower := strings.ToLower(message)
+	for _, marker := range []string{`"traceid":"`, `"traceid": "`} {
+		idx := strings.Index(lower, marker)
+		if idx < 0 {
+			continue
+		}
+		start := idx + len(marker)
+		if start >= len(message) {
+			continue
+		}
+		end := start
+		for end < len(message) {
+			ch := message[end]
+			if ch == '"' || ch == '<' || ch == ' ' || ch == '\\r' || ch == '\\n' || ch == '\\t' {
+				break
+			}
+			end++
+		}
+		if end > start {
+			return message[start:end]
+		}
+	}
+	return ""
+}
+
+func providerTransientProbeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if providerProbeHTTPStatus(message) != "" {
+		return true
+	}
+	for _, marker := range []string{
+		"errors.aliyun.com",
+		"request has been blocked",
+		"访问被阻断",
+		"block_message",
+		"too many requests",
+		"rate limit",
+		"rate-limit",
+		"throttl",
+		"temporarily unavailable",
+		"service unavailable",
+		"bad gateway",
+		"gateway timeout",
+		"connection reset",
+		"connection refused",
+		"i/o timeout",
+		"context deadline exceeded",
+		"tls handshake timeout",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func summarizeProviderProbeError(err error) string {
+	if err == nil {
+		return "provider verification is temporarily unavailable"
+	}
+	var deferred *providerProbeDeferredError
+	if errors.As(err, &deferred) && deferred.summary != "" {
+		return deferred.summary
+	}
+
+	message := err.Error()
+	status := providerProbeHTTPStatus(message)
+	lower := strings.ToLower(message)
+	blocked := strings.Contains(lower, "errors.aliyun.com") ||
+		strings.Contains(lower, "request has been blocked") ||
+		strings.Contains(lower, "访问被阻断") ||
+		strings.Contains(lower, "block_message")
+
+	var summary string
+	switch {
+	case blocked:
+		summary = "provider/WAF blocked remote listing"
+	case status == "429" || strings.Contains(lower, "rate limit") || strings.Contains(lower, "throttl"):
+		summary = "provider rate limited remote listing"
+	default:
+		summary = "provider remote listing is temporarily unavailable"
+	}
+	if status != "" {
+		summary += " (HTTP " + status + ")"
+	}
+	summary += "; verification deferred without re-upload"
+	if traceID := providerProbeTraceID(message); traceID != "" {
+		summary += "; trace_id=" + traceID
+	}
+	return summary
+}
+
+type providerProbeDeferredError struct {
+	summary string
+	retryAt time.Time
+	cause   error
+}
+
+func (e *providerProbeDeferredError) Error() string {
+	if e == nil || e.summary == "" {
+		return "provider verification deferred"
+	}
+	return e.summary
+}
+
+func (e *providerProbeDeferredError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (g *providerProbeCooldownGroup) remaining(parent string, now time.Time) (providerProbeCooldownState, bool) {
+	parent = utils.FixAndCleanPath(parent)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	state, ok := g.entries[parent]
+	if !ok || !now.Before(state.until) {
+		return state, false
+	}
+	return state, true
+}
+
+func (g *providerProbeCooldownGroup) fail(parent string, err error, now time.Time) providerProbeCooldownState {
+	parent = utils.FixAndCleanPath(parent)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.entries == nil {
+		g.entries = make(map[string]providerProbeCooldownState)
+	}
+
+	previous := g.entries[parent]
+	failures := previous.failures + 1
+	if previous.failures == 0 || (!previous.until.IsZero() && now.After(previous.until.Add(30*time.Minute))) {
+		failures = 1
+	}
+	state := providerProbeCooldownState{
+		failures: failures,
+		until:    now.Add(providerProbeBackoff(failures)),
+		summary:  summarizeProviderProbeError(err),
+	}
+
+	if _, exists := g.entries[parent]; !exists && len(g.entries) >= providerProbeCooldownMaxEntries {
+		oldestKey := ""
+		var oldest time.Time
+		for key, entry := range g.entries {
+			if oldestKey == "" || entry.until.Before(oldest) {
+				oldestKey = key
+				oldest = entry.until
+			}
+		}
+		if oldestKey != "" {
+			delete(g.entries, oldestKey)
+		}
+	}
+	g.entries[parent] = state
+	return state
+}
+
+func (g *providerProbeCooldownGroup) success(parent string) {
+	parent = utils.FixAndCleanPath(parent)
+	g.mu.Lock()
+	delete(g.entries, parent)
+	g.mu.Unlock()
+}
+
+func (g *providerProbeCooldownGroup) clear() {
+	g.mu.Lock()
+	g.entries = nil
+	g.mu.Unlock()
+}
+
+func providerFreshList(ctx context.Context, stop <-chan struct{}, slots chan struct{}, parent string) ([]model.Obj, error) {
+	parent = utils.FixAndCleanPath(parent)
+	now := time.Now()
+	if state, cooling := providerProbeCooldowns.remaining(parent, now); cooling {
+		return nil, &providerProbeDeferredError{
+			summary: state.summary,
+			retryAt: state.until,
+		}
+	}
+
+	reserved, err := acquireWorkerSlot(slots, stop)
+	if err != nil {
+		return nil, err
+	}
+	fresh, listErr := fs.List(ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
+	releaseWorkerSlot(slots, reserved)
+	if listErr == nil {
+		providerProbeCooldowns.success(parent)
+		return fresh, nil
+	}
+	if !providerTransientProbeError(listErr) {
+		return nil, listErr
+	}
+
+	state := providerProbeCooldowns.fail(parent, listErr, time.Now())
+	return nil, &providerProbeDeferredError{
+		summary: state.summary,
+		retryAt: state.until,
+		cause:   listErr,
+	}
+}
+
 func cloneProviderObjects(objs []model.Obj) []model.Obj {
 	if len(objs) == 0 {
 		return nil
@@ -5877,7 +6131,10 @@ func (g *providerRefreshGroup) do(stop <-chan struct{}, parent string, refresh f
 	return call.objs, call.err
 }
 
-var providerParentSnapshots providerRefreshGroup
+var (
+	providerParentSnapshots providerRefreshGroup
+	providerProbeCooldowns   providerProbeCooldownGroup
+)
 
 // ProviderListForWebDAV serves ordinary directory revalidation from a recent
 // successful fresh provider snapshot. Expired/missing snapshots perform one
@@ -5890,12 +6147,7 @@ func ProviderListForWebDAV(ctx context.Context, parent string) ([]model.Obj, boo
 	}
 	objs, err := providerParentSnapshots.do(ctx.Done(), parent, func() ([]model.Obj, error) {
 		slots := currentProviderProbeSlots()
-		reserved, err := acquireWorkerSlot(slots, ctx.Done())
-		if err != nil {
-			return nil, err
-		}
-		fresh, listErr := fs.List(ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
-		releaseWorkerSlot(slots, reserved)
+		fresh, listErr := providerFreshList(ctx, ctx.Done(), slots, parent)
 		if listErr == nil {
 			refreshFreshParentCompletedEvidence(parent, fresh, time.Now())
 		}
@@ -6038,12 +6290,7 @@ func acquireWorkerSlot(slots chan struct{}, stop <-chan struct{}) (bool, error) 
 
 func (m *workerManager) refreshParent(parent string) ([]model.Obj, error) {
 	return providerParentSnapshots.do(m.stop, parent, func() ([]model.Obj, error) {
-		reserved, err := acquireWorkerSlot(m.providerProbes, m.stop)
-		if err != nil {
-			return nil, err
-		}
-		fresh, listErr := fs.List(m.ctx, parent, &fs.ListArgs{Refresh: true, NoLog: true})
-		releaseWorkerSlot(m.providerProbes, reserved)
+		fresh, listErr := providerFreshList(m.ctx, m.stop, m.providerProbes, parent)
 		if listErr == nil {
 			refreshFreshParentCompletedEvidence(parent, fresh, time.Now())
 		}
@@ -6096,6 +6343,7 @@ func Start() {
 		return
 	}
 	providerParentSnapshots.clear()
+	providerProbeCooldowns.clear()
 	workerCtx, cancel := context.WithCancel(context.Background())
 	workers := max(1, conf.Conf.WebDAVWriteback.Workers)
 	uploadWorkers := uploadWorkerLimit(workers, conf.Conf.WebDAVWriteback.UploadWorkers)
@@ -6161,6 +6409,7 @@ func Stop() {
 	close(m.stop)
 	m.wg.Wait()
 	providerParentSnapshots.clear()
+	providerProbeCooldowns.clear()
 }
 
 const missingDurablePayloadRecoveryMessage = "durable spool is missing after restart; verifying provider before Cloud Sync repair"
@@ -8139,6 +8388,20 @@ func remoteVerificationInconclusiveDelay() time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+func remoteVerificationRetryDelay(err error) time.Duration {
+	if err != nil {
+		var deferred *providerProbeDeferredError
+		if errors.As(err, &deferred) && !deferred.retryAt.IsZero() {
+			remaining := time.Until(deferred.retryAt)
+			if remaining > time.Second {
+				return remaining
+			}
+			return time.Second
+		}
+	}
+	return remoteVerificationInconclusiveDelay()
+}
+
 func providerRepairNeedsVerification(state remoteVerificationState) bool {
 	return state == remoteVerificationInconclusive
 }
@@ -8437,10 +8700,10 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 	}
 
 	if verification == remoteVerificationInconclusive {
-		next := time.Now().Add(remoteVerificationInconclusiveDelay())
+		next := time.Now().Add(remoteVerificationRetryDelay(err))
 		msg := "remote verification is inconclusive; keeping canonical generation without reupload"
 		if err != nil {
-			msg = fmt.Sprintf("remote verification is inconclusive: %v", err)
+			msg = summarizeProviderProbeError(err)
 		} else if remote != nil && requireHash && remote.GetSize() == row.Size &&
 			remote.GetHash().GetHash(utils.SHA1) == "" {
 			msg = "remote size matches but required 115 SHA-1 is unavailable; keeping canonical generation without reupload"
