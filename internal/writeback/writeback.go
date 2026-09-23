@@ -5812,7 +5812,7 @@ func providerProbeTraceID(message string) string {
 		end := start
 		for end < len(message) {
 			ch := message[end]
-			if ch == '"' || ch == '<' || ch == ' ' || ch == '\\r' || ch == '\\n' || ch == '\\t' {
+			if ch == '"' || ch == '<' || ch == ' ' || ch == 13 || ch == 10 || ch == 9 {
 				break
 			}
 			end++
@@ -5868,6 +5868,14 @@ func summarizeProviderProbeError(err error) string {
 	}
 
 	message := err.Error()
+	if !providerTransientProbeError(err) {
+		trimmed := strings.TrimSpace(message)
+		runes := []rune(trimmed)
+		if len(runes) > 512 {
+			trimmed = string(runes[:512]) + "..."
+		}
+		return "remote verification is inconclusive: " + trimmed
+	}
 	status := providerProbeHTTPStatus(message)
 	lower := strings.ToLower(message)
 	blocked := strings.Contains(lower, "errors.aliyun.com") ||
