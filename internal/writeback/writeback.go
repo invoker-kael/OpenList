@@ -2904,6 +2904,18 @@ func completedSpoolPressureReclaimEnabled() bool {
 	return conf.Conf != nil && conf.Conf.WebDAVWriteback.CompletedCacheTTLMinutes >= 0
 }
 
+// completedSpoolOldestFirst orders reclaimable payloads by when the current
+// canonical generation became durable, not by when provider verification
+// eventually completed. A generation that needed retries is still old data once
+// it has converged, so successful retry history must not keep its spool around
+// or make it look newer than payloads received later.
+func completedSpoolOldestFirst(query *gorm.DB) *gorm.DB {
+	return query.
+		Order("COALESCE(durable_at, ack_time, created_at) asc").
+		Order("completed_at asc").
+		Order("id asc")
+}
+
 func reclaimCompletedSpoolCapacity(targetFree uint64) bool {
 	if !completedSpoolPressureReclaimEnabled() || targetFree == 0 || db.GetDb() == nil {
 		return false
@@ -2917,11 +2929,11 @@ func reclaimCompletedSpoolCapacity(targetFree uint64) bool {
 		}
 
 		var rows []model.WebDAVWritebackObject
-		if err := db.GetDb().
+		query := db.GetDb().
 			Select("id", "generation", "spool_path", "completed_at", "remote_generation", "remote_verified_at").
 			Where("state = ? AND spool_path <> '' AND completed_at IS NOT NULL", StateCompleted).
-			Where("remote_verified_at IS NOT NULL AND remote_generation = generation").
-			Order("completed_at asc, id asc").
+			Where("remote_verified_at IS NOT NULL AND remote_generation = generation")
+		if err := completedSpoolOldestFirst(query).
 			Limit(100).
 			Find(&rows).Error; err != nil || len(rows) == 0 {
 			return reclaimed
@@ -9007,12 +9019,11 @@ func releaseCompletedSpoolBatch(cutoff time.Time, limit int) (selected, released
 		return 0, 0, 0, nil
 	}
 	var rows []model.WebDAVWritebackObject
-	if err := db.GetDb().
+	query := db.GetDb().
 		Select("id", "generation", "size", "spool_path", "completed_at", "remote_generation", "remote_verified_at", "state").
 		Where("state = ? AND spool_path <> '' AND completed_at IS NOT NULL AND completed_at <= ?", StateCompleted, cutoff).
-		Where("remote_verified_at IS NOT NULL AND remote_generation = generation").
-		Order("completed_at asc").
-		Order("id asc").
+		Where("remote_verified_at IS NOT NULL AND remote_generation = generation")
+	if err := completedSpoolOldestFirst(query).
 		Limit(limit * 2).
 		Find(&rows).Error; err != nil {
 		return 0, 0, 0, err
