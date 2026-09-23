@@ -1,5 +1,10 @@
 # Cloud Sync Write-back 运维指南
 
+> [!WARNING]
+> **本功能只适用于单向上传/备份，不支持双向同步。**
+>
+> 不要把 Durable Write-back 用在 Cloud Sync 双向同步任务上。本架构明确把 Cloud Sync 上传端视为数据源，把远端 Provider 视为后台副本；远端主动发生的修改、删除、重命名等操作**不属于可安全回传到 Cloud Sync 的一致性模型**。如果用于双向同步，可能出现状态冲突、旧状态覆盖、重复收敛，甚至后续上传覆盖远端改动。
+
 本文档面向 **Synology Cloud Sync 单向上传**场景下的 WebDAV Durable Write-back 日常运维。大多数异常都由 OpenList 自动恢复；这里重点说明页面状态代表什么，以及什么时候真的需要人工操作。
 
 > **开发说明：** 本功能由 AI 辅助开发，并经过人工测试验证。
@@ -29,7 +34,7 @@
 
 ### Cloud Sync 模式
 
-本设计针对 **Synology Cloud Sync -> WebDAV/OpenList 单向上传**，包括 Cloud Sync 客户端加密任务。
+本设计只针对 **Synology Cloud Sync -> WebDAV/OpenList 单向上传/备份**，包括 Cloud Sync 客户端加密任务。**双向同步不支持，也不建议尝试。** 如果同一个远端路径还会被其他客户端或人工从 Provider 侧修改，应视为超出当前一致性模型。
 
 ### 远端存储
 
