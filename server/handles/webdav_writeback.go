@@ -14,6 +14,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/writeback"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 const (
@@ -59,6 +60,20 @@ type webDAVWritebackCleanupResult struct {
 	Released      int    `json:"released"`
 	ReleasedBytes uint64 `json:"released_bytes"`
 	Truncated     bool   `json:"truncated,omitempty"`
+}
+
+type webDAVWritebackMonitorPage struct {
+	Items    []webDAVWritebackMonitorRow `json:"items"`
+	Total    int64                       `json:"total"`
+	Page     int                         `json:"page"`
+	PageSize int                         `json:"page_size"`
+}
+
+type webDAVWritebackHistoryPage struct {
+	Items    []webDAVWritebackHistoryRow `json:"items"`
+	Total    int64                       `json:"total"`
+	Page     int                         `json:"page"`
+	PageSize int                         `json:"page_size"`
 }
 
 type webDAVWritebackSettingsUpdate struct {
@@ -353,6 +368,26 @@ func webDAVMonitorLimit(c *gin.Context) int {
 	return limit
 }
 
+
+func webDAVMonitorPage(c *gin.Context) (int, bool, error) {
+	raw := strings.TrimSpace(c.Query("page"))
+	if raw == "" {
+		return 1, false, nil
+	}
+	page, err := strconv.Atoi(raw)
+	if err != nil || page <= 0 {
+		return 0, true, errors.New("page must be a positive integer")
+	}
+	return page, true, nil
+}
+
+func webDAVPageOffset(page, pageSize int) int {
+	if page <= 1 || pageSize <= 0 {
+		return 0
+	}
+	return (page - 1) * pageSize
+}
+
 func webDAVMonitorCanonicalState(row *model.WebDAVWritebackObject) string {
 	if row.CanonicalState != "" {
 		return row.CanonicalState
@@ -528,25 +563,44 @@ func webDAVHistoryEffectiveStatus(history *model.WebDAVWritebackHistory, current
 	return history.Result, ""
 }
 
+
 func WebDAVWritebackMonitorList(c *gin.Context) {
 	now := time.Now()
 	limit := webDAVMonitorLimit(c)
+	page, paged, pageErr := webDAVMonitorPage(c)
+	if pageErr != nil {
+		common.ErrorResp(c, pageErr, http.StatusBadRequest)
+		return
+	}
+	offset := webDAVPageOffset(page, limit)
+	fetchLimit := limit
+	if paged {
+		fetchLimit = offset + limit
+	}
 	state := strings.ToLower(strings.TrimSpace(c.DefaultQuery("state", "active")))
 	search := strings.TrimSpace(c.Query("q"))
 
-	rows := make([]webDAVWritebackMonitorRow, 0, limit)
+	rows := make([]webDAVWritebackMonitorRow, 0, fetchLimit)
 	includeReceiving := state == "active" || state == "all" || state == "receiving"
 	includeObjects := state != "receiving"
+	var total int64
 
 	if includeReceiving {
-		var fences []model.WebDAVWritebackReceiveFence
 		query := db.GetDb().
 			Model(&model.WebDAVWritebackReceiveFence{}).
 			Where("active_receivers > 0 AND receive_lease_until > ?", now)
 		if search != "" {
 			query = query.Where("path LIKE ?", "%"+search+"%")
 		}
-		if err := query.Order("updated_at DESC").Limit(limit).Find(&fences).Error; err != nil {
+		var receivingTotal int64
+		if err := query.Session(&gorm.Session{}).Count(&receivingTotal).Error; err != nil {
+			common.ErrorResp(c, err, http.StatusInternalServerError)
+			return
+		}
+		total += receivingTotal
+
+		var fences []model.WebDAVWritebackReceiveFence
+		if err := query.Order("updated_at DESC").Limit(fetchLimit).Find(&fences).Error; err != nil {
 			common.ErrorResp(c, err, http.StatusInternalServerError)
 			return
 		}
@@ -572,7 +626,6 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 	}
 
 	if includeObjects {
-		var objects []model.WebDAVWritebackObject
 		query := db.GetDb().
 			Model(&model.WebDAVWritebackObject{}).
 			Select(webDAVWritebackMonitorColumns)
@@ -612,7 +665,16 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 		if search != "" {
 			query = query.Where("path LIKE ?", "%"+search+"%")
 		}
-		if err := query.Order("updated_at DESC").Limit(limit).Find(&objects).Error; err != nil {
+
+		var objectTotal int64
+		if err := query.Session(&gorm.Session{}).Count(&objectTotal).Error; err != nil {
+			common.ErrorResp(c, err, http.StatusInternalServerError)
+			return
+		}
+		total += objectTotal
+
+		var objects []model.WebDAVWritebackObject
+		if err := query.Order("updated_at DESC").Limit(fetchLimit).Find(&objects).Error; err != nil {
 			common.ErrorResp(c, err, http.StatusInternalServerError)
 			return
 		}
@@ -673,38 +735,23 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 		}
 		return rows[i].ID < rows[j].ID
 	})
+
+	if paged {
+		start := min(offset, len(rows))
+		end := min(start+limit, len(rows))
+		common.SuccessResp(c, webDAVWritebackMonitorPage{
+			Items:    rows[start:end],
+			Total:    total,
+			Page:     page,
+			PageSize: limit,
+		})
+		return
+	}
 	if len(rows) > limit {
 		rows = rows[:limit]
 	}
 	common.SuccessResp(c, rows)
 }
-
-type webDAVWritebackHistoryAggregate struct {
-	Value string
-	Count int64
-}
-
-type webDAVWritebackTimelineEvent struct {
-	Event string    `json:"event"`
-	At    time.Time `json:"at"`
-}
-
-type webDAVWritebackHistoryRow struct {
-	model.WebDAVWritebackHistory
-	EffectiveStatus           string                         `json:"effective_status"`
-	OperatorAction            string                         `json:"operator_action,omitempty"`
-	CurrentGeneration         uint64                         `json:"current_generation,omitempty"`
-	CurrentProviderState      string                         `json:"current_provider_state,omitempty"`
-	CurrentRecoveryState      string                         `json:"current_recovery_state,omitempty"`
-	CurrentAckTime            *time.Time                     `json:"current_ack_time,omitempty"`
-	CurrentCompletedAt        *time.Time                     `json:"current_completed_at,omitempty"`
-	LifecycleDurationMS       int64                          `json:"lifecycle_duration_ms"`
-	CloudSyncUploadDurationMS int64                          `json:"cloudsync_upload_duration_ms"`
-	ProviderSyncDurationMS    int64                          `json:"provider_sync_duration_ms"`
-	RecoveryDurationMS        int64                          `json:"recovery_duration_ms"`
-	EventTimeline             []webDAVWritebackTimelineEvent `json:"event_timeline,omitempty"`
-}
-
 func webDAVDurationMillis(start, end *time.Time) int64 {
 	if start == nil || end == nil || end.Before(*start) {
 		return 0
@@ -805,8 +852,113 @@ func webDAVHistoryStatusInGroup(status, action, group string) bool {
 	}
 }
 
+
+type webDAVHistoryViewFilter struct {
+	Status         string
+	StatusGroup    string
+	CurrentState   string
+	ActionRequired *bool
+}
+
+func webDAVHistoryView(
+	rows []model.WebDAVWritebackHistory,
+	filter webDAVHistoryViewFilter,
+	now time.Time,
+) ([]webDAVWritebackHistoryRow, error) {
+	pathKeys := make([]string, 0, len(rows))
+	seenPathKeys := make(map[string]struct{}, len(rows))
+	for i := range rows {
+		if rows[i].PathKey == "" {
+			continue
+		}
+		if _, exists := seenPathKeys[rows[i].PathKey]; exists {
+			continue
+		}
+		seenPathKeys[rows[i].PathKey] = struct{}{}
+		pathKeys = append(pathKeys, rows[i].PathKey)
+	}
+
+	currentByPath := make(map[string]*model.WebDAVWritebackObject, len(pathKeys))
+	fenceByPath := make(map[string]*model.WebDAVWritebackReceiveFence, len(pathKeys))
+	if len(pathKeys) > 0 {
+		var current []model.WebDAVWritebackObject
+		if err := db.GetDb().
+			Select("path_key", "generation", "size", "payload_sha1", "canonical_state", "state", "ack_time", "durable_at", "completed_at", "last_error", "resolution_reason", "cloud_sync_reupload_required").
+			Where("path_key IN ?", pathKeys).
+			Find(&current).Error; err != nil {
+			return nil, err
+		}
+		for i := range current {
+			currentByPath[current[i].PathKey] = &current[i]
+		}
+
+		var fences []model.WebDAVWritebackReceiveFence
+		if err := db.GetDb().
+			Select("path_key", "active_receivers", "latest_expected_size", "latest_started_at", "receive_lease_until").
+			Where("path_key IN ?", pathKeys).
+			Find(&fences).Error; err != nil {
+			return nil, err
+		}
+		for i := range fences {
+			fenceByPath[fences[i].PathKey] = &fences[i]
+		}
+	}
+
+	view := make([]webDAVWritebackHistoryRow, 0, len(rows))
+	for i := range rows {
+		row := &rows[i]
+		current := currentByPath[row.PathKey]
+		fence := fenceByPath[row.PathKey]
+		status, action := webDAVHistoryEffectiveStatus(row, current, fence, now)
+
+		if filter.Status != "" {
+			if filter.Status == webDAVStatusCompleted {
+				if status != webDAVStatusCompleted && status != webDAVStatusRecovered {
+					continue
+				}
+			} else if status != filter.Status {
+				continue
+			}
+		}
+		if filter.CurrentState != "" && (current == nil || current.State != filter.CurrentState) {
+			continue
+		}
+		actionRequired := action == webDAVActionRestartCloudSync || action == webDAVActionManualCheck
+		if filter.ActionRequired != nil && actionRequired != *filter.ActionRequired {
+			continue
+		}
+		if !webDAVHistoryStatusInGroup(status, action, filter.StatusGroup) {
+			continue
+		}
+
+		item := webDAVWritebackHistoryRow{
+			WebDAVWritebackHistory: *row,
+			EffectiveStatus:        status,
+			OperatorAction:         action,
+		}
+		webDAVHistoryDurations(&item)
+		if current != nil {
+			item.CurrentGeneration = current.Generation
+			item.CurrentProviderState = current.State
+			item.CurrentRecoveryState = writeback.RecoveryLabel(current)
+			item.CurrentAckTime = current.AckTime
+			item.CurrentCompletedAt = current.CompletedAt
+		}
+		view = append(view, item)
+	}
+	return view, nil
+}
+
+
 func WebDAVWritebackHistoryList(c *gin.Context) {
 	limit := webDAVMonitorLimit(c)
+	page, paged, pageErr := webDAVMonitorPage(c)
+	if pageErr != nil {
+		common.ErrorResp(c, pageErr, http.StatusBadRequest)
+		return
+	}
+	offset := webDAVPageOffset(page, limit)
+
 	statusFilter := strings.ToLower(strings.TrimSpace(c.Query("status")))
 	statusGroupFilter := strings.ToLower(strings.TrimSpace(c.Query("status_group")))
 	switch statusGroupFilter {
@@ -825,6 +977,12 @@ func WebDAVWritebackHistoryList(c *gin.Context) {
 			return
 		}
 		actionRequiredFilter = &value
+	}
+	viewFilter := webDAVHistoryViewFilter{
+		Status:         statusFilter,
+		StatusGroup:    statusGroupFilter,
+		CurrentState:   currentStateFilter,
+		ActionRequired: actionRequiredFilter,
 	}
 
 	query := db.GetDb().Model(&model.WebDAVWritebackHistory{})
@@ -876,8 +1034,85 @@ func WebDAVWritebackHistoryList(c *gin.Context) {
 		}
 		query = query.Where("updated_at >= ?", after)
 	}
+
+	dynamicFilter := statusFilter != "" || statusGroupFilter != "" || currentStateFilter != "" || actionRequiredFilter != nil
+	now := time.Now()
+
+	if paged && !dynamicFilter {
+		var total int64
+		if err := query.Session(&gorm.Session{}).Count(&total).Error; err != nil {
+			common.ErrorResp(c, err, http.StatusInternalServerError)
+			return
+		}
+		var rows []model.WebDAVWritebackHistory
+		if err := query.Session(&gorm.Session{}).
+			Order("updated_at DESC").
+			Order("id DESC").
+			Offset(offset).
+			Limit(limit).
+			Find(&rows).Error; err != nil {
+			common.ErrorResp(c, err, http.StatusInternalServerError)
+			return
+		}
+		view, err := webDAVHistoryView(rows, viewFilter, now)
+		if err != nil {
+			common.ErrorResp(c, err, http.StatusInternalServerError)
+			return
+		}
+		common.SuccessResp(c, webDAVWritebackHistoryPage{
+			Items:    view,
+			Total:    total,
+			Page:     page,
+			PageSize: limit,
+		})
+		return
+	}
+
+	if paged && dynamicFilter {
+		const scanBatchSize = webDAVMonitorMaxLimit
+		items := make([]webDAVWritebackHistoryRow, 0, limit)
+		var total int64
+		for scanOffset := 0; ; scanOffset += scanBatchSize {
+			var rows []model.WebDAVWritebackHistory
+			if err := query.Session(&gorm.Session{}).
+				Order("updated_at DESC").
+				Order("id DESC").
+				Offset(scanOffset).
+				Limit(scanBatchSize).
+				Find(&rows).Error; err != nil {
+				common.ErrorResp(c, err, http.StatusInternalServerError)
+				return
+			}
+			if len(rows) == 0 {
+				break
+			}
+			batchView, err := webDAVHistoryView(rows, viewFilter, now)
+			if err != nil {
+				common.ErrorResp(c, err, http.StatusInternalServerError)
+				return
+			}
+			for _, item := range batchView {
+				matchIndex := int(total)
+				if matchIndex >= offset && len(items) < limit {
+					items = append(items, item)
+				}
+				total++
+			}
+			if len(rows) < scanBatchSize {
+				break
+			}
+		}
+		common.SuccessResp(c, webDAVWritebackHistoryPage{
+			Items:    items,
+			Total:    total,
+			Page:     page,
+			PageSize: limit,
+		})
+		return
+	}
+
 	candidateLimit := limit
-	if statusFilter != "" || statusGroupFilter != "" || currentStateFilter != "" || actionRequiredFilter != nil {
+	if dynamicFilter {
 		candidateLimit = webDAVMonitorMaxLimit
 	}
 	var rows []model.WebDAVWritebackHistory
@@ -885,97 +1120,16 @@ func WebDAVWritebackHistoryList(c *gin.Context) {
 		common.ErrorResp(c, err, http.StatusInternalServerError)
 		return
 	}
-
-	pathKeys := make([]string, 0, len(rows))
-	seenPathKeys := make(map[string]struct{}, len(rows))
-	for i := range rows {
-		if rows[i].PathKey == "" {
-			continue
-		}
-		if _, exists := seenPathKeys[rows[i].PathKey]; exists {
-			continue
-		}
-		seenPathKeys[rows[i].PathKey] = struct{}{}
-		pathKeys = append(pathKeys, rows[i].PathKey)
+	view, err := webDAVHistoryView(rows, viewFilter, now)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError)
+		return
 	}
-
-	currentByPath := make(map[string]*model.WebDAVWritebackObject, len(pathKeys))
-	fenceByPath := make(map[string]*model.WebDAVWritebackReceiveFence, len(pathKeys))
-	if len(pathKeys) > 0 {
-		var current []model.WebDAVWritebackObject
-		if err := db.GetDb().
-			Select("path_key", "generation", "size", "payload_sha1", "canonical_state", "state", "ack_time", "durable_at", "completed_at", "last_error", "resolution_reason", "cloud_sync_reupload_required").
-			Where("path_key IN ?", pathKeys).
-			Find(&current).Error; err != nil {
-			common.ErrorResp(c, err, http.StatusInternalServerError)
-			return
-		}
-		for i := range current {
-			currentByPath[current[i].PathKey] = &current[i]
-		}
-
-		var fences []model.WebDAVWritebackReceiveFence
-		if err := db.GetDb().
-			Select("path_key", "active_receivers", "latest_expected_size", "latest_started_at", "receive_lease_until").
-			Where("path_key IN ?", pathKeys).
-			Find(&fences).Error; err != nil {
-			common.ErrorResp(c, err, http.StatusInternalServerError)
-			return
-		}
-		for i := range fences {
-			fenceByPath[fences[i].PathKey] = &fences[i]
-		}
-	}
-
-	now := time.Now()
-	view := make([]webDAVWritebackHistoryRow, 0, min(limit, len(rows)))
-	for i := range rows {
-		row := &rows[i]
-		current := currentByPath[row.PathKey]
-		fence := fenceByPath[row.PathKey]
-		status, action := webDAVHistoryEffectiveStatus(row, current, fence, now)
-
-		if statusFilter != "" {
-			if statusFilter == webDAVStatusCompleted {
-				if status != webDAVStatusCompleted && status != webDAVStatusRecovered {
-					continue
-				}
-			} else if status != statusFilter {
-				continue
-			}
-		}
-		if currentStateFilter != "" && (current == nil || current.State != currentStateFilter) {
-			continue
-		}
-		actionRequired := action == webDAVActionRestartCloudSync || action == webDAVActionManualCheck
-		if actionRequiredFilter != nil && actionRequired != *actionRequiredFilter {
-			continue
-		}
-		if !webDAVHistoryStatusInGroup(status, action, statusGroupFilter) {
-			continue
-		}
-
-		item := webDAVWritebackHistoryRow{
-			WebDAVWritebackHistory: *row,
-			EffectiveStatus:        status,
-			OperatorAction:         action,
-		}
-		webDAVHistoryDurations(&item)
-		if current != nil {
-			item.CurrentGeneration = current.Generation
-			item.CurrentProviderState = current.State
-			item.CurrentRecoveryState = writeback.RecoveryLabel(current)
-			item.CurrentAckTime = current.AckTime
-			item.CurrentCompletedAt = current.CompletedAt
-		}
-		view = append(view, item)
-		if len(view) >= limit {
-			break
-		}
+	if len(view) > limit {
+		view = view[:limit]
 	}
 	common.SuccessResp(c, view)
 }
-
 func WebDAVWritebackHistorySummary(c *gin.Context) {
 	summary := webDAVWritebackHistorySummary{
 		Results:    map[string]int64{},

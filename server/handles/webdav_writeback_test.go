@@ -342,3 +342,21 @@ func TestWebDAVHistoryStatusInCloudSyncGroups(t *testing.T) {
 		})
 	}
 }
+
+func TestWebDAVPageOffset(t *testing.T) {
+	for _, tc := range []struct {
+		page     int
+		pageSize int
+		want     int
+	}{
+		{page: 1, pageSize: 25, want: 0},
+		{page: 2, pageSize: 25, want: 25},
+		{page: 4, pageSize: 50, want: 150},
+		{page: 0, pageSize: 50, want: 0},
+	} {
+		if got := webDAVPageOffset(tc.page, tc.pageSize); got != tc.want {
+			t.Fatalf("webDAVPageOffset(%d,%d)=%d, want %d", tc.page, tc.pageSize, got, tc.want)
+		}
+	}
+}
+
