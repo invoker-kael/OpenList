@@ -1,5 +1,10 @@
 # Synology Cloud Sync Write-back Mode
 
+> [!WARNING]
+> **Supported scope: one-way upload/backup only. Do not use this mode for bidirectional synchronization.**
+>
+> Durable Write-back treats the Cloud Sync upload side as the authoritative source and deliberately decouples the client-visible canonical WebDAV state from the backing provider's live state. Remote-side edits, deletes, renames, or other changes are therefore **not designed to flow back safely into Cloud Sync**. Using this mode for two-way sync can create conflicts, stale views, repeated reconciliation, or overwrite remote-side changes.
+
 This feature provides a durable WebDAV write-back path for **one-way Synology Cloud Sync uploads**, including client-side encrypted Cloud Sync jobs. The goal is simple: acknowledge a file only after it is safely stored locally, then let OpenList handle provider upload and recovery in the background without making Cloud Sync resend large files unnecessarily.
 
 > **Development note:** This feature was developed with AI assistance and validated through human testing.
@@ -8,7 +13,7 @@ This feature provides a durable WebDAV write-back path for **one-way Synology Cl
 
 ## Design
 
-Cloud Sync is treated as the authoritative source. The opaque object received by WebDAV is committed to a local spool before the HTTP PUT succeeds. A persistent MySQL/GORM row then provides canonical WebDAV metadata while a background worker uploads the payload through the normal OpenList storage driver.
+Cloud Sync is treated as the authoritative source for this one-way upload/backup workflow. The backing provider is a replica target, not a second synchronization authority. The opaque object received by WebDAV is committed to a local spool before the HTTP PUT succeeds. A persistent MySQL/GORM row then provides canonical WebDAV metadata while a background worker uploads the payload through the normal OpenList storage driver.
 
 The backing provider's modification time is deliberately not exposed back to Cloud Sync for objects tracked by write-back. This avoids repeated uploads caused by eventual-consistency windows or provider-side timestamp changes.
 
