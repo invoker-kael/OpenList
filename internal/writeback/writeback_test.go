@@ -4139,7 +4139,6 @@ func TestProviderUploadProgressBytes(t *testing.T) {
 	}
 }
 
-
 func TestProviderTransientProbeErrorRecognizesWAFAndRateLimit(t *testing.T) {
 	blocked := errors.New(`failed get objs: failed to list objs: <!doctypehtml><html lang="zh-cn"><title>405</title><script>var x={"traceid":"784e2ca117901350881961589e96dc","lang":"cn"}</script>很抱歉，由于您访问的URL有可能对网站造成安全威胁，您的访问被阻断。 errors.aliyun.com`)
 	if !providerTransientProbeError(blocked) {

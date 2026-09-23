@@ -6141,7 +6141,7 @@ func (g *providerRefreshGroup) do(stop <-chan struct{}, parent string, refresh f
 
 var (
 	providerParentSnapshots providerRefreshGroup
-	providerProbeCooldowns   providerProbeCooldownGroup
+	providerProbeCooldowns  providerProbeCooldownGroup
 )
 
 // ProviderListForWebDAV serves ordinary directory revalidation from a recent
