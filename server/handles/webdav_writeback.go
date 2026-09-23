@@ -626,9 +626,7 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 	}
 
 	if includeObjects {
-		query := db.GetDb().
-			Model(&model.WebDAVWritebackObject{}).
-			Select(webDAVWritebackMonitorColumns)
+		query := db.GetDb().Model(&model.WebDAVWritebackObject{})
 
 		switch state {
 		case "", "active":
@@ -674,7 +672,11 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 		total += objectTotal
 
 		var objects []model.WebDAVWritebackObject
-		if err := query.Order("updated_at DESC").Limit(fetchLimit).Find(&objects).Error; err != nil {
+		if err := query.
+			Select(webDAVWritebackMonitorColumns).
+			Order("updated_at DESC").
+			Limit(fetchLimit).
+			Find(&objects).Error; err != nil {
 			common.ErrorResp(c, err, http.StatusInternalServerError)
 			return
 		}
