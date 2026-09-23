@@ -270,12 +270,11 @@ func PreviewCompletedCacheNow() (CacheCleanupResult, error) {
 	cutoff := time.Now()
 	limit := completedCleanupBatchSize * completedCleanupMaxBatches * 4
 	var rows []model.WebDAVWritebackObject
-	if err := db.GetDb().
+	query := db.GetDb().
 		Select("id", "generation", "size", "spool_path", "completed_at", "remote_generation", "remote_verified_at", "state").
 		Where("state = ? AND spool_path <> '' AND completed_at IS NOT NULL AND completed_at <= ?", StateCompleted, cutoff).
-		Where("remote_verified_at IS NOT NULL AND remote_generation = generation").
-		Order("completed_at asc").
-		Order("id asc").
+		Where("remote_verified_at IS NOT NULL AND remote_generation = generation")
+	if err := completedSpoolOldestFirst(query).
 		Limit(limit).
 		Find(&rows).Error; err != nil {
 		return CacheCleanupResult{}, err
