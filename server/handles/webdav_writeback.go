@@ -752,6 +752,32 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 	}
 	common.SuccessResp(c, rows)
 }
+type webDAVWritebackHistoryAggregate struct {
+	Value string
+	Count int64
+}
+
+type webDAVWritebackTimelineEvent struct {
+	Event string    `json:"event"`
+	At    time.Time `json:"at"`
+}
+
+type webDAVWritebackHistoryRow struct {
+	model.WebDAVWritebackHistory
+	EffectiveStatus           string                         `json:"effective_status"`
+	OperatorAction            string                         `json:"operator_action,omitempty"`
+	CurrentGeneration         uint64                         `json:"current_generation,omitempty"`
+	CurrentProviderState      string                         `json:"current_provider_state,omitempty"`
+	CurrentRecoveryState      string                         `json:"current_recovery_state,omitempty"`
+	CurrentAckTime            *time.Time                     `json:"current_ack_time,omitempty"`
+	CurrentCompletedAt        *time.Time                     `json:"current_completed_at,omitempty"`
+	LifecycleDurationMS       int64                          `json:"lifecycle_duration_ms"`
+	CloudSyncUploadDurationMS int64                          `json:"cloudsync_upload_duration_ms"`
+	ProviderSyncDurationMS    int64                          `json:"provider_sync_duration_ms"`
+	RecoveryDurationMS        int64                          `json:"recovery_duration_ms"`
+	EventTimeline             []webDAVWritebackTimelineEvent `json:"event_timeline,omitempty"`
+}
+
 func webDAVDurationMillis(start, end *time.Time) int64 {
 	if start == nil || end == nil || end.Before(*start) {
 		return 0
