@@ -301,7 +301,7 @@ func VerifyNow(ids []uint) (int64, error) {
 
 	var rows []model.WebDAVWritebackObject
 	if err := db.GetDb().
-		Select("id", "parent").
+		Select("id", "parent", "parent_key").
 		Where("id IN ? AND state = ? AND is_dir = ?", ids, StateVerifying, false).
 		Find(&rows).Error; err != nil {
 		return 0, err
@@ -310,16 +310,46 @@ func VerifyNow(ids []uint) (int64, error) {
 		return 0, nil
 	}
 
-	rowIDs := make([]uint, 0, len(rows))
-	parents := make(map[string]struct{}, len(rows))
+	rowIDs := make([]uint, 0, len(rows)+verificationSiblingBatchLimit)
+	seenIDs := make(map[uint]struct{}, len(rows)+verificationSiblingBatchLimit)
+	parents := make(map[string]string, len(rows))
 	for i := range rows {
-		rowIDs = append(rowIDs, rows[i].ID)
-		if rows[i].Parent != "" {
-			parents[rows[i].Parent] = struct{}{}
+		row := &rows[i]
+		if _, exists := seenIDs[row.ID]; !exists {
+			seenIDs[row.ID] = struct{}{}
+			rowIDs = append(rowIDs, row.ID)
 		}
+		if row.Parent == "" {
+			continue
+		}
+		parentKey := row.ParentKey
+		if parentKey == "" {
+			parentKey = pathKey(row.Parent)
+		}
+		parents[parentKey] = row.Parent
 	}
 
-	for parent := range parents {
+	// Treat a manual verification request as a parent-level recovery hint.
+	// Pull a bounded sibling batch forward as well, so one operator action can
+	// recover a WAF-blocked directory without releasing thousands of probes.
+	for parentKey, parent := range parents {
+		var siblingIDs []uint
+		if err := db.GetDb().
+			Model(&model.WebDAVWritebackObject{}).
+			Where("parent_key = ? AND state = ? AND is_dir = ?", parentKey, StateVerifying, false).
+			Order("retry_at asc").
+			Order("id asc").
+			Limit(verificationSiblingBatchLimit).
+			Pluck("id", &siblingIDs).Error; err != nil {
+			return 0, err
+		}
+		for _, id := range siblingIDs {
+			if _, exists := seenIDs[id]; exists {
+				continue
+			}
+			seenIDs[id] = struct{}{}
+			rowIDs = append(rowIDs, id)
+		}
 		providerProbeCooldowns.success(parent)
 		providerParentSnapshots.invalidate(parent)
 	}

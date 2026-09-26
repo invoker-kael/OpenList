@@ -8526,6 +8526,53 @@ func (m *workerManager) completeMatchingVerifySiblings(trigger *model.WebDAVWrit
 	}
 }
 
+func (m *workerManager) wakeVerifyingSiblings(trigger *model.WebDAVWritebackObject) {
+	if trigger == nil {
+		return
+	}
+
+	now := time.Now()
+	excluded := make([]uint, 0)
+	excluded = append(excluded, trigger.ID)
+	for id := range m.inflightIDSet() {
+		if id != trigger.ID {
+			excluded = append(excluded, id)
+		}
+	}
+
+	var ids []uint
+	query := db.GetDb().
+		Model(&model.WebDAVWritebackObject{}).
+		Where("parent_key = ? AND state = ? AND is_dir = ?", pathKey(trigger.Parent), StateVerifying, false).
+		Where("(retry_at IS NULL OR retry_at > ?)", now)
+	if len(excluded) > 0 {
+		query = query.Where("id NOT IN ?", excluded)
+	}
+	if err := query.
+		Order("retry_at asc").
+		Order("id asc").
+		Limit(verificationSiblingBatchLimit).
+		Pluck("id", &ids).Error; err != nil {
+		log.Errorf("write-back sibling verification wake scan failed for %s: %v", trigger.Parent, err)
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	res := db.GetDb().
+		Model(&model.WebDAVWritebackObject{}).
+		Where("id IN ? AND state = ?", ids, StateVerifying).
+		Update("retry_at", &now)
+	if res.Error != nil {
+		log.Errorf("write-back sibling verification wake failed for %s: %v", trigger.Parent, res.Error)
+		return
+	}
+	if res.RowsAffected > 0 {
+		wake()
+	}
+}
+
 func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject, requireHash, batchSiblings bool) (model.Obj, error) {
 	if requireHash {
 		// 115 directory listings already carry size and SHA-1. Use one fresh
@@ -8743,6 +8790,13 @@ func verifyingUpdates(currentState string, updates map[string]any) map[string]an
 
 func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObject, currentState string, requireHash bool) {
 	remote, err := m.remoteForVerify(row, requireHash, shouldBatchVerificationSiblings(currentState, requireHash))
+	if err == nil && requireHash && currentState == StateVerifying {
+		// A successful fresh parent LIST proves the provider circuit is healthy
+		// again. completeMatchingVerifySiblings already consumes this snapshot
+		// for matching rows; pull one more bounded batch forward so recovery can
+		// continue without turning every VERIFYING row into an upload.
+		m.wakeVerifyingSiblings(row)
+	}
 	verification := classifyRemoteVerification(row, remote, err, requireHash)
 	if verification == remoteVerificationMatch {
 		if m.completeRemoteVerification(row, remote, []string{currentState}, requireHash) {
