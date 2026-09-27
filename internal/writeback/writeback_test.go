@@ -1,6 +1,7 @@
 package writeback
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
