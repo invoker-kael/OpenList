@@ -45,7 +45,7 @@ const (
 	ResolutionRemoteMissing           = "remote_missing"
 	ResolutionVerificationExhausted   = "verification_exhausted"
 	ResolutionNeedsCloudSyncRehydrate = "needs_cloudsync_rehydrate"
-	ResolutionWAFReupload              = "waf_reupload"
+	ResolutionWAFReupload             = "waf_reupload"
 
 	CanonicalStateAcked     = "durable_acked"
 	canonicalStateLegacyAck = "acked"
