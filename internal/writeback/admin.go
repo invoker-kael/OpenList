@@ -9,6 +9,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/shirou/gopsutil/v4/disk"
+	"gorm.io/gorm"
 )
 
 const maxAdminWorkers = 256
