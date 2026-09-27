@@ -4164,8 +4164,26 @@ func TestSummarizeProviderProbeErrorStripsBlockedHTML(t *testing.T) {
 	if !strings.Contains(summary, "784e2ca117901350881961589e96dc") {
 		t.Fatalf("provider error summary must retain trace id: %q", summary)
 	}
-	if !strings.Contains(summary, "without re-upload") {
-		t.Fatalf("provider error summary must make the safe recovery behavior explicit: %q", summary)
+	if !strings.Contains(summary, "direct re-upload scheduled after cooldown") {
+		t.Fatalf("provider error summary must describe delayed direct re-upload recovery: %q", summary)
+	}
+}
+
+func TestProviderProbeIsWAFBlockRecognizesPersistedSummary(t *testing.T) {
+	err := errors.New("provider/WAF blocked remote listing (HTTP 405); direct re-upload scheduled after cooldown")
+	if !providerProbeIsWAFBlock(err) {
+		t.Fatal("persisted WAF diagnostic must remain recognizable after restart")
+	}
+}
+
+func TestWAFRepairUploadQueuedUsesResolutionMarker(t *testing.T) {
+	row := &model.WebDAVWritebackObject{State: StateQueued, ResolutionReason: ResolutionWAFReupload}
+	if !wafRepairUploadQueued(row) {
+		t.Fatal("queued WAF recovery row must bypass the provider pre-upload verification")
+	}
+	row.ResolutionReason = ""
+	if wafRepairUploadQueued(row) {
+		t.Fatal("ordinary queued row must keep the normal retry verification path")
 	}
 }
 
@@ -4233,7 +4251,7 @@ func TestProviderProbeCooldownDoesNotCountAsDivergence(t *testing.T) {
 		VerifyCount: 2,
 	}
 	deferred := &providerProbeDeferredError{
-		summary: "provider/WAF blocked remote listing (HTTP 405); verification deferred without re-upload",
+		summary: "provider/WAF blocked remote listing (HTTP 405); direct re-upload scheduled after cooldown",
 		retryAt: time.Now().Add(time.Minute),
 	}
 	if got := classifyRemoteVerification(row, nil, deferred, true); got != remoteVerificationInconclusive {

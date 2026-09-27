@@ -45,6 +45,7 @@ const (
 	ResolutionRemoteMissing           = "remote_missing"
 	ResolutionVerificationExhausted   = "verification_exhausted"
 	ResolutionNeedsCloudSyncRehydrate = "needs_cloudsync_rehydrate"
+	ResolutionWAFReupload              = "waf_reupload"
 
 	CanonicalStateAcked     = "durable_acked"
 	canonicalStateLegacyAck = "acked"
@@ -5777,7 +5778,8 @@ func providerProbeIsWAFBlock(err error) bool {
 	return strings.Contains(message, "errors.aliyun.com") ||
 		strings.Contains(message, "request has been blocked") ||
 		strings.Contains(message, "访问被阻断") ||
-		strings.Contains(message, "block_message")
+		strings.Contains(message, "block_message") ||
+		strings.Contains(message, "provider/waf blocked remote listing")
 }
 
 func providerProbeBackoff(err error, failures int) time.Duration {
@@ -5951,7 +5953,11 @@ func summarizeProviderProbeError(err error) string {
 	if status != "" {
 		summary += " (HTTP " + status + ")"
 	}
-	summary += "; verification deferred without re-upload"
+	if blocked {
+		summary += "; direct re-upload scheduled after cooldown"
+	} else {
+		summary += "; verification deferred without re-upload"
+	}
 	if traceID := providerProbeTraceID(message); traceID != "" {
 		summary += "; trace_id=" + traceID
 	}
@@ -8105,7 +8111,8 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		return
 	}
 	requireHash := providerRequiresPayloadHash(row.Path)
-	if row.RetryCount > 0 {
+	directWAFRepair := wafRepairUploadQueued(row)
+	if row.RetryCount > 0 && !directWAFRepair {
 		remote, verifyErr := m.remoteForVerify(row, requireHash, false)
 		verification := classifyRemoteVerification(row, remote, verifyErr, requireHash)
 		if verification == remoteVerificationMatch {
@@ -8139,6 +8146,14 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 	if !available {
 		now := time.Now()
+		if directWAFRepair {
+			forceCloudSyncRepairForMissingPayload(
+				row,
+				StateQueued,
+				"durable local payload is missing when the WAF cooldown expired; restart/rescan Cloud Sync to publish a fresh generation",
+			)
+			return
+		}
 		if err := markMissingDurablePayloadForVerification(row, now, "durable local payload is missing; verifying provider before Cloud Sync repair"); err != nil {
 			m.fail(row, err)
 		}
@@ -8205,7 +8220,10 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 	err = fs.PutDirectlyWithProgress(m.ctx, row.Parent, fsStream, updateProviderProgress, true)
 	if err != nil {
-		if errs.IsNotFoundError(err) {
+		if providerProbeIsWAFBlock(err) {
+			state := providerProbeCooldowns.fail(row.Parent, err, time.Now())
+			scheduleWAFRepairUpload(row, StateUploading, state.until, summarizeProviderProbeError(err))
+		} else if errs.IsNotFoundError(err) {
 			m.failAfter(row, err, 2*time.Second)
 		} else {
 			m.fail(row, err)
@@ -8234,6 +8252,10 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		if current.SpoolPath != row.SpoolPath {
 			removeSpoolIfUnreferenced(row.SpoolPath)
 		}
+		return
+	}
+	if directWAFRepair {
+		m.completeWAFRepairUpload(row, uploadCompletedAt)
 		return
 	}
 
@@ -8788,6 +8810,117 @@ func verifyingUpdates(currentState string, updates map[string]any) map[string]an
 	return updates
 }
 
+func wafRepairUploadQueued(row *model.WebDAVWritebackObject) bool {
+	return row != nil && row.State == StateQueued && row.ResolutionReason == ResolutionWAFReupload
+}
+
+func scheduleWAFRepairUpload(row *model.WebDAVWritebackObject, currentState string, retryAt time.Time, message string) bool {
+	if row == nil {
+		return false
+	}
+	if retryAt.Before(time.Now()) {
+		retryAt = time.Now()
+	}
+	availability, payloadErr := inspectDurableLocalPayload(row)
+	if payloadErr != nil {
+		next := time.Now().Add(remoteVerificationInconclusiveDelay())
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
+			Updates(verifyingUpdates(currentState, map[string]any{
+				"retry_at":   &next,
+				"last_error": fmt.Sprintf("cannot inspect durable spool before WAF recovery re-upload: %v", payloadErr),
+			})).Error
+		return false
+	}
+	if availability == durablePayloadMissing && row.CleanupPath == "" {
+		return forceCloudSyncRepairForMissingPayload(
+			row,
+			currentState,
+			"durable spool is missing while provider/WAF verification is blocked; restart/rescan Cloud Sync to publish a fresh generation",
+		)
+	}
+	if message == "" {
+		message = "provider/WAF cooldown active; direct re-upload scheduled after cooldown without remote verification"
+	}
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
+		Updates(map[string]any{
+			"state":                   StateQueued,
+			"retry_at":                &retryAt,
+			"retry_count":             row.RetryCount + 1,
+			"verify_count":            0,
+			"last_error":              message,
+			"resolution_reason":       ResolutionWAFReupload,
+			"recovery_started_at":     gorm.Expr("COALESCE(recovery_started_at, ?)", time.Now()),
+			"remote_generation":       0,
+			"remote_verified_at":      nil,
+			"restart_upload_recovery": false,
+		})
+	if res.Error != nil {
+		return false
+	}
+	if res.RowsAffected > 0 {
+		wake()
+		return true
+	}
+	return false
+}
+
+func (m *workerManager) completeWAFRepairUpload(row *model.WebDAVWritebackObject, completedAt time.Time) bool {
+	if row == nil {
+		return false
+	}
+	// In this recovery mode a successful provider PUT is the terminal evidence.
+	// We intentionally do not issue another LIST/GET after the WAF cooldown.
+	updates := map[string]any{
+		"state":                    StateCompleted,
+		"completed_at":             &completedAt,
+		"retry_at":                 nil,
+		"last_error":               "",
+		"resolution_reason":        "",
+		"retry_count":              0,
+		"verify_count":             0,
+		"remote_object_id":         "",
+		"remote_sha1":              strings.ToLower(row.PayloadSHA1),
+		"remote_generation":        row.Generation,
+		"remote_verified_at":       &completedAt,
+		"provider_evidence_result": "upload_accepted_after_waf",
+		"restart_upload_recovery":  false,
+	}
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+		Updates(updates)
+	if res.Error != nil || res.RowsAffected == 0 {
+		return false
+	}
+
+	providerProbeCooldowns.success(row.Parent)
+	providerParentSnapshots.invalidate(row.Parent)
+
+	final := *row
+	final.State = StateCompleted
+	final.CompletedAt = &completedAt
+	final.RetryAt = nil
+	final.LastError = ""
+	final.ResolutionReason = ""
+	final.RetryCount = 0
+	final.VerifyCount = 0
+	final.RemoteObjectID = ""
+	final.RemoteSHA1 = strings.ToLower(row.PayloadSHA1)
+	final.RemoteGeneration = row.Generation
+	final.RemoteVerifiedAt = &completedAt
+	final.ProviderEvidenceResult = "upload_accepted_after_waf"
+	recordHistoryOutcomeBestEffort(&final, HistoryResultCompleted, StateCompleted, historyRecoveryForCompletion(row), completedAt, "")
+
+	if row.CleanupPath != "" && row.CleanupPath != row.Path {
+		_ = fs.Remove(m.ctx, row.CleanupPath)
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ?", row.ID, row.Generation).
+			Update("cleanup_path", "").Error
+	}
+	return true
+}
+
 func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObject, currentState string, requireHash bool) {
 	remote, err := m.remoteForVerify(row, requireHash, shouldBatchVerificationSiblings(currentState, requireHash))
 	if err == nil && requireHash && currentState == StateVerifying {
@@ -8798,6 +8931,11 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 		m.wakeVerifyingSiblings(row)
 	}
 	verification := classifyRemoteVerification(row, remote, err, requireHash)
+	if verification == remoteVerificationInconclusive && providerProbeIsWAFBlock(err) {
+		next := time.Now().Add(remoteVerificationRetryDelay(err))
+		scheduleWAFRepairUpload(row, currentState, next, summarizeProviderProbeError(err))
+		return
+	}
 	if verification == remoteVerificationMatch {
 		if m.completeRemoteVerification(row, remote, []string{currentState}, requireHash) {
 			return
@@ -9000,6 +9138,15 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 }
 
 func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
+	if row != nil && providerProbeIsWAFBlock(errors.New(row.LastError)) {
+		scheduleWAFRepairUpload(
+			row,
+			StateVerifying,
+			time.Now(),
+			"provider/WAF cooldown elapsed; direct re-upload queued without remote verification",
+		)
+		return
+	}
 	if row.CleanupPath != "" && row.SpoolPath == "" {
 		holdReplicaMoveSource(row.CleanupPath, time.Now().Add(replicaMoveSourceHoldDelay()))
 	}
