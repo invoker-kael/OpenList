@@ -4176,13 +4176,17 @@ func TestProviderProbeIsWAFBlockRecognizesPersistedSummary(t *testing.T) {
 	}
 }
 
-func TestWAFRepairUploadQueuedUsesResolutionMarker(t *testing.T) {
+func TestDirectRepairUploadQueuedUsesResolutionMarker(t *testing.T) {
 	row := &model.WebDAVWritebackObject{State: StateQueued, ResolutionReason: ResolutionWAFReupload}
-	if !wafRepairUploadQueued(row) {
+	if !directRepairUploadQueued(row) {
 		t.Fatal("queued WAF recovery row must bypass the provider pre-upload verification")
 	}
+	row.ResolutionReason = ResolutionManualReupload
+	if !directRepairUploadQueued(row) {
+		t.Fatal("manual immediate re-upload must bypass provider pre-upload verification")
+	}
 	row.ResolutionReason = ""
-	if wafRepairUploadQueued(row) {
+	if directRepairUploadQueued(row) {
 		t.Fatal("ordinary queued row must keep the normal retry verification path")
 	}
 }

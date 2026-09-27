@@ -294,15 +294,14 @@ func PreviewCompletedCacheNow() (CacheCleanupResult, error) {
 	return result, nil
 }
 
-func VerifyNow(ids []uint) (int64, error) {
+func ReuploadNow(ids []uint) (int64, error) {
 	if len(ids) == 0 {
 		return 0, fmt.Errorf("ids must not be empty")
 	}
 
 	var rows []model.WebDAVWritebackObject
 	if err := db.GetDb().
-		Select("id", "parent", "parent_key").
-		Where("id IN ? AND state = ? AND is_dir = ?", ids, StateVerifying, false).
+		Where("id IN ? AND state IN ? AND is_dir = ?", ids, []string{StateQueued, StateVerifying}, false).
 		Find(&rows).Error; err != nil {
 		return 0, err
 	}
@@ -310,57 +309,55 @@ func VerifyNow(ids []uint) (int64, error) {
 		return 0, nil
 	}
 
-	rowIDs := make([]uint, 0, len(rows)+verificationSiblingBatchLimit)
-	seenIDs := make(map[uint]struct{}, len(rows)+verificationSiblingBatchLimit)
-	parents := make(map[string]string, len(rows))
+	now := time.Now()
+	var scheduled int64
+	parents := make(map[string]struct{})
 	for i := range rows {
 		row := &rows[i]
-		if _, exists := seenIDs[row.ID]; !exists {
-			seenIDs[row.ID] = struct{}{}
-			rowIDs = append(rowIDs, row.ID)
+		availability, err := inspectDurableLocalPayload(row)
+		if err != nil {
+			return scheduled, err
 		}
-		if row.Parent == "" {
+		if availability != durablePayloadAvailable {
 			continue
 		}
-		parentKey := row.ParentKey
-		if parentKey == "" {
-			parentKey = pathKey(row.Parent)
+
+		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state IN ? AND is_dir = ?", row.ID, row.Generation, []string{StateQueued, StateVerifying}, false).
+			Updates(map[string]any{
+				"state":                   StateQueued,
+				"retry_at":                &now,
+				"retry_count":             row.RetryCount + 1,
+				"verify_count":            0,
+				"last_error":              "manual immediate re-upload requested; provider verification bypassed",
+				"resolution_reason":       ResolutionManualReupload,
+				"recovery_started_at":     gorm.Expr("COALESCE(recovery_started_at, ?)", now),
+				"remote_generation":       0,
+				"remote_verified_at":      nil,
+				"restart_upload_recovery": false,
+			})
+		if res.Error != nil {
+			return scheduled, res.Error
 		}
-		parents[parentKey] = row.Parent
+		if res.RowsAffected > 0 {
+			scheduled += res.RowsAffected
+			if row.Parent != "" {
+				parents[row.Parent] = struct{}{}
+			}
+		}
 	}
 
-	// Treat a manual verification request as a parent-level recovery hint.
-	// Pull a bounded sibling batch forward as well, so one operator action can
-	// recover a WAF-blocked directory without releasing thousands of probes.
-	for parentKey, parent := range parents {
-		var siblingIDs []uint
-		if err := db.GetDb().
-			Model(&model.WebDAVWritebackObject{}).
-			Where("parent_key = ? AND state = ? AND is_dir = ?", parentKey, StateVerifying, false).
-			Order("retry_at asc").
-			Order("id asc").
-			Limit(verificationSiblingBatchLimit).
-			Pluck("id", &siblingIDs).Error; err != nil {
-			return 0, err
-		}
-		for _, id := range siblingIDs {
-			if _, exists := seenIDs[id]; exists {
-				continue
-			}
-			seenIDs[id] = struct{}{}
-			rowIDs = append(rowIDs, id)
-		}
-		providerProbeCooldowns.success(parent)
+	for parent := range parents {
 		providerParentSnapshots.invalidate(parent)
 	}
-
-	now := time.Now()
-	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("id IN ? AND state = ? AND is_dir = ?", rowIDs, StateVerifying, false).
-		Update("retry_at", &now)
-	if res.Error != nil {
-		return 0, res.Error
+	if scheduled > 0 {
+		wake()
 	}
-	wake()
-	return res.RowsAffected, nil
+	return scheduled, nil
+}
+
+// VerifyNow is retained for older frontend builds. Its semantics now match the
+// operator-facing action: immediately re-upload the durable payload.
+func VerifyNow(ids []uint) (int64, error) {
+	return ReuploadNow(ids)
 }

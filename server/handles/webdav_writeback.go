@@ -1228,24 +1228,28 @@ func WebDAVWritebackHistoryCleanup(c *gin.Context) {
 	common.SuccessResp(c, webDAVWritebackHistoryCleanupResult{Deleted: deleted})
 }
 
-type webDAVWritebackVerifyNowRequest struct {
+type webDAVWritebackReuploadNowRequest struct {
 	IDs []uint `json:"ids"`
 }
 
-func WebDAVWritebackVerifyNow(c *gin.Context) {
-	var req webDAVWritebackVerifyNowRequest
+func WebDAVWritebackReuploadNow(c *gin.Context) {
+	var req webDAVWritebackReuploadNowRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ErrorResp(c, err, http.StatusBadRequest)
 		return
 	}
 	if len(req.IDs) == 0 {
-		common.ErrorResp(c, errors.New("select at least one verifying task"), http.StatusBadRequest)
+		common.ErrorResp(c, errors.New("select at least one queued or verifying file"), http.StatusBadRequest)
 		return
 	}
-	scheduled, err := writeback.VerifyNow(req.IDs)
+	scheduled, err := writeback.ReuploadNow(req.IDs)
 	if err != nil {
 		common.ErrorResp(c, err, http.StatusInternalServerError)
 		return
 	}
 	common.SuccessResp(c, gin.H{"scheduled": scheduled})
+}
+
+func WebDAVWritebackVerifyNow(c *gin.Context) {
+	WebDAVWritebackReuploadNow(c)
 }

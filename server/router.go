@@ -201,6 +201,7 @@ func admin(g *gin.RouterGroup) {
 	webdavWriteback.POST("/settings", handles.WebDAVWritebackSaveSettings)
 	webdavWriteback.GET("/cleanup/preview", handles.WebDAVWritebackCleanupPreview)
 	webdavWriteback.POST("/cleanup", handles.WebDAVWritebackCleanupCompletedCache)
+	webdavWriteback.POST("/reupload-now", handles.WebDAVWritebackReuploadNow)
 	webdavWriteback.POST("/verify-now", handles.WebDAVWritebackVerifyNow)
 }
 
