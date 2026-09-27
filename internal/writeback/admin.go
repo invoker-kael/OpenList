@@ -32,6 +32,7 @@ type AdminRuntimeStats struct {
 	NeedsCloudSyncRehydrate     int64  `json:"needs_cloudsync_rehydrate"`
 	AutomaticRecovery           int64  `json:"automatic_recovery"`
 	RemoteHashMismatch          int64  `json:"remote_hash_mismatch"`
+	Paused                      int64  `json:"paused"`
 }
 
 func ValidateAdminConfig(cfg conf.WebDAVWritebackConfig) error {
@@ -253,6 +254,10 @@ func AdminRuntimeSnapshot() (AdminRuntimeStats, error) {
 	if err != nil {
 		return stats, err
 	}
+	stats.Paused, err = count("paused = ?", true)
+	if err != nil {
+		return stats, err
+	}
 
 	if conf.Conf != nil && conf.Conf.WebDAVWriteback.SpoolDir != "" {
 		usage, usageErr := disk.Usage(conf.Conf.WebDAVWriteback.SpoolDir)
@@ -323,10 +328,12 @@ func ReuploadNow(ids []uint) (int64, error) {
 			continue
 		}
 
+		clearManualPause(row.ID)
 		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state IN ? AND is_dir = ?", row.ID, row.Generation, []string{StateQueued, StateVerifying}, false).
 			Updates(map[string]any{
 				"state":                   StateQueued,
+				"paused":                  false,
 				"retry_at":                &now,
 				"retry_count":             row.RetryCount + 1,
 				"verify_count":            0,
@@ -355,6 +362,84 @@ func ReuploadNow(ids []uint) (int64, error) {
 		wake()
 	}
 	return scheduled, nil
+}
+
+func activeTaskScope(ids []uint, all bool) (*gorm.DB, error) {
+	query := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("state IN ?", []string{StateQueued, StateUploading, StateVerifying})
+	if all {
+		return query, nil
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("ids must not be empty when all is false")
+	}
+	return query.Where("id IN ?", ids), nil
+}
+
+func PauseTasks(ids []uint, all bool) (int64, error) {
+	query, err := activeTaskScope(ids, all)
+	if err != nil {
+		return 0, err
+	}
+	var taskIDs []uint
+	if err := query.Session(&gorm.Session{}).Pluck("id", &taskIDs).Error; err != nil {
+		return 0, err
+	}
+	if len(taskIDs) == 0 {
+		return 0, nil
+	}
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id IN ? AND state IN ?", taskIDs, []string{StateQueued, StateUploading, StateVerifying}).
+		Update("paused", true)
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	requestManualPause(taskIDs...)
+	return res.RowsAffected, nil
+}
+
+func ResumeTasks(ids []uint, all bool) (int64, error) {
+	query, err := activeTaskScope(ids, all)
+	if err != nil {
+		return 0, err
+	}
+	var taskIDs []uint
+	if err := query.Where("paused = ?", true).Session(&gorm.Session{}).Pluck("id", &taskIDs).Error; err != nil {
+		return 0, err
+	}
+	if len(taskIDs) == 0 {
+		return 0, nil
+	}
+	clearManualPause(taskIDs...)
+	now := time.Now()
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id IN ? AND state IN ?", taskIDs, []string{StateQueued, StateUploading, StateVerifying}).
+		Updates(map[string]any{"paused": false})
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id IN ? AND state IN ?", taskIDs, []string{StateQueued, StateVerifying}).
+		Update("retry_at", &now).Error; err != nil {
+		return res.RowsAffected, err
+	}
+	if res.RowsAffected > 0 {
+		wake()
+	}
+	return res.RowsAffected, nil
+}
+
+func ReuploadAll() (int64, error) {
+	var ids []uint
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("state IN ? AND is_dir = ?", []string{StateQueued, StateVerifying}, false).
+		Pluck("id", &ids).Error; err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	return ReuploadNow(ids)
 }
 
 // VerifyNow is retained for older frontend builds. Its semantics now match the

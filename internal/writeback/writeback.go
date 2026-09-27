@@ -63,6 +63,35 @@ const (
 )
 
 var ErrCanonicalChanged = errors.New("canonical WebDAV state changed while staging provider delete")
+var ErrWritebackPaused = errors.New("write-back paused by operator")
+
+var manualPauseRequests sync.Map
+
+func requestManualPause(ids ...uint) {
+	for _, id := range ids {
+		if id != 0 {
+			manualPauseRequests.Store(id, struct{}{})
+		}
+	}
+}
+
+func clearManualPause(ids ...uint) {
+	for _, id := range ids {
+		manualPauseRequests.Delete(id)
+	}
+}
+
+func manualPauseRequested(id uint) bool {
+	_, ok := manualPauseRequests.Load(id)
+	return ok
+}
+
+func clearAllManualPauseRequests() {
+	manualPauseRequests.Range(func(key, _ any) bool {
+		manualPauseRequests.Delete(key)
+		return true
+	})
+}
 
 type CanonicalObject struct {
 	model.Object
@@ -3865,6 +3894,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		row.RecoveryStartedAt = nil
 		row.ResolutionReason = ""
 		row.State = StateQueued
+		row.Paused = false
 		row.SpoolPath = finalName
 		row.PayloadSHA1 = payloadSHA1
 		row.MimeType = mime
@@ -3978,6 +4008,7 @@ func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*m
 		row.RecoveryStartedAt = nil
 		row.ResolutionReason = ""
 		row.State = StateQueued
+		row.Paused = false
 		row.SpoolPath = ""
 		row.PayloadSHA1 = ""
 		row.MimeType = ""
@@ -4018,6 +4049,25 @@ type memoryPayload struct {
 
 func (m *memoryPayload) Close() error {
 	return nil
+}
+
+type pauseAwarePayload struct {
+	LocalPayload
+	id uint
+}
+
+func (p *pauseAwarePayload) Read(buf []byte) (int, error) {
+	if manualPauseRequested(p.id) {
+		return 0, ErrWritebackPaused
+	}
+	return p.LocalPayload.Read(buf)
+}
+
+func (p *pauseAwarePayload) Seek(offset int64, whence int) (int64, error) {
+	if manualPauseRequested(p.id) {
+		return 0, ErrWritebackPaused
+	}
+	return p.LocalPayload.Seek(offset, whence)
 }
 
 func openLocalPayload(row *model.WebDAVWritebackObject) (LocalPayload, bool, error) {
@@ -6416,6 +6466,7 @@ func Start() {
 	}
 	providerParentSnapshots.clear()
 	providerProbeCooldowns.clear()
+	clearAllManualPauseRequests()
 	workerCtx, cancel := context.WithCancel(context.Background())
 	workers := max(1, conf.Conf.WebDAVWriteback.Workers)
 	uploadWorkers := uploadWorkerLimit(workers, conf.Conf.WebDAVWriteback.UploadWorkers)
@@ -6482,6 +6533,7 @@ func Stop() {
 	m.wg.Wait()
 	providerParentSnapshots.clear()
 	providerProbeCooldowns.clear()
+	clearAllManualPauseRequests()
 }
 
 const missingDurablePayloadRecoveryMessage = "durable spool is missing after restart; verifying provider before Cloud Sync repair"
@@ -6914,7 +6966,7 @@ func dispatchWorkDue(now time.Time) (bool, error) {
 	var row model.WebDAVWritebackObject
 	err := db.GetDb().
 		Select("id").
-		Where("state IN ? AND (retry_at IS NULL OR retry_at <= ?)", []string{StateDeleted, StateVerifying, StateQueued}, now).
+		Where("paused = ? AND state IN ? AND (retry_at IS NULL OR retry_at <= ?)", false, []string{StateDeleted, StateVerifying, StateQueued}, now).
 		Take(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
@@ -7035,8 +7087,8 @@ func filterDispatchExcludedIDs(rows []model.WebDAVWritebackObject, excludedIDs m
 func loadDispatchClass(now time.Time, states []string, isDir *bool, excludedIDs map[uint]struct{}, limit int) ([]model.WebDAVWritebackObject, error) {
 	var rows []model.WebDAVWritebackObject
 	query := db.GetDb().
-		Select("id", "path", "parent_key", "size", "is_dir", "state").
-		Where("state IN ? AND (retry_at IS NULL OR retry_at <= ?)", states, now)
+		Select("id", "path", "parent_key", "size", "is_dir", "state", "paused").
+		Where("paused = ? AND state IN ? AND (retry_at IS NULL OR retry_at <= ?)", false, states, now)
 	if isDir != nil {
 		query = query.Where("is_dir = ?", *isDir)
 	}
@@ -7362,6 +7414,9 @@ func (m *workerManager) processSafely(id uint) {
 func (m *workerManager) process(id uint) {
 	var row model.WebDAVWritebackObject
 	if err := db.GetDb().Take(&row, id).Error; err != nil {
+		return
+	}
+	if row.Paused {
 		return
 	}
 	switch row.State {
@@ -8075,6 +8130,22 @@ func (m *workerManager) processReplicaMove(row *model.WebDAVWritebackObject) {
 	m.enterReplicaMoveVerification(row, "")
 }
 
+func parkPausedUpload(row *model.WebDAVWritebackObject) {
+	if row == nil {
+		return
+	}
+	requestManualPause(row.ID)
+	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+		Updates(map[string]any{
+			"state":                        StateQueued,
+			"paused":                       true,
+			"retry_at":                     nil,
+			"last_error":                   "",
+			"provider_upload_completed_at": nil,
+		}).Error
+}
+
 func providerUploadProgressBytes(total int64, progress float64) int64 {
 	if total <= 0 || progress <= 0 {
 		return 0
@@ -8194,9 +8265,13 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		Ctime:    row.CreateTime,
 		HashInfo: utils.NewHashInfo(utils.SHA1, row.PayloadSHA1),
 	}
+	uploadPayload := LocalPayload(payload)
+	if row.ID != 0 {
+		uploadPayload = &pauseAwarePayload{LocalPayload: payload, id: row.ID}
+	}
 	fsStream := &stream.FileStream{
 		Obj:      obj,
-		Reader:   payload,
+		Reader:   uploadPayload,
 		Mimetype: row.MimeType,
 	}
 	var progressMu sync.Mutex
@@ -8221,7 +8296,9 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 	err = fs.PutDirectlyWithProgress(m.ctx, row.Parent, fsStream, updateProviderProgress, true)
 	if err != nil {
-		if providerProbeIsWAFBlock(err) {
+		if errors.Is(err, ErrWritebackPaused) {
+			parkPausedUpload(row)
+		} else if providerProbeIsWAFBlock(err) {
 			state := providerProbeCooldowns.fail(row.Parent, err, time.Now())
 			scheduleWAFRepairUpload(row, StateUploading, state.until, summarizeProviderProbeError(err))
 		} else if errs.IsNotFoundError(err) {
@@ -8242,7 +8319,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 
 	var current model.WebDAVWritebackObject
 	if err := db.GetDb().
-		Select("generation", "canonical_state", "state", "path", "spool_path").
+		Select("generation", "canonical_state", "state", "path", "spool_path", "paused").
 		Take(&current, row.ID).Error; err != nil {
 		return
 	}
@@ -8257,6 +8334,19 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 	if directRepairUpload {
 		m.completeDirectRepairUpload(row, uploadCompletedAt)
+		return
+	}
+	if current.Paused {
+		requestManualPause(row.ID)
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+			Updates(map[string]any{
+				"state":        StateVerifying,
+				"paused":       true,
+				"retry_at":     nil,
+				"last_error":   "",
+				"verify_count": 0,
+			}).Error
 		return
 	}
 
@@ -8703,6 +8793,7 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 	}
 	updates := map[string]any{
 		"state":                   StateCompleted,
+		"paused":                  false,
 		"completed_at":            &now,
 		"retry_at":                nil,
 		"last_error":              "",
@@ -8722,6 +8813,7 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 	if res.Error != nil || res.RowsAffected == 0 {
 		return false
 	}
+	clearManualPause(row.ID)
 	// History is deliberately best-effort and runs only after correctness state
 	// has committed. A History failure must never turn a provider success into a
 	// Cloud Sync retry.
@@ -8851,6 +8943,7 @@ func scheduleWAFRepairUpload(row *model.WebDAVWritebackObject, currentState stri
 		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
 		Updates(map[string]any{
 			"state":                   StateQueued,
+			"paused":                  false,
 			"retry_at":                &retryAt,
 			"retry_count":             row.RetryCount + 1,
 			"verify_count":            0,
@@ -8883,6 +8976,7 @@ func (m *workerManager) completeDirectRepairUpload(row *model.WebDAVWritebackObj
 	}
 	updates := map[string]any{
 		"state":                    StateCompleted,
+		"paused":                   false,
 		"completed_at":             &completedAt,
 		"retry_at":                 nil,
 		"last_error":               "",
@@ -8902,6 +8996,7 @@ func (m *workerManager) completeDirectRepairUpload(row *model.WebDAVWritebackObj
 	if res.Error != nil || res.RowsAffected == 0 {
 		return false
 	}
+	clearManualPause(row.ID)
 
 	providerProbeCooldowns.success(row.Parent)
 	providerParentSnapshots.invalidate(row.Parent)

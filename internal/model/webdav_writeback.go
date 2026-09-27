@@ -38,6 +38,7 @@ type WebDAVWritebackObject struct {
 	ProviderEvidenceCount     int        `json:"provider_evidence_count"`
 	ProviderEvidenceResult    string     `json:"provider_evidence_result" gorm:"size:32"`
 	State                     string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1;index:idx_webdav_writeback_parent_state,priority:2;index:idx_webdav_writeback_state_size,priority:1"`
+	Paused                    bool       `json:"paused" gorm:"index"`
 	SpoolPath                 string     `json:"spool_path" gorm:"type:text"`
 	PayloadSHA1               string     `json:"payload_sha1" gorm:"size:40"`
 	RemoteObjectID            string     `json:"remote_object_id" gorm:"size:255"`

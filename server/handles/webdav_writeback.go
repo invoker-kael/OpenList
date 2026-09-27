@@ -20,7 +20,7 @@ import (
 const (
 	webDAVMonitorDefaultLimit     = 100
 	webDAVMonitorMaxLimit         = 500
-	webDAVWritebackMonitorColumns = "id, path, name, is_dir, size, e_tag, canonical_state, state, generation, remote_generation, payload_sha1, remote_sha1, remote_object_id, retry_count, verify_count, last_error, resolution_reason, retry_at, remote_verified_at, receive_started_at, ack_time, durable_at, provider_upload_started_at, provider_upload_completed_at, provider_uploaded_bytes, recovery_started_at, cloud_sync_reupload_required, provider_evidence_first_at, provider_evidence_last_at, provider_evidence_count, provider_evidence_result, completed_at, created_at, updated_at"
+	webDAVWritebackMonitorColumns = "id, path, name, is_dir, size, e_tag, canonical_state, state, generation, remote_generation, payload_sha1, remote_sha1, remote_object_id, retry_count, verify_count, last_error, resolution_reason, retry_at, remote_verified_at, receive_started_at, ack_time, durable_at, provider_upload_started_at, provider_upload_completed_at, provider_uploaded_bytes, recovery_started_at, cloud_sync_reupload_required, provider_evidence_first_at, provider_evidence_last_at, provider_evidence_count, provider_evidence_result, paused, completed_at, created_at, updated_at"
 )
 
 type webDAVWritebackStateSummary struct {
@@ -49,6 +49,7 @@ type webDAVWritebackSummary struct {
 	NeedsCloudSyncRehydrate     int64                                  `json:"needs_cloudsync_rehydrate"`
 	AutomaticRecovery           int64                                  `json:"automatic_recovery"`
 	RemoteHashMismatch          int64                                  `json:"remote_hash_mismatch"`
+	Paused                      int64                                  `json:"paused"`
 	Errors                      int64                                  `json:"errors"`
 	States                      map[string]webDAVWritebackStateSummary `json:"states"`
 	UpdatedAt                   time.Time                              `json:"updated_at"`
@@ -146,6 +147,7 @@ type webDAVWritebackMonitorRow struct {
 	ProviderEvidenceLastAt    *time.Time `json:"provider_evidence_last_at,omitempty"`
 	ProviderEvidenceCount     int        `json:"provider_evidence_count"`
 	ProviderEvidenceResult    string     `json:"provider_evidence_result,omitempty"`
+	Paused                    bool       `json:"paused"`
 	CompletedAt               *time.Time `json:"completed_at"`
 	StartedAt                 *time.Time `json:"started_at,omitempty"`
 	CreatedAt                 time.Time  `json:"created_at"`
@@ -248,6 +250,7 @@ func WebDAVWritebackMonitorSummary(c *gin.Context) {
 		NeedsCloudSyncRehydrate:     runtimeStats.NeedsCloudSyncRehydrate,
 		AutomaticRecovery:           runtimeStats.AutomaticRecovery,
 		RemoteHashMismatch:          runtimeStats.RemoteHashMismatch,
+		Paused:                      runtimeStats.Paused,
 		Errors:                      errorsCount,
 		States:                      states,
 		UpdatedAt:                   now,
@@ -414,17 +417,22 @@ const (
 	webDAVStatusReuploadVerifying      = "reupload_verifying"
 	webDAVStatusRecovered              = "recovered"
 	webDAVStatusAutomaticRecovery      = "automatic_recovery"
+	webDAVStatusPaused                 = "paused"
 
 	webDAVActionNone                  = "none"
 	webDAVActionWait                  = "wait"
 	webDAVActionRetryingAutomatically = "retrying_automatically"
 	webDAVActionRestartCloudSync      = "restart_cloudsync_required"
 	webDAVActionManualCheck           = "manual_check_required"
+	webDAVActionPaused                = "paused_by_operator"
 )
 
 func webDAVCurrentEffectiveStatus(row *model.WebDAVWritebackObject) (string, string) {
 	if row == nil {
 		return "", webDAVActionNone
+	}
+	if row.Paused {
+		return webDAVStatusPaused, webDAVActionPaused
 	}
 	if row.CloudSyncReuploadRequired || row.State == writeback.StateWaitingCloudSyncReupload {
 		switch row.ResolutionReason {
@@ -718,6 +726,7 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 				ProviderEvidenceLastAt:    row.ProviderEvidenceLastAt,
 				ProviderEvidenceCount:     row.ProviderEvidenceCount,
 				ProviderEvidenceResult:    row.ProviderEvidenceResult,
+				Paused:                    row.Paused,
 				CompletedAt:               row.CompletedAt,
 				StartedAt:                 row.ReceiveStartedAt,
 				CreatedAt:                 row.CreatedAt,
@@ -1248,6 +1257,49 @@ func WebDAVWritebackReuploadNow(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, gin.H{"scheduled": scheduled})
+}
+
+type webDAVWritebackBatchActionRequest struct {
+	Action string `json:"action"`
+	IDs    []uint `json:"ids"`
+	All    bool   `json:"all"`
+}
+
+func WebDAVWritebackBatchAction(c *gin.Context) {
+	var req webDAVWritebackBatchActionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	if !req.All && len(req.IDs) == 0 {
+		common.ErrorResp(c, errors.New("select tasks or set all=true"), http.StatusBadRequest)
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	var (
+		affected int64
+		err      error
+	)
+	switch action {
+	case "pause":
+		affected, err = writeback.PauseTasks(req.IDs, req.All)
+	case "resume", "start":
+		affected, err = writeback.ResumeTasks(req.IDs, req.All)
+	case "reupload":
+		if req.All {
+			affected, err = writeback.ReuploadAll()
+		} else {
+			affected, err = writeback.ReuploadNow(req.IDs)
+		}
+	default:
+		common.ErrorResp(c, errors.New("unsupported batch action"), http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError)
+		return
+	}
+	common.SuccessResp(c, gin.H{"affected": affected, "action": action})
 }
 
 func WebDAVWritebackVerifyNow(c *gin.Context) {

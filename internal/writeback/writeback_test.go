@@ -4176,6 +4176,24 @@ func TestProviderProbeIsWAFBlockRecognizesPersistedSummary(t *testing.T) {
 	}
 }
 
+func TestPauseAwarePayloadStopsAndResumes(t *testing.T) {
+	const id uint = 991
+	clearManualPause(id)
+	payload := &pauseAwarePayload{
+		LocalPayload: &memoryPayload{Reader: bytes.NewReader([]byte("abc"))},
+		id:           id,
+	}
+	requestManualPause(id)
+	buf := make([]byte, 1)
+	if _, err := payload.Read(buf); !errors.Is(err, ErrWritebackPaused) {
+		t.Fatalf("paused read error=%v, want ErrWritebackPaused", err)
+	}
+	clearManualPause(id)
+	if _, err := payload.Read(buf); err != nil {
+		t.Fatalf("resumed read failed: %v", err)
+	}
+}
+
 func TestDirectRepairUploadQueuedUsesResolutionMarker(t *testing.T) {
 	row := &model.WebDAVWritebackObject{State: StateQueued, ResolutionReason: ResolutionWAFReupload}
 	if !directRepairUploadQueued(row) {
