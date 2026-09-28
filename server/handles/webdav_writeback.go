@@ -1291,6 +1291,8 @@ func WebDAVWritebackBatchAction(c *gin.Context) {
 		} else {
 			affected, err = writeback.ReuploadNow(req.IDs)
 		}
+	case "cancel":
+		affected, err = writeback.CancelTasks(req.IDs, req.All)
 	default:
 		common.ErrorResp(c, errors.New("unsupported batch action"), http.StatusBadRequest)
 		return

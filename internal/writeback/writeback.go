@@ -67,23 +67,29 @@ var ErrWritebackPaused = errors.New("write-back paused by operator")
 
 var manualPauseRequests sync.Map
 
-func requestManualPause(ids ...uint) {
-	for _, id := range ids {
-		if id != 0 {
-			manualPauseRequests.Store(id, struct{}{})
-		}
+func requestManualPause(id uint, generation uint64) {
+	if id == 0 {
+		return
 	}
+	manualPauseRequests.Store(id, generation)
 }
 
-func clearManualPause(ids ...uint) {
-	for _, id := range ids {
+func clearManualPause(id uint, generation uint64) {
+	if id == 0 {
+		return
+	}
+	value, ok := manualPauseRequests.Load(id)
+	if !ok {
+		return
+	}
+	if generation == 0 || value == generation {
 		manualPauseRequests.Delete(id)
 	}
 }
 
-func manualPauseRequested(id uint) bool {
-	_, ok := manualPauseRequests.Load(id)
-	return ok
+func manualPauseRequested(id uint, generation uint64) bool {
+	value, ok := manualPauseRequests.Load(id)
+	return ok && value == generation
 }
 
 func clearAllManualPauseRequests() {
@@ -1796,6 +1802,7 @@ func deleteCompletedCanonical(row *model.WebDAVWritebackObject) (bool, error) {
 	updates := map[string]any{
 		"canonical_state":              CanonicalStateAcked,
 		"state":                        StateWaitingCloudSyncReupload,
+		"paused":                       false,
 		"cloud_sync_reupload_required": true,
 		"recovery_started_at":          recoveryStartedAt,
 		"retry_at":                     nil,
@@ -4053,18 +4060,19 @@ func (m *memoryPayload) Close() error {
 
 type pauseAwarePayload struct {
 	LocalPayload
-	id uint
+	id         uint
+	generation uint64
 }
 
 func (p *pauseAwarePayload) Read(buf []byte) (int, error) {
-	if manualPauseRequested(p.id) {
+	if manualPauseRequested(p.id, p.generation) {
 		return 0, ErrWritebackPaused
 	}
 	return p.LocalPayload.Read(buf)
 }
 
 func (p *pauseAwarePayload) Seek(offset int64, whence int) (int64, error) {
-	if manualPauseRequested(p.id) {
+	if manualPauseRequested(p.id, p.generation) {
 		return 0, ErrWritebackPaused
 	}
 	return p.LocalPayload.Seek(offset, whence)
@@ -8134,7 +8142,7 @@ func parkPausedUpload(row *model.WebDAVWritebackObject) {
 	if row == nil {
 		return
 	}
-	requestManualPause(row.ID)
+	requestManualPause(row.ID, row.Generation)
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
 		Updates(map[string]any{
@@ -8144,6 +8152,7 @@ func parkPausedUpload(row *model.WebDAVWritebackObject) {
 			"last_error":                   "",
 			"provider_upload_completed_at": nil,
 		}).Error
+	clearManualPause(row.ID, row.Generation)
 }
 
 func providerUploadProgressBytes(total int64, progress float64) int64 {
@@ -8267,7 +8276,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 	uploadPayload := LocalPayload(payload)
 	if row.ID != 0 {
-		uploadPayload = &pauseAwarePayload{LocalPayload: payload, id: row.ID}
+		uploadPayload = &pauseAwarePayload{LocalPayload: payload, id: row.ID, generation: row.Generation}
 	}
 	fsStream := &stream.FileStream{
 		Obj:      obj,
@@ -8337,7 +8346,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		return
 	}
 	if current.Paused {
-		requestManualPause(row.ID)
+		requestManualPause(row.ID, row.Generation)
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
 			Updates(map[string]any{
@@ -8813,7 +8822,7 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 	if res.Error != nil || res.RowsAffected == 0 {
 		return false
 	}
-	clearManualPause(row.ID)
+	clearManualPause(row.ID, row.Generation)
 	// History is deliberately best-effort and runs only after correctness state
 	// has committed. A History failure must never turn a provider success into a
 	// Cloud Sync retry.
@@ -8867,6 +8876,7 @@ func requireCloudSyncReupload(row *model.WebDAVWritebackObject, currentState, re
 	final := *row
 	final.CanonicalState = CanonicalStateAcked
 	final.State = StateWaitingCloudSyncReupload
+	final.Paused = false
 	final.CloudSyncReuploadRequired = true
 	final.RecoveryStartedAt = recoveryStartedAt
 	final.RetryAt = nil
@@ -8996,7 +9006,7 @@ func (m *workerManager) completeDirectRepairUpload(row *model.WebDAVWritebackObj
 	if res.Error != nil || res.RowsAffected == 0 {
 		return false
 	}
-	clearManualPause(row.ID)
+	clearManualPause(row.ID, row.Generation)
 
 	providerProbeCooldowns.success(row.Parent)
 	providerParentSnapshots.invalidate(row.Parent)

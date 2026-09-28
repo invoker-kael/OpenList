@@ -4178,18 +4178,30 @@ func TestProviderProbeIsWAFBlockRecognizesPersistedSummary(t *testing.T) {
 }
 
 func TestPauseAwarePayloadStopsAndResumes(t *testing.T) {
-	const id uint = 991
-	clearManualPause(id)
+	const (
+		id         uint   = 991
+		generation uint64 = 7
+	)
+	clearManualPause(id, 0)
 	payload := &pauseAwarePayload{
 		LocalPayload: &memoryPayload{Reader: bytes.NewReader([]byte("abc"))},
 		id:           id,
+		generation:   generation,
 	}
-	requestManualPause(id)
+	requestManualPause(id, generation)
 	buf := make([]byte, 1)
 	if _, err := payload.Read(buf); !errors.Is(err, ErrWritebackPaused) {
 		t.Fatalf("paused read error=%v, want ErrWritebackPaused", err)
 	}
-	clearManualPause(id)
+	newer := &pauseAwarePayload{
+		LocalPayload: &memoryPayload{Reader: bytes.NewReader([]byte("z"))},
+		id:           id,
+		generation:   generation + 1,
+	}
+	if _, err := newer.Read(buf); err != nil {
+		t.Fatalf("newer generation must not inherit the old pause request: %v", err)
+	}
+	clearManualPause(id, generation)
 	if _, err := payload.Read(buf); err != nil {
 		t.Fatalf("resumed read failed: %v", err)
 	}

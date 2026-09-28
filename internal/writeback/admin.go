@@ -328,7 +328,7 @@ func ReuploadNow(ids []uint) (int64, error) {
 			continue
 		}
 
-		clearManualPause(row.ID)
+		clearManualPause(row.ID, row.Generation)
 		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state IN ? AND is_dir = ?", row.ID, row.Generation, []string{StateQueued, StateVerifying}, false).
 			Updates(map[string]any{
@@ -381,12 +381,16 @@ func PauseTasks(ids []uint, all bool) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	var taskIDs []uint
-	if err := query.Session(&gorm.Session{}).Pluck("id", &taskIDs).Error; err != nil {
+	var rows []model.WebDAVWritebackObject
+	if err := query.Session(&gorm.Session{}).Select("id", "generation").Find(&rows).Error; err != nil {
 		return 0, err
 	}
-	if len(taskIDs) == 0 {
+	if len(rows) == 0 {
 		return 0, nil
+	}
+	taskIDs := make([]uint, 0, len(rows))
+	for i := range rows {
+		taskIDs = append(taskIDs, rows[i].ID)
 	}
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id IN ? AND state IN ?", taskIDs, []string{StateQueued, StateUploading, StateVerifying}).
@@ -394,7 +398,9 @@ func PauseTasks(ids []uint, all bool) (int64, error) {
 	if res.Error != nil {
 		return 0, res.Error
 	}
-	requestManualPause(taskIDs...)
+	for i := range rows {
+		requestManualPause(rows[i].ID, rows[i].Generation)
+	}
 	return res.RowsAffected, nil
 }
 
@@ -403,14 +409,18 @@ func ResumeTasks(ids []uint, all bool) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	var taskIDs []uint
-	if err := query.Where("paused = ?", true).Session(&gorm.Session{}).Pluck("id", &taskIDs).Error; err != nil {
+	var rows []model.WebDAVWritebackObject
+	if err := query.Where("paused = ?", true).Session(&gorm.Session{}).Select("id", "generation").Find(&rows).Error; err != nil {
 		return 0, err
 	}
-	if len(taskIDs) == 0 {
+	if len(rows) == 0 {
 		return 0, nil
 	}
-	clearManualPause(taskIDs...)
+	taskIDs := make([]uint, 0, len(rows))
+	for i := range rows {
+		taskIDs = append(taskIDs, rows[i].ID)
+		clearManualPause(rows[i].ID, rows[i].Generation)
+	}
 	now := time.Now()
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id IN ? AND state IN ?", taskIDs, []string{StateQueued, StateUploading, StateVerifying}).
@@ -440,6 +450,43 @@ func ReuploadAll() (int64, error) {
 		return 0, nil
 	}
 	return ReuploadNow(ids)
+}
+
+func CancelTasks(ids []uint, all bool) (int64, error) {
+	query, err := activeTaskScope(ids, all)
+	if err != nil {
+		return 0, err
+	}
+	var rows []model.WebDAVWritebackObject
+	if err := query.
+		Where("is_dir = ? AND cleanup_path = ''", false).
+		Find(&rows).Error; err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	var canceled int64
+	for i := range rows {
+		row := &rows[i]
+		if row.State == StateUploading {
+			requestManualPause(row.ID, row.Generation)
+		} else {
+			clearManualPause(row.ID, row.Generation)
+		}
+		if requireCloudSyncReupload(
+			row,
+			row.State,
+			ResolutionNeedsCloudSyncRehydrate,
+			"manual cancel requested; restart or rescan Cloud Sync to publish a fresh generation",
+			0,
+			false,
+		) {
+			canceled++
+		}
+	}
+	return canceled, nil
 }
 
 // VerifyNow is retained for older frontend builds. Its semantics now match the
