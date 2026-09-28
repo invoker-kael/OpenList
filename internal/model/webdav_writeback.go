@@ -23,7 +23,7 @@ type WebDAVWritebackObject struct {
 	// CanonicalState is the client-visible lifecycle. State below is retained as
 	// the provider-replication lifecycle so ACKed WebDAV identity cannot flap as
 	// the backing provider moves through queued/uploading/verifying/completed.
-	CanonicalState            string     `json:"canonical_state" gorm:"size:24"`
+	CanonicalState            string     `json:"canonical_state" gorm:"size:128"`
 	ReceiveStartedAt          *time.Time `json:"receive_started_at"`
 	AckTime                   *time.Time `json:"ack_time"`
 	DurableAt                 *time.Time `json:"durable_at"`
@@ -37,7 +37,7 @@ type WebDAVWritebackObject struct {
 	ProviderEvidenceLastAt    *time.Time `json:"provider_evidence_last_at"`
 	ProviderEvidenceCount     int        `json:"provider_evidence_count"`
 	ProviderEvidenceResult    string     `json:"provider_evidence_result" gorm:"size:32"`
-	State                     string     `json:"state" gorm:"size:32;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1;index:idx_webdav_writeback_parent_state,priority:2;index:idx_webdav_writeback_state_size,priority:1"`
+	State                     string     `json:"state" gorm:"size:128;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1;index:idx_webdav_writeback_parent_state,priority:2;index:idx_webdav_writeback_state_size,priority:1"`
 	Paused                    bool       `json:"paused" gorm:"index"`
 	SpoolPath                 string     `json:"spool_path" gorm:"type:text"`
 	PayloadSHA1               string     `json:"payload_sha1" gorm:"size:40"`
@@ -48,7 +48,7 @@ type WebDAVWritebackObject struct {
 	MimeType                  string     `json:"mime_type" gorm:"size:255"`
 	CleanupPath               string     `json:"cleanup_path" gorm:"type:text"`
 	LastError                 string     `json:"last_error" gorm:"type:text"`
-	ResolutionReason          string     `json:"resolution_reason" gorm:"size:64"`
+	ResolutionReason          string     `json:"resolution_reason" gorm:"size:128"`
 	RetryCount                int        `json:"retry_count"`
 	VerifyCount               int        `json:"verify_count"`
 	RetryAt                   *time.Time `json:"retry_at" gorm:"index;index:idx_webdav_writeback_queue,priority:2;index:idx_webdav_writeback_dispatch,priority:3"`
@@ -75,7 +75,7 @@ type WebDAVWritebackHistory struct {
 	ProviderUploadCompletedAt *time.Time `json:"provider_upload_completed_at"`
 	CompletedAt               *time.Time `json:"completed_at" gorm:"index"`
 	Result                    string     `json:"result" gorm:"size:32;index"`
-	FinalState                string     `json:"final_state" gorm:"size:32"`
+	FinalState                string     `json:"final_state" gorm:"size:128"`
 	TriggerType               string     `json:"trigger_type" gorm:"size:24;index"`
 	RecoveryType              string     `json:"recovery_type" gorm:"size:48;index"`
 	RecoveryStartedAt         *time.Time `json:"recovery_started_at"`
@@ -91,7 +91,7 @@ type WebDAVWritebackHistory struct {
 	RetryCount                int        `json:"retry_count"`
 	VerifyCount               int        `json:"verify_count"`
 	LastError                 string     `json:"last_error" gorm:"type:text"`
-	ResolutionReason          string     `json:"resolution_reason" gorm:"size:64"`
+	ResolutionReason          string     `json:"resolution_reason" gorm:"size:128"`
 	MimeType                  string     `json:"mime_type" gorm:"size:255"`
 	CreatedAt                 time.Time  `json:"created_at"`
 	UpdatedAt                 time.Time  `json:"updated_at" gorm:"index"`
@@ -173,9 +173,9 @@ type WebDAVProviderOperation struct {
 	Overwrite                     bool       `json:"overwrite"`
 	Depth                         int        `json:"depth"`
 	DestinationExisted            bool       `json:"destination_existed"`
-	State                         string     `json:"state" gorm:"size:16;index;index:idx_webdav_provider_recovery,priority:1;index:idx_webdav_provider_prepared_expiry,priority:1"`
+	State                         string     `json:"state" gorm:"size:128;index;index:idx_webdav_provider_recovery,priority:1;index:idx_webdav_provider_prepared_expiry,priority:1"`
 	RecoveryCount                 int        `json:"recovery_count"`
-	LastRecovery                  string     `json:"last_recovery" gorm:"size:24"`
+	LastRecovery                  string     `json:"last_recovery" gorm:"size:128"`
 	LastError                     string     `json:"last_error" gorm:"type:text"`
 	LastCheckedAt                 *time.Time `json:"last_checked_at" gorm:"index:idx_webdav_provider_recovery,priority:2"`
 	AppliedAt                     *time.Time `json:"applied_at"`

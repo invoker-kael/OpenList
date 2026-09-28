@@ -4208,7 +4208,7 @@ func TestPauseAwarePayloadStopsAndResumes(t *testing.T) {
 }
 
 func TestLongestWritebackStateFitsPersistedColumn(t *testing.T) {
-	const persistedStateSize = 32
+	const persistedStateSize = 128
 	states := []string{
 		StateQueued,
 		StateUploading,
