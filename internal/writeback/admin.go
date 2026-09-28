@@ -453,21 +453,37 @@ func ReuploadAll() (int64, error) {
 }
 
 func CancelTasks(ids []uint, all bool) (int64, error) {
-	query, err := activeTaskScope(ids, all)
-	if err != nil {
-		return 0, err
+	activeStates := []string{
+		StateQueued,
+		StateUploading,
+		StateVerifying,
+		StateDeleted,
+		StateWaitingCloudSyncReupload,
+		StateWaitingRepair,
+		legacyStateFailed,
 	}
+	query := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("is_dir = ? AND state IN ?", false, activeStates)
+	if !all {
+		if len(ids) == 0 {
+			return 0, fmt.Errorf("ids must not be empty when all is false")
+		}
+		query = query.Where("id IN ?", ids)
+	}
+
 	var rows []model.WebDAVWritebackObject
-	if err := query.
-		Where("is_dir = ? AND cleanup_path = ''", false).
-		Find(&rows).Error; err != nil {
+	if err := query.Find(&rows).Error; err != nil {
 		return 0, err
 	}
 	if len(rows) == 0 {
 		return 0, nil
 	}
 
-	var canceled int64
+	now := time.Now()
+	spools := make([]string, 0, len(rows))
+	parents := make(map[string]struct{}, len(rows))
+	var reset int64
+
 	for i := range rows {
 		row := &rows[i]
 		if row.State == StateUploading {
@@ -475,18 +491,59 @@ func CancelTasks(ids []uint, all bool) (int64, error) {
 		} else {
 			clearManualPause(row.ID, row.Generation)
 		}
-		if requireCloudSyncReupload(
-			row,
-			row.State,
-			ResolutionNeedsCloudSyncRehydrate,
-			"manual cancel requested; restart or rescan Cloud Sync to publish a fresh generation",
-			0,
-			false,
-		) {
-			canceled++
+		if row.SpoolPath != "" {
+			spools = append(spools, row.SpoolPath)
 		}
+		if row.Parent != "" {
+			parents[row.Parent] = struct{}{}
+		}
+
+		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ?", row.ID, row.Generation).
+			Updates(map[string]any{
+				"generation":                    row.Generation + 1,
+				"canonical_state":               CanonicalStateDeleted,
+				"state":                         StateWaitingCloudSyncReupload,
+				"paused":                        false,
+				"cloud_sync_reupload_required":  true,
+				"recovery_started_at":           &now,
+				"retry_at":                      nil,
+				"last_error":                    "",
+				"resolution_reason":             ResolutionManualCloudSyncReset,
+				"spool_path":                    "",
+				"payload_sha1":                  "",
+				"mime_type":                     "",
+				"cleanup_path":                  "",
+				"retry_count":                   0,
+				"verify_count":                  0,
+				"completed_at":                  nil,
+				"ack_time":                      nil,
+				"durable_at":                    nil,
+				"receive_started_at":            nil,
+				"remote_object_id":              "",
+				"remote_sha1":                   "",
+				"remote_generation":             0,
+				"remote_verified_at":            nil,
+				"provider_upload_started_at":    nil,
+				"provider_upload_completed_at":  nil,
+				"provider_uploaded_bytes":       0,
+				"provider_evidence_first_at":    nil,
+				"provider_evidence_last_at":     nil,
+				"provider_evidence_count":       0,
+				"provider_evidence_result":      "",
+				"restart_upload_recovery":       false,
+			})
+		if res.Error != nil {
+			return reset, res.Error
+		}
+		reset += res.RowsAffected
 	}
-	return canceled, nil
+
+	removeSpoolsIfUnreferenced(spools)
+	for parent := range parents {
+		providerParentSnapshots.invalidate(parent)
+	}
+	return reset, nil
 }
 
 // VerifyNow is retained for older frontend builds. Its semantics now match the

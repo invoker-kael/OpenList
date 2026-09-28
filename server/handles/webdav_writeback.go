@@ -643,7 +643,7 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 				writeback.StateDeleted,
 				writeback.StateWaitingCloudSyncReupload,
 				writeback.StateWaitingRepair,
-			})
+			}).Where("resolution_reason <> ? OR resolution_reason IS NULL", writeback.ResolutionManualCloudSyncReset)
 		case "all":
 		case "syncing":
 			query = query.Where("state IN ?", []string{

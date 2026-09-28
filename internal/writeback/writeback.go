@@ -47,6 +47,7 @@ const (
 	ResolutionNeedsCloudSyncRehydrate = "needs_cloudsync_rehydrate"
 	ResolutionWAFReupload             = "waf_reupload"
 	ResolutionManualReupload          = "manual_reupload"
+	ResolutionManualCloudSyncReset    = "manual_cloudsync_reset"
 
 	CanonicalStateAcked     = "durable_acked"
 	canonicalStateLegacyAck = "acked"
@@ -6768,12 +6769,22 @@ func (m *workerManager) recoverInterrupted() error {
 		return err
 	}
 	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("state = ?", StateWaitingCloudSyncReupload).
+		Where("state = ? AND (resolution_reason <> ? OR resolution_reason IS NULL)", StateWaitingCloudSyncReupload, ResolutionManualCloudSyncReset).
 		Updates(map[string]any{
 			"canonical_state":              CanonicalStateAcked,
 			"cloud_sync_reupload_required": true,
 			"retry_at":                     nil,
 			"recovery_started_at":          gorm.Expr("COALESCE(recovery_started_at, updated_at, created_at)"),
+		}).Error; err != nil {
+		return err
+	}
+	if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("state = ? AND resolution_reason = ?", StateWaitingCloudSyncReupload, ResolutionManualCloudSyncReset).
+		Updates(map[string]any{
+			"canonical_state":              CanonicalStateDeleted,
+			"cloud_sync_reupload_required": true,
+			"paused":                       false,
+			"retry_at":                     nil,
 		}).Error; err != nil {
 		return err
 	}
@@ -8247,6 +8258,10 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	defer func() {
 		releaseActiveSpool()
 		_ = payload.Close()
+		clearManualPause(row.ID, row.Generation)
+		if row.SpoolPath != "" {
+			removeSpoolIfUnreferenced(row.SpoolPath)
+		}
 	}()
 
 	uploadStartedAt := time.Now()

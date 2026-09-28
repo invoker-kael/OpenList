@@ -4207,6 +4207,21 @@ func TestPauseAwarePayloadStopsAndResumes(t *testing.T) {
 	}
 }
 
+func TestManualCloudSyncResetRemainsClientInvisible(t *testing.T) {
+	row := &model.WebDAVWritebackObject{
+		CanonicalState:            CanonicalStateDeleted,
+		State:                     StateWaitingCloudSyncReupload,
+		CloudSyncReuploadRequired: true,
+		ResolutionReason:          ResolutionManualCloudSyncReset,
+	}
+	if !canonicalDeleted(row) {
+		t.Fatal("manual Cloud Sync reset must remain a canonical tombstone")
+	}
+	if !waitingCloudSyncReupload(row) {
+		t.Fatal("manual Cloud Sync reset must remain a rehydrate state")
+	}
+}
+
 func TestDirectRepairUploadQueuedUsesResolutionMarker(t *testing.T) {
 	row := &model.WebDAVWritebackObject{State: StateQueued, ResolutionReason: ResolutionWAFReupload}
 	if !directRepairUploadQueued(row) {
