@@ -19,7 +19,7 @@ jobs:
       - name: Checkout validated source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: de7282e51c61bc6613ddd31c9610f0e44c07dca8
+          ref: 4daf0b13d5dbb05439bc752bfaac584c042f7238
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
@@ -38,10 +38,10 @@ jobs:
           platforms: linux/amd64
           build-args: |
             FRONTEND_REPO=invoker-kael/OpenList-Frontend
-            FRONTEND_REF=da45270dd0864cf97d73872eb2305c35e1b4eaac
+            FRONTEND_REF=1cd120bb3b423be242c24501e824a56efd1ba99b
             FRONTEND_I18N_URL=https://github.com/OpenListTeam/OpenList-Frontend/releases/download/v4.2.6/i18n.tar.gz
           push: true
           tags: |
             invokerkael/openlist:cloudsync-writeback
-            invokerkael/openlist:de7282e-uida45270
+            invokerkael/openlist:4daf0b1-ui1cd120b
           provenance: false
