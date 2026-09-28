@@ -127,6 +127,64 @@ func TestHistoryCleanupCannotTouchCanonicalOrSpoolState(t *testing.T) {
 	}
 }
 
+func TestSuccessfulHistoryCleanupAllowsImmediateCleanup(t *testing.T) {
+	database := historyTestDB(t)
+	row := model.WebDAVWritebackHistory{
+		PathKey: "plain-now", Path: "/plain-now", Generation: 1,
+		Result: HistoryResultCompleted, FinalState: StateCompleted,
+	}
+	if err := database.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := CleanupHistory(database, HistoryCleanupSpec{Class: "successful"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted=%d, want 1", deleted)
+	}
+}
+
+func TestAllHistoryCleanupDeletesEveryClass(t *testing.T) {
+	database := historyTestDB(t)
+	rows := []model.WebDAVWritebackHistory{
+		{PathKey: "plain-all", Path: "/plain", Generation: 1, Result: HistoryResultCompleted, FinalState: StateCompleted},
+		{PathKey: "recovery-all", Path: "/recovery", Generation: 1, Result: HistoryResultRecoveryRequired, FinalState: StateWaitingCloudSyncReupload, RecoveryType: HistoryRecoveryRestart},
+		{PathKey: "error-all", Path: "/error", Generation: 1, Result: HistoryResultRecoveryRequired, FinalState: StateWaitingRepair, LastError: "boom"},
+	}
+	if err := database.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := CleanupHistory(database, HistoryCleanupSpec{Class: "all"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != int64(len(rows)) {
+		t.Fatalf("deleted=%d, want %d", deleted, len(rows))
+	}
+}
+
+func TestHistoryCleanupAgeUsesCompletionTime(t *testing.T) {
+	database := historyTestDB(t)
+	oldCompleted := time.Now().Add(-90 * 24 * time.Hour)
+	recentUpdate := time.Now()
+	row := model.WebDAVWritebackHistory{
+		PathKey: "completion-age", Path: "/completion-age", Generation: 1,
+		Result: HistoryResultCompleted, FinalState: StateCompleted,
+		CompletedAt: &oldCompleted, UpdatedAt: recentUpdate,
+	}
+	if err := database.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := CleanupHistory(database, HistoryCleanupSpec{Class: "successful", OlderThanDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted=%d, want completion-aged row removed", deleted)
+	}
+}
+
 func TestSuccessfulHistoryCleanupPreservesRecoveryEvidence(t *testing.T) {
 	database := historyTestDB(t)
 	old := time.Now().Add(-90 * 24 * time.Hour)

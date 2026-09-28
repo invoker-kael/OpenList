@@ -309,10 +309,9 @@ func CleanupHistory(database *gorm.DB, spec HistoryCleanupSpec) (int64, error) {
 		query = query.Where("id IN ?", spec.IDs)
 	} else {
 		switch strings.ToLower(strings.TrimSpace(spec.Class)) {
+		case "all":
+			// Intentionally no class filter.
 		case "successful":
-			if spec.OlderThanDays <= 0 {
-				return 0, errors.New("successful history cleanup requires older_than_days > 0")
-			}
 			query = query.
 				Where("result IN ?", []string{HistoryResultCompleted, HistoryResultDeleted}).
 				Where("(recovery_type = '' OR recovery_type IS NULL)")
@@ -327,7 +326,7 @@ func CleanupHistory(database *gorm.DB, spec HistoryCleanupSpec) (int64, error) {
 		}
 		if spec.OlderThanDays > 0 {
 			cutoff := time.Now().Add(-time.Duration(spec.OlderThanDays) * 24 * time.Hour)
-			query = query.Where("updated_at < ?", cutoff)
+			query = query.Where("COALESCE(completed_at, updated_at, created_at) < ?", cutoff)
 		}
 	}
 	res := query.Delete(&model.WebDAVWritebackHistory{})

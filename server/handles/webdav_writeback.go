@@ -1214,16 +1214,15 @@ func WebDAVWritebackHistoryCleanup(c *gin.Context) {
 	class := strings.ToLower(strings.TrimSpace(req.Class))
 	if len(req.IDs) == 0 {
 		switch class {
-		case "successful":
-			if req.OlderThanDays <= 0 {
-				common.ErrorResp(c, errors.New("successful history cleanup requires older_than_days > 0"), http.StatusBadRequest)
-				return
-			}
-		case "recovery", "error", "remote_missing":
+		case "all", "successful", "recovery", "error", "remote_missing":
 		default:
 			common.ErrorResp(c, errors.New("select history rows or choose a supported cleanup class"), http.StatusBadRequest)
 			return
 		}
+	}
+	if req.OlderThanDays < 0 {
+		common.ErrorResp(c, errors.New("older_than_days must be >= 0"), http.StatusBadRequest)
+		return
 	}
 	deleted, err := writeback.CleanupHistory(db.GetDb(), writeback.HistoryCleanupSpec{
 		IDs:           req.IDs,
