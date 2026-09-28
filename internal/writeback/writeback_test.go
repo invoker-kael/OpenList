@@ -4207,6 +4207,25 @@ func TestPauseAwarePayloadStopsAndResumes(t *testing.T) {
 	}
 }
 
+func TestLongestWritebackStateFitsPersistedColumn(t *testing.T) {
+	const persistedStateSize = 32
+	states := []string{
+		StateQueued,
+		StateUploading,
+		StateVerifying,
+		StateCompleted,
+		StateDeleted,
+		StateWaitingCloudSyncReupload,
+		StateWaitingRepair,
+		StateLockNull,
+	}
+	for _, state := range states {
+		if len(state) > persistedStateSize {
+			t.Fatalf("state %q length=%d exceeds persisted width=%d", state, len(state), persistedStateSize)
+		}
+	}
+}
+
 func TestManualCloudSyncResetRemainsClientInvisible(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
 		CanonicalState:            CanonicalStateDeleted,

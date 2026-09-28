@@ -37,7 +37,7 @@ type WebDAVWritebackObject struct {
 	ProviderEvidenceLastAt    *time.Time `json:"provider_evidence_last_at"`
 	ProviderEvidenceCount     int        `json:"provider_evidence_count"`
 	ProviderEvidenceResult    string     `json:"provider_evidence_result" gorm:"size:32"`
-	State                     string     `json:"state" gorm:"size:24;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1;index:idx_webdav_writeback_parent_state,priority:2;index:idx_webdav_writeback_state_size,priority:1"`
+	State                     string     `json:"state" gorm:"size:32;index;index:idx_webdav_writeback_queue,priority:1;index:idx_webdav_writeback_completed,priority:1;index:idx_webdav_writeback_dispatch,priority:1;index:idx_webdav_writeback_parent_state,priority:2;index:idx_webdav_writeback_state_size,priority:1"`
 	Paused                    bool       `json:"paused" gorm:"index"`
 	SpoolPath                 string     `json:"spool_path" gorm:"type:text"`
 	PayloadSHA1               string     `json:"payload_sha1" gorm:"size:40"`
@@ -75,7 +75,7 @@ type WebDAVWritebackHistory struct {
 	ProviderUploadCompletedAt *time.Time `json:"provider_upload_completed_at"`
 	CompletedAt               *time.Time `json:"completed_at" gorm:"index"`
 	Result                    string     `json:"result" gorm:"size:32;index"`
-	FinalState                string     `json:"final_state" gorm:"size:24"`
+	FinalState                string     `json:"final_state" gorm:"size:32"`
 	TriggerType               string     `json:"trigger_type" gorm:"size:24;index"`
 	RecoveryType              string     `json:"recovery_type" gorm:"size:48;index"`
 	RecoveryStartedAt         *time.Time `json:"recovery_started_at"`
