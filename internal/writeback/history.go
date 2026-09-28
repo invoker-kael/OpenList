@@ -310,7 +310,8 @@ func CleanupHistory(database *gorm.DB, spec HistoryCleanupSpec) (int64, error) {
 	} else {
 		switch strings.ToLower(strings.TrimSpace(spec.Class)) {
 		case "all":
-			// Intentionally no class filter.
+			// Keep an explicit predicate so GORM's global-delete guard remains enabled.
+			query = query.Where("id > 0")
 		case "successful":
 			query = query.
 				Where("result IN ?", []string{HistoryResultCompleted, HistoryResultDeleted}).
