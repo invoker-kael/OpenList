@@ -87,30 +87,29 @@ func TestRestartRequiredFieldsOnlyCoversWorkerTopologyAndEnablement(t *testing.T
 	}
 }
 
-func TestCompletedSpoolReleaseSafeProtectsActiveAndUnverifiedPayloads(t *testing.T) {
+func TestCompletedSpoolReleaseSafeProtectsActiveAndUnacceptedPayloads(t *testing.T) {
 	now := time.Now()
 	completed := now.Add(-time.Minute)
-	verified := now.Add(-30 * time.Second)
+	uploaded := now.Add(-30 * time.Second)
 	row := &model.WebDAVWritebackObject{
-		Generation:       2,
-		RemoteGeneration: 2,
-		State:            StateCompleted,
-		SpoolPath:        "/tmp/current.data",
-		CompletedAt:      &completed,
-		RemoteVerifiedAt: &verified,
-		Size:             1024,
+		Generation:                2,
+		State:                     StateCompleted,
+		SpoolPath:                 "/tmp/current.data",
+		CompletedAt:               &completed,
+		ProviderUploadCompletedAt: &uploaded,
+		Size:                      1024,
 	}
 	if !completedSpoolReleaseSafe(row, now) {
-		t.Fatal("verified idle completed cache should be releasable")
+		t.Fatal("provider-accepted idle completed cache should be releasable")
 	}
 	release := markSpoolActive(row.SpoolPath)
 	if completedSpoolReleaseSafe(row, now) {
 		t.Fatal("active worker spool must never be releasable")
 	}
 	release()
-	row.RemoteVerifiedAt = nil
+	row.ProviderUploadCompletedAt = nil
 	if completedSpoolReleaseSafe(row, now) {
-		t.Fatal("completed cache without provider evidence must never be releasable")
+		t.Fatal("completed cache without provider PUT completion must never be releasable")
 	}
 }
 
