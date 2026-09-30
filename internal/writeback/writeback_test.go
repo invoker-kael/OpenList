@@ -3509,20 +3509,19 @@ func TestFreshParentCompletedEvidenceBatchIsBounded(t *testing.T) {
 	}
 }
 
-func TestCompletedSpoolReleaseEligibleRequiresVerifiedCurrentGeneration(t *testing.T) {
+func TestCompletedSpoolReleaseEligibleRequiresAcceptedProviderUpload(t *testing.T) {
 	now := time.Now()
 	completed := now.Add(-time.Minute)
-	verified := now.Add(-30 * time.Second)
+	uploaded := now.Add(-30 * time.Second)
 	base := &model.WebDAVWritebackObject{
-		Generation:       7,
-		RemoteGeneration: 7,
-		State:            StateCompleted,
-		SpoolPath:        "/spool/current.data",
-		CompletedAt:      &completed,
-		RemoteVerifiedAt: &verified,
+		Generation:                7,
+		State:                     StateCompleted,
+		SpoolPath:                 "/spool/current.data",
+		CompletedAt:               &completed,
+		ProviderUploadCompletedAt: &uploaded,
 	}
 	if !completedSpoolReleaseEligible(base, now) {
-		t.Fatal("verified current-generation completed spool should be releasable")
+		t.Fatal("provider-accepted completed spool should be releasable without remote verification")
 	}
 
 	cases := []struct {
@@ -3533,8 +3532,7 @@ func TestCompletedSpoolReleaseEligibleRequiresVerifiedCurrentGeneration(t *testi
 		{"missing spool path", func(r *model.WebDAVWritebackObject) { r.SpoolPath = "" }},
 		{"missing completion", func(r *model.WebDAVWritebackObject) { r.CompletedAt = nil }},
 		{"completion newer than cutoff", func(r *model.WebDAVWritebackObject) { future := now.Add(time.Minute); r.CompletedAt = &future }},
-		{"missing provider verification", func(r *model.WebDAVWritebackObject) { r.RemoteVerifiedAt = nil }},
-		{"stale provider generation", func(r *model.WebDAVWritebackObject) { r.RemoteGeneration = r.Generation - 1 }},
+		{"missing provider upload completion", func(r *model.WebDAVWritebackObject) { r.ProviderUploadCompletedAt = nil }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -4252,7 +4250,7 @@ func TestDirectRepairUploadQueuedUsesResolutionMarker(t *testing.T) {
 	}
 	row.ResolutionReason = ""
 	if directRepairUploadQueued(row) {
-		t.Fatal("ordinary queued row must keep the normal retry verification path")
+		t.Fatal("ordinary queued row must not be marked as a special direct-recovery upload")
 	}
 }
 

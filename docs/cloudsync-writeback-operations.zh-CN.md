@@ -42,7 +42,7 @@
 
 ## 2. 为什么 Cloud Sync 显示“完成”，OpenList 仍可能继续工作
 
-Durable Write-back 将客户端成功和远端复制成功分开：
+Durable Write-back 仍然把客户端成功和远端复制解耦，但正常 Provider 上传成功后**不再追加 LIST/GET/Hash 验证任务**：
 
 ```text
 Cloud Sync PUT
@@ -54,31 +54,22 @@ OpenList 完整接收请求体
 fsync + 本地持久 spool
     |
     v
-canonical metadata 提交到服务端数据库
+canonical metadata 提交到 MySQL
     |
     v
 HTTP 201/204 返回给 Cloud Sync
     |
-    +------ Cloud Sync 此时可能显示“完成”
-    |
     v
-OpenList 后台 worker
+OpenList 后台上传到 Provider
     |
-    +--> 上传到 provider
-    +--> provider 验证
-    +--> 必要时自动重试和恢复
+    +--> PUT 成功 -> COMPLETED
+    |
+    +--> PUT 失败 -> retry_at/backoff -> 直接重新 PUT
 ```
 
-WebDAV PUT 成功表示：
+因此 Cloud Sync 的“完成”仍表示 OpenList 已经 Durable ACK，不代表 115 已立即完成；但 OP 的正常后台链路现在只有“排队 -> 上传 -> 完成/重试”，不会再因为正常验证任务堆积而阻塞上传。
 
-- 文件已经完整、持久地落到本地；
-- canonical path、size、mtime、ETag 已经提交；
-- 不需要因为远端速度慢而让 Cloud Sync 重发整个文件。
-
-它**不表示**远端 provider 已经完成上传和验证。
-
-这是有意设计，用来避免大文件因为远端最终一致性或速度问题产生重复上传。
-
+只有**不确定恢复场景**才保留远端检查，例如 OpenList 在上传中途重启、durable spool 丢失、或 MOVE/DELETE 恢复需要判断远端结果时。
 
 ## 3. 用户看到的状态与进度
 
@@ -87,7 +78,7 @@ WebDAV PUT 成功表示：
 | 用户状态 | 含义 | 操作 |
 |---|---|---|
 | **接收中** | Cloud Sync 正在把 PUT 数据发送给 OpenList | 无 |
-| **后台同步中** | OpenList 已持久化数据，正在排队、上传、验证或自动恢复 provider 副本 | 无 |
+| **后台同步中** | OpenList 已持久化数据，正在排队、上传或自动恢复 provider 副本 | 无 |
 | **等待 Cloud Sync 重传** | 旧 generation 已无法安全自动收敛，需要 Cloud Sync 重新 PUT | 完整停止/停用后重新启动/启用同一个 Cloud Sync 任务 |
 | **已删除** | 删除生命周期 | 无 |
 
@@ -96,7 +87,7 @@ WebDAV PUT 成功表示：
 **进度**列只显示真实进度：
 - 接收中：Cloud Sync 已发送字节 / PUT 声明大小。
 - Provider 上传中：OpenList storage driver 原生上传进度回调。
-- 排队、验证阶段：不伪造百分比。
+- 排队、重试等待和异常恢复检查阶段：不伪造百分比。
 
 ### 历史记录
 
@@ -110,7 +101,7 @@ WebDAV PUT 成功表示：
 
 ## 4. 正常自动恢复
 
-正常自愈路径：
+普通 Provider 错误采用“失败即退避重传”，不再先进入验证队列：
 
 ```text
 queued
@@ -118,39 +109,19 @@ queued
   v
 uploading
   |
-  +---- provider 临时失败
-  |           |
-  |           v
-  |      queued + retry_at
-  |           |
-  |           +---- 自动重试
+  +---- PUT 成功 ------> completed
   |
-  v
-verifying
-  |
-  +---- provider 证据不足
-  |           |
-  |           v
-  | waiting_provider_verification
-  |           |
-  |           +---- 重新获取新证据
-  |
-  v
-completed
+  +---- PUT 失败
+          |
+          v
+      queued + retry_at
+          |
+          +---- backoff 到期后直接重新上传
 ```
 
-以下情况正常都不需要操作 Cloud Sync：
+这适用于 115/API/网络临时失败、upload token 失败、限流和普通 5xx。只要 durable spool 仍存在，OpenList 自己负责重传，Cloud Sync 不需要重新发送整个文件。
 
-- 115/API/网络临时失败；
-- upload token 获取失败；
-- durable spool 仍存在时的 provider PUT 失败；
-- `uploading` 期间 OpenList 重启；
-- provider metadata 暂时陈旧或不完整；
-- 第一次发现 provider divergence；
-- verification 等待或重试窗口；
-- 尚未形成明确丢失结论的远端 list/get 不一致。
-
-不要为了让状态“快一点”而反复停止或启动 Cloud Sync。
+异常恢复检查只用于“Provider 结果不确定而不能安全直接判断”的场景，例如进程在 UPLOADING 中崩溃或本地 spool 已缺失。
 
 ## 5. `missing_spool`：先让 OpenList 自己恢复
 
@@ -224,7 +195,7 @@ deleted + recovery_state=needs_cloudsync_rehydrate
 
 ## 8. Provider 错误处理
 
-只要 OpenList 仍保留 durable payload，provider 错误就应该由 OpenList 负责：
+只要 OpenList 仍保留 durable payload，Provider 错误直接进入重传：
 
 ```text
 provider PUT error
@@ -233,30 +204,22 @@ provider PUT error
 持久化 last_error + retry_count + retry_at
     |
     v
-自动重试或验证
+等待 backoff
     |
     v
-completed
+重新 PUT
+    |
+    +--> 成功 -> completed
+    +--> 失败 -> 下一次 backoff
 ```
 
-常见例子：
-
-- 115 upload init 失败；
-- sign-check 或 range 错误；
-- upload token 错误；
-- multipart upload 失败；
-- remote verification 失败；
-- 临时 rate limit 或网络错误。
-
-只要 spool 仍存在，这些错误都不应该要求 Cloud Sync 重新发送整个文件。
-
-当前版本也会把 provider retry 上下文和 worker panic stack 写入 OpenList 日志，方便定位问题。
+405/429/5xx 等 Provider/WAF 错误仍使用冷却时间，冷却结束后直接重新上传，不再先执行远端验证。只有 spool 丢失、重启中断等不确定恢复场景才调用 Provider 探测。
 
 常用日志过滤：
 
 ```bash
 docker logs op --since 2h 2>&1 | grep -E \
-'write-back worker panic|write-back provider retry|write-back delete retry|115 Open'
+'write-back worker panic|write-back provider retry|115 Open'
 ```
 
 ## 9. OpenList 重启行为

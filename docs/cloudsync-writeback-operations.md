@@ -40,41 +40,36 @@ This design targets **one-way Synology Cloud Sync upload/backup to WebDAV/OpenLi
 
 115 Open is the primary validated provider. Other OpenList drivers can use the same flow, but provider verification capability may differ.
 
-## 2. Why Cloud Sync can show "Completed" while OpenList is still working
+## 2. Why Cloud Sync can be “done” while OpenList is still working
 
-Durable Write-back separates client success from provider replication success:
+Durable Write-back still separates client success from provider replication, but a normal successful provider PUT **no longer schedules LIST/GET/hash verification**:
 
 ```text
 Cloud Sync PUT
     |
     v
-OpenList receives the complete request body
+OpenList receives the full request body
     |
     v
 fsync + durable local spool
     |
     v
-canonical metadata committed to the server database
+canonical metadata committed to MySQL
     |
     v
 HTTP 201/204 returned to Cloud Sync
     |
-    +------ Cloud Sync may show "Completed"
-    |
     v
-OpenList background worker
+OpenList uploads to the provider in the background
     |
-    +--> provider upload
-    +--> provider verification
-    +--> automatic retry/recovery when needed
+    +--> PUT succeeds -> COMPLETED
+    |
+    +--> PUT fails -> retry_at/backoff -> direct PUT retry
 ```
 
-A successful WebDAV PUT means the complete payload has been durably accepted locally and the canonical path, size, mtime, and ETag have been committed.
+Cloud Sync completion still means the object is durably accepted by OpenList, not that 115 has already finished. The normal provider lifecycle is now only queue -> upload -> complete/retry, so routine verification work cannot accumulate and starve uploads.
 
-It does **not** mean the backing provider has already completed upload and verification.
-
-This separation is intentional. It prevents a slow or eventually consistent provider from forcing Cloud Sync to retransmit large files unnecessarily.
-
+Remote checks remain only for uncertain recovery cases such as a process restart during UPLOADING, a missing durable spool, or MOVE/DELETE recovery that must determine the remote outcome.
 
 ## 3. User-facing states and progress
 
@@ -106,7 +101,7 @@ Transient states such as receiving/uploading/verifying are not History final sta
 
 ## 4. Normal automatic recovery
 
-The expected self-healing path is:
+Ordinary provider failures now use “fail, back off, and re-upload” without entering a verification queue first:
 
 ```text
 queued
@@ -114,39 +109,19 @@ queued
   v
 uploading
   |
-  +---- transient provider failure
-  |           |
-  |           v
-  |      queued + retry_at
-  |           |
-  |           +---- automatic retry
+  +---- PUT succeeds ----> completed
   |
-  v
-verifying
-  |
-  +---- provider evidence inconclusive
-  |           |
-  |           v
-  | waiting_provider_verification
-  |           |
-  |           +---- fresh verification
-  |
-  v
-completed
+  +---- PUT fails
+          |
+          v
+      queued + retry_at
+          |
+          +---- direct re-upload after backoff
 ```
 
-Examples that should normally self-heal without touching Cloud Sync:
+This covers temporary 115/API/network failures, upload-token failures, rate limiting, and ordinary 5xx responses. As long as the durable spool still exists, OpenList owns the retry and Cloud Sync does not need to resend the file.
 
-- temporary 115/API/network failures;
-- upload-token failures;
-- provider PUT failure while the durable spool remains available;
-- OpenList restart during `uploading`;
-- temporarily stale or incomplete provider metadata;
-- first observation of a provider divergence;
-- verification retry windows;
-- remote list/get inconsistencies that have not reached a conclusive loss decision.
-
-Do not stop/start Cloud Sync merely to make these states move faster.
+Recovery checks are reserved for uncertain outcomes where OpenList cannot safely infer the provider state, such as a crash while UPLOADING or a missing local spool.
 
 ## 5. `missing_spool`: let OpenList recover first
 
@@ -220,7 +195,7 @@ The admin UI and API should therefore prioritize Recovery State instead of expec
 
 ## 8. Provider error handling
 
-When OpenList still has a durable payload, provider errors belong to OpenList:
+As long as OpenList still has the durable payload, provider errors go directly back to upload retry:
 
 ```text
 provider PUT error
@@ -229,30 +204,22 @@ provider PUT error
 persist last_error + retry_count + retry_at
     |
     v
-automatic retry / verification
+wait for backoff
     |
     v
-completed
+PUT again
+    |
+    +--> success -> completed
+    +--> failure -> next backoff
 ```
 
-Examples include:
+Provider/WAF responses such as 405, 429, and 5xx still use a cooldown, but once the cooldown expires OpenList re-uploads directly instead of probing first. Provider probes are reserved for uncertain restart or missing-spool recovery.
 
-- 115 upload-initialization errors;
-- sign-check or range errors;
-- upload-token errors;
-- multipart upload failures;
-- remote verification failures;
-- temporary rate-limit or network failures.
-
-As long as the spool is still available, these errors should not require Cloud Sync to retransmit the entire file.
-
-The current build also logs provider retry context and worker panic stacks to the OpenList log for diagnosis.
-
-Useful filter:
+Useful log filter:
 
 ```bash
 docker logs op --since 2h 2>&1 | grep -E \
-'write-back worker panic|write-back provider retry|write-back delete retry|115 Open'
+'write-back worker panic|write-back provider retry|115 Open'
 ```
 
 ## 9. Restart behavior

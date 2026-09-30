@@ -206,7 +206,7 @@ func WebDAVWritebackMonitorSummary(c *gin.Context) {
 	if err := db.GetDb().
 		Model(&model.WebDAVWritebackObject{}).
 		Where("state = ? AND spool_path <> ''", writeback.StateCompleted).
-		Where("remote_verified_at IS NOT NULL AND remote_generation = generation").
+		Where("provider_upload_completed_at IS NOT NULL").
 		Select("COALESCE(SUM(size), 0)").
 		Scan(&completedCacheBytes).Error; err != nil {
 		common.ErrorResp(c, err, http.StatusInternalServerError)
@@ -468,10 +468,9 @@ func webDAVCurrentEffectiveStatus(row *model.WebDAVWritebackObject) (string, str
 	case writeback.StateUploading:
 		return webDAVStatusRemoteUploading, webDAVActionWait
 	case writeback.StateVerifying:
-		if row.VerifyCount > 0 || row.LastError != "" {
-			return webDAVStatusRemoteVerifying, webDAVActionRetryingAutomatically
-		}
-		return webDAVStatusRemoteVerifying, webDAVActionWait
+		// VERIFYING is now an exceptional recovery check only. Normal successful
+		// provider PUTs transition directly to COMPLETED.
+		return webDAVStatusAutomaticRecovery, webDAVActionRetryingAutomatically
 	case writeback.StateCompleted:
 		return webDAVStatusCompleted, webDAVActionNone
 	default:
@@ -1247,7 +1246,7 @@ func WebDAVWritebackReuploadNow(c *gin.Context) {
 		return
 	}
 	if len(req.IDs) == 0 {
-		common.ErrorResp(c, errors.New("select at least one queued or verifying file"), http.StatusBadRequest)
+		common.ErrorResp(c, errors.New("select at least one queued or recovery-check file"), http.StatusBadRequest)
 		return
 	}
 	scheduled, err := writeback.ReuploadNow(req.IDs)
