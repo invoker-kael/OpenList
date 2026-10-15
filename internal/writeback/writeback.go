@@ -2836,7 +2836,7 @@ func receiveReservationProgressBytes(expected, received int64) uint64 {
 
 func pendingBacklogState(state string) bool {
 	switch state {
-	case StateQueued, legacyStateFailed, StateUploading, StateVerifying:
+	case StateQueued, StateUploading, StateVerifying:
 		return true
 	default:
 		return false
@@ -2848,7 +2848,7 @@ func pendingSpoolBacklogBytes(tx *gorm.DB, excludePath string) (uint64, error) {
 		Bytes int64 `gorm:"column:bytes"`
 	}
 	query := tx.Model(&model.WebDAVWritebackObject{}).
-		Where("state IN ?", []string{StateQueued, legacyStateFailed, StateUploading, StateVerifying})
+		Where("state IN ?", []string{StateQueued, StateUploading, StateVerifying})
 	if excludePath == "" {
 		query = query.Select("COALESCE(SUM(CASE WHEN spool_path = '' THEN 0 ELSE size END), 0) AS bytes")
 	} else {
@@ -7335,9 +7335,6 @@ func loadDispatchRows(now time.Time, workers, budget int, excludedIDs map[uint]s
 	rows := make([]model.WebDAVWritebackObject, 0, budget)
 	remaining := budget
 
-	loadClass := func(states []string, dir *bool) ([]model.WebDAVWritebackObject, error) {
-		return loadDispatchClass(now, states, dir, excludedIDs, min(remaining, classLimit))
-	}
 
 	deleteScanLimit := max(min(remaining, classLimit), min(classLimit*4, max(remaining, workers*4)))
 	deleted, err := loadDispatchClass(now, []string{StateDeleted}, nil, excludedIDs, deleteScanLimit)
@@ -8575,33 +8572,15 @@ const (
 	restartUploadVerificationWindow       = time.Minute
 )
 
-func verificationAttemptsFor(row *model.WebDAVWritebackObject, requireHash bool) int {
-	attempts := max(1, conf.Conf.WebDAVWriteback.VerifyAttempts)
-	intervalSeconds := max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)
-	if row != nil && requireHash && row.Size > open115MultipartChunkSize {
-		minWindowSeconds := max(intervalSeconds, conf.Conf.WebDAVWriteback.RetryMaxSeconds)
-		minAttempts := (minWindowSeconds + intervalSeconds - 1) / intervalSeconds
-		attempts = max(attempts, minAttempts)
-	}
-	if row != nil && row.RestartUploadRecovery {
-		windowSeconds := max(intervalSeconds, int(restartUploadVerificationWindow/time.Second))
-		restartAttempts := max(2, (windowSeconds+intervalSeconds-1)/intervalSeconds)
-		attempts = min(attempts, restartAttempts)
-	}
-	return attempts
+func verificationAttemptsFor(_ *model.WebDAVWritebackObject, _ bool) int {
+	return max(1, conf.Conf.WebDAVWriteback.VerifyAttempts)
 }
 
 func remoteVerificationInconclusiveDelay() time.Duration {
-	verifySeconds := 1
-	retrySeconds := 1
+	seconds := 1
 	if conf.Conf != nil {
-		verifySeconds = max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)
-		retrySeconds = max(1, conf.Conf.WebDAVWriteback.RetryInitialSeconds)
+		seconds = max(1, conf.Conf.WebDAVWriteback.VerifyIntervalSeconds)
 	}
-	// Inconclusive evidence cannot justify another upload. Poll it less
-	// aggressively than the normal post-upload visibility window while keeping
-	// a bounded cadence for providers that eventually populate hashes.
-	seconds := max(verifySeconds, min(retrySeconds, 30))
 	return time.Duration(seconds) * time.Second
 }
 
