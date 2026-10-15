@@ -6293,18 +6293,18 @@ func InvalidateProviderSnapshots(parents ...string) {
 }
 
 type workerManager struct {
-	ctx            context.Context
-	cancel         context.CancelFunc
-	stop           chan struct{}
-	wake           chan struct{}
-	jobs           chan workerJob
-	uploads        chan struct{}
-	largeUploads   chan struct{}
+	ctx               context.Context
+	cancel            context.CancelFunc
+	stop              chan struct{}
+	wake              chan struct{}
+	jobs              chan workerJob
+	uploads           chan struct{}
+	largeUploads      chan struct{}
 	providerProbes    chan struct{}
 	verificationSlots chan struct{}
 	inflight          sync.Map
-	batchCompleted sync.Map
-	wg             sync.WaitGroup
+	batchCompleted    sync.Map
+	wg                sync.WaitGroup
 }
 
 func currentProviderProbeSlots() chan struct{} {
@@ -6496,13 +6496,13 @@ func Start() {
 		providerProbes = make(chan struct{}, providerProbeWorkers)
 	}
 	m := &workerManager{
-		ctx:            workerCtx,
-		cancel:         cancel,
-		stop:           make(chan struct{}),
-		wake:           make(chan struct{}, 1),
-		jobs:           make(chan workerJob, max(4, workers*4)),
-		uploads:        uploads,
-		largeUploads:   largeUploads,
+		ctx:               workerCtx,
+		cancel:            cancel,
+		stop:              make(chan struct{}),
+		wake:              make(chan struct{}, 1),
+		jobs:              make(chan workerJob, max(4, workers*4)),
+		uploads:           uploads,
+		largeUploads:      largeUploads,
 		providerProbes:    providerProbes,
 		verificationSlots: make(chan struct{}, providerProbeWorkers),
 	}
@@ -7334,7 +7334,6 @@ func loadDispatchRows(now time.Time, workers, budget int, excludedIDs map[uint]s
 	isFile := false
 	rows := make([]model.WebDAVWritebackObject, 0, budget)
 	remaining := budget
-
 
 	deleteScanLimit := max(min(remaining, classLimit), min(classLimit*4, max(remaining, workers*4)))
 	deleted, err := loadDispatchClass(now, []string{StateDeleted}, nil, excludedIDs, deleteScanLimit)

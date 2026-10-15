@@ -1554,7 +1554,6 @@ func TestMarkCanonicalAckedStampsCurrentTakeover(t *testing.T) {
 	}
 }
 
-
 func TestCanonicalStateSeparatesClientAckFromReplication(t *testing.T) {
 	for _, state := range []string{StateQueued, StateUploading, StateVerifying, StateCompleted} {
 		row := &model.WebDAVWritebackObject{State: state}
@@ -2131,7 +2130,6 @@ func TestPendingDirectoryMoveLocalAuthority(t *testing.T) {
 		t.Fatal("completed directory without completion evidence must not use local fast MOVE")
 	}
 }
-
 
 func TestPendingBacklogState(t *testing.T) {
 	for _, state := range []string{StateQueued, StateUploading, StateVerifying} {
@@ -2953,7 +2951,6 @@ func TestCloudSyncInconclusiveVerificationNeverConsumesReuploadBudget(t *testing
 	}
 }
 
-
 func TestVerificationAttemptsUseConfiguredFailureThreshold(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = &conf.Config{
@@ -2992,7 +2989,6 @@ func TestProviderRepairInconclusiveNeverRetransmitsImmediately(t *testing.T) {
 		t.Fatal("conclusive divergence may proceed to the bounded repair upload path")
 	}
 }
-
 
 func TestRemoteVerificationInconclusiveDelayUsesVerificationCadence(t *testing.T) {
 	oldConf := conf.Conf
