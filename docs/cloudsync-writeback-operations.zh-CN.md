@@ -325,3 +325,9 @@ OpenList 必须先取得连续、稳定的 fresh provider evidence 才会确认 
 只要 OpenList 接收到同一路径的更新 PUT，新 generation 就会接管旧 recovery incident。活动任务页负责展示当前接收/后台同步进度；History 继续保留旧 incident 作为审计记录，并在新 generation 收敛后把普通用户看到的最终结果统一显示为 **已完成**。这里不要求新 payload 的 SHA-1 或大小必须与失败 generation 完全一致，因为 Cloud Sync 加密重新生成或本地文件的正常变更都可能改变实际字节；恢复判断以同一路径的 generation/ACK 顺序为准。
 
 OpenList 不提供“手动重传”动作。当 OpenList 已无法安全地让 Provider 副本收敛时，最终恢复数据来源必须回到 Cloud Sync。
+
+## 简化后的 Cloud Sync 结果模型
+
+运维页面只保留四种主要结果：接收中、处理中、已完成、失败。queued/uploading/verifying 仅作为内部实现状态。
+
+Provider PUT 返回成功后仍需独立确认 115 实际存在且内容一致，确认后才进入 COMPLETED。115 暂时无法查询时保持“处理中”并由独立确认线程继续重试；连续达到 VerifyAttempts 次仍无法确认或持续不一致时，任务进入 FAILED，WebDAV 将该 canonical 路径暴露为不存在，由 Cloud Sync 自动重新上传新的 generation。已完成对象仍保留低频后台核对，后续若确认 115 丢失，也会转为 FAILED，而不是长期向 Cloud Sync 假报文件正常。

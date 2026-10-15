@@ -127,7 +127,7 @@ func RecoveryType(row *model.WebDAVWritebackObject) string {
 	if row == nil {
 		return RecoveryTypeNone
 	}
-	if row.CloudSyncReuploadRequired || row.State == StateWaitingCloudSyncReupload {
+	if row.State == StateFailed || row.CloudSyncReuploadRequired || row.State == StateWaitingCloudSyncReupload {
 		return RecoveryTypeCloudSyncRehydrate
 	}
 	if row.ResolutionReason == ResolutionRemoteHashMismatch {
@@ -156,7 +156,7 @@ func TaskHealth(row *model.WebDAVWritebackObject) string {
 	if row == nil {
 		return TaskHealthHealthy
 	}
-	if row.State == StateWaitingRepair {
+	if row.State == StateFailed || row.State == StateWaitingRepair {
 		return TaskHealthRetryExhausted
 	}
 	if row.State == StateWaitingCloudSyncReupload {
@@ -234,8 +234,8 @@ func AdminRuntimeSnapshot() (AdminRuntimeStats, error) {
 		return stats, err
 	}
 	stats.NeedsCloudSyncRehydrate, err = count(
-		"cloud_sync_reupload_required = ? OR state = ? OR resolution_reason = ?",
-		true, StateWaitingCloudSyncReupload, ResolutionNeedsCloudSyncRehydrate,
+		"state = ? OR cloud_sync_reupload_required = ? OR state = ? OR resolution_reason = ?",
+		StateFailed, true, StateWaitingCloudSyncReupload, ResolutionNeedsCloudSyncRehydrate,
 	)
 	if err != nil {
 		return stats, err
@@ -460,7 +460,7 @@ func CancelTasks(ids []uint, all bool) (int64, error) {
 		StateDeleted,
 		StateWaitingCloudSyncReupload,
 		StateWaitingRepair,
-		legacyStateFailed,
+		StateFailed,
 	}
 	query := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("is_dir = ? AND state IN ?", false, activeStates)
@@ -503,7 +503,7 @@ func CancelTasks(ids []uint, all bool) (int64, error) {
 			Updates(map[string]any{
 				"generation":                   row.Generation + 1,
 				"canonical_state":              CanonicalStateDeleted,
-				"state":                        StateWaitingCloudSyncReupload,
+				"state":                        StateFailed,
 				"paused":                       false,
 				"cloud_sync_reupload_required": true,
 				"recovery_started_at":          &now,

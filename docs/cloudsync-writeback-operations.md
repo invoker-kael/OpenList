@@ -325,3 +325,9 @@ If the same generation still cannot converge after that single automatic repair,
 Once OpenList accepts a newer PUT for the same path, that newer generation supersedes the old recovery incident. Active shows the current receive/sync progress, while History keeps the old incident as audit data and presents the normal user-facing final outcome as **Completed** after the newer generation converges. Recovery correlation does not require the new payload SHA-1 or size to equal the failed generation, because Cloud Sync encryption or a legitimate local edit can change the bytes; same-path generation/ACK ordering is authoritative.
 
 There is no manual re-upload action in OpenList. When OpenList can no longer safely converge the provider replica, Cloud Sync is the source-of-truth recovery path.
+
+## Simplified Cloud Sync result model
+
+The operator-facing model is intentionally small: receiving, processing, completed, and failed. Internally queued/uploading/verifying remain implementation details.
+
+A provider PUT is not considered a successful backup until 115 can confirm the object. Temporary 115 lookup failures stay in processing and are retried in the independent verification pool. After VerifyAttempts consecutive unsuccessful confirmations, the task becomes failed, its canonical WebDAV entry is exposed as missing, and Cloud Sync can upload a fresh generation. Completed objects are also reconciled in the background so a later confirmed provider loss can become failed instead of being advertised to Cloud Sync forever.

@@ -418,6 +418,7 @@ const (
 	webDAVStatusRecovered              = "recovered"
 	webDAVStatusAutomaticRecovery      = "automatic_recovery"
 	webDAVStatusPaused                 = "paused"
+	webDAVStatusFailed                 = "failed"
 
 	webDAVActionNone                  = "none"
 	webDAVActionWait                  = "wait"
@@ -433,6 +434,9 @@ func webDAVCurrentEffectiveStatus(row *model.WebDAVWritebackObject) (string, str
 	}
 	if row.Paused {
 		return webDAVStatusPaused, webDAVActionPaused
+	}
+	if row.State == writeback.StateFailed {
+		return webDAVStatusFailed, webDAVActionNone
 	}
 	if row.CloudSyncReuploadRequired || row.State == writeback.StateWaitingCloudSyncReupload {
 		switch row.ResolutionReason {
@@ -642,7 +646,8 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 				writeback.StateDeleted,
 				writeback.StateWaitingCloudSyncReupload,
 				writeback.StateWaitingRepair,
-			}).Where("resolution_reason <> ? OR resolution_reason IS NULL", writeback.ResolutionManualCloudSyncReset)
+				writeback.StateFailed,
+			})
 		case "all":
 		case "syncing":
 			query = query.Where("state IN ?", []string{
@@ -650,18 +655,10 @@ func WebDAVWritebackMonitorList(c *gin.Context) {
 				writeback.StateUploading,
 				writeback.StateVerifying,
 			})
-		case "waiting_reupload":
-			query = query.Where(
-				"state = ? OR cloud_sync_reupload_required = ? OR resolution_reason = ? OR (state = ? AND canonical_state = ? AND LOWER(last_error) LIKE ?)",
-				writeback.StateWaitingCloudSyncReupload,
-				true,
-				writeback.ResolutionNeedsCloudSyncRehydrate,
-				writeback.StateDeleted,
-				writeback.CanonicalStateDeleted,
-				"%cloud sync can re-upload%",
-			)
+		case "waiting_reupload", "failed":
+			query = query.Where("state = ?", writeback.StateFailed)
 		case "error":
-			query = query.Where("last_error <> ''")
+			query = query.Where("state = ? OR last_error <> ''", writeback.StateFailed)
 		default:
 			query = query.Where("state = ?", state)
 		}
