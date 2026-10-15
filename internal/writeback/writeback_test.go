@@ -1554,21 +1554,22 @@ func TestMarkCanonicalAckedStampsCurrentTakeover(t *testing.T) {
 	}
 }
 
+
 func TestCanonicalStateSeparatesClientAckFromReplication(t *testing.T) {
-	for _, state := range []string{StateQueued, StateUploading, StateVerifying, StateCompleted, legacyStateFailed} {
+	for _, state := range []string{StateQueued, StateUploading, StateVerifying, StateCompleted} {
 		row := &model.WebDAVWritebackObject{State: state}
 		if !canonicalAcked(row) {
-			t.Fatalf("legacy replication state %q must remain client-visible as ACKed", state)
+			t.Fatalf("active replication state %q must remain client-visible as ACKed", state)
 		}
+	}
+	if !canonicalDeleted(&model.WebDAVWritebackObject{State: StateFailed}) {
+		t.Fatal("terminal failed state must be client-visible as missing so Cloud Sync can re-upload")
 	}
 	if canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: CanonicalStateDeleted, State: StateCompleted}) {
 		t.Fatal("explicit canonical tombstone must win over a completed remote replication state")
 	}
-	if !canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: CanonicalStateAcked, State: legacyStateFailed}) {
-		t.Fatal("remote replication failure must not revoke the client ACK")
-	}
-	if !canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: canonicalStateLegacyAck, State: legacyStateFailed}) {
-		t.Fatal("legacy acked rows must migrate logically to DURABLE_ACKED")
+	if !canonicalAcked(&model.WebDAVWritebackObject{CanonicalState: CanonicalStateAcked, State: StateFailed}) {
+		t.Fatal("explicit canonical ACK remains authoritative for compatibility rows")
 	}
 }
 
@@ -2131,13 +2132,14 @@ func TestPendingDirectoryMoveLocalAuthority(t *testing.T) {
 	}
 }
 
+
 func TestPendingBacklogState(t *testing.T) {
-	for _, state := range []string{StateQueued, legacyStateFailed, StateUploading, StateVerifying} {
+	for _, state := range []string{StateQueued, StateUploading, StateVerifying} {
 		if !pendingBacklogState(state) {
 			t.Fatalf("state %q must contribute to pending backlog", state)
 		}
 	}
-	for _, state := range []string{StateCompleted, StateDeleted, StateLockNull, ""} {
+	for _, state := range []string{StateFailed, StateCompleted, StateDeleted, StateLockNull, ""} {
 		if pendingBacklogState(state) {
 			t.Fatalf("state %q must not contribute to pending backlog", state)
 		}
@@ -2951,7 +2953,8 @@ func TestCloudSyncInconclusiveVerificationNeverConsumesReuploadBudget(t *testing
 	}
 }
 
-func TestLarge115VerificationWindowUsesRetryMax(t *testing.T) {
+
+func TestVerificationAttemptsUseConfiguredFailureThreshold(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = &conf.Config{
 		WebDAVWriteback: conf.WebDAVWritebackConfig{
@@ -2962,31 +2965,19 @@ func TestLarge115VerificationWindowUsesRetryMax(t *testing.T) {
 	}
 	defer func() { conf.Conf = oldConf }()
 
-	small := &model.WebDAVWritebackObject{Size: open115MultipartChunkSize}
-	if got := verificationAttemptsFor(small, true); got != 60 {
-		t.Fatalf("single-part-sized verification attempts = %d, want 60", got)
+	for _, row := range []*model.WebDAVWritebackObject{
+		{Size: open115MultipartChunkSize},
+		{Size: open115MultipartChunkSize + 1},
+		{Size: open115MultipartChunkSize + 1, RestartUploadRecovery: true},
+	} {
+		if got := verificationAttemptsFor(row, true); got != 60 {
+			t.Fatalf("verification attempts = %d, want configured threshold 60", got)
+		}
 	}
 
-	large := &model.WebDAVWritebackObject{Size: open115MultipartChunkSize + 1}
-	if got := verificationAttemptsFor(large, true); got != 360 {
-		t.Fatalf("large 115 verification attempts = %d, want 360", got)
-	}
-	if got := verificationAttemptsFor(large, false); got != 60 {
-		t.Fatalf("non-115 large verification attempts = %d, want 60", got)
-	}
-
-	conf.Conf.WebDAVWriteback.VerifyAttempts = 500
-	if got := verificationAttemptsFor(large, true); got != 500 {
-		t.Fatalf("explicit longer verification budget = %d, want 500", got)
-	}
-
-	large.RestartUploadRecovery = true
-	if got := verificationAttemptsFor(large, true); got != 12 {
-		t.Fatalf("restart-interrupted large upload verification attempts = %d, want 12", got)
-	}
-	small.RestartUploadRecovery = true
-	if got := verificationAttemptsFor(small, true); got != 12 {
-		t.Fatalf("restart-interrupted small upload verification attempts = %d, want 12", got)
+	conf.Conf.WebDAVWriteback.VerifyAttempts = 7
+	if got := verificationAttemptsFor(&model.WebDAVWritebackObject{}, true); got != 7 {
+		t.Fatalf("verification attempts = %d, want configured threshold 7", got)
 	}
 }
 
@@ -3002,7 +2993,8 @@ func TestProviderRepairInconclusiveNeverRetransmitsImmediately(t *testing.T) {
 	}
 }
 
-func TestRemoteVerificationInconclusiveDelayReducesProviderPolling(t *testing.T) {
+
+func TestRemoteVerificationInconclusiveDelayUsesVerificationCadence(t *testing.T) {
 	oldConf := conf.Conf
 	defer func() { conf.Conf = oldConf }()
 
@@ -3010,8 +3002,8 @@ func TestRemoteVerificationInconclusiveDelayReducesProviderPolling(t *testing.T)
 		VerifyIntervalSeconds: 5,
 		RetryInitialSeconds:   30,
 	}}
-	if got := remoteVerificationInconclusiveDelay(); got != 30*time.Second {
-		t.Fatalf("default inconclusive delay=%v, want 30s", got)
+	if got := remoteVerificationInconclusiveDelay(); got != 5*time.Second {
+		t.Fatalf("inconclusive delay=%v, want 5s verification cadence", got)
 	}
 
 	conf.Conf.WebDAVWriteback.VerifyIntervalSeconds = 60
