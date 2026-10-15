@@ -6948,12 +6948,10 @@ func (m *workerManager) maintainCompletedCanonical() {
 		if !completedCanonicalReconcileDue(row, now) {
 			continue
 		}
-		reserved, slotErr := acquireWorkerSlot(m.providerProbes, m.stop)
-		if slotErr != nil {
-			return
-		}
+		// ReconcileDirect/providerFreshList owns provider-probe admission. The
+		// completed loop is already sequential, so reserving a slot here would
+		// double-acquire the same semaphore and deadlock when the limit is one.
 		_, reconcileErr := ReconcileDirect(m.ctx, row.Path)
-		releaseWorkerSlot(m.providerProbes, reserved)
 		if reconcileErr != nil && !errors.Is(reconcileErr, context.Canceled) {
 			log.Errorf("write-back background canonical reconcile failed for %s: %v", row.Path, reconcileErr)
 		}
