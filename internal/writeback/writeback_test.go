@@ -2972,7 +2972,7 @@ func TestProviderConfirmationStartedAtPrefersUploadCompletion(t *testing.T) {
 	recovery := now.Add(-20 * time.Minute)
 	row := &model.WebDAVWritebackObject{
 		ProviderUploadCompletedAt: &uploaded,
-		RecoveryStartedAt:          &recovery,
+		RecoveryStartedAt:         &recovery,
 	}
 	if got := providerConfirmationStartedAt(row, now); !got.Equal(uploaded) {
 		t.Fatalf("confirmation start=%v, want upload completion %v", got, uploaded)

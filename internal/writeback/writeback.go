@@ -8998,16 +8998,33 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 		return
 	}
 	now := time.Now()
+	startedAt := providerConfirmationStartedAt(row, now)
+	firstConfirmation := row.ProviderUploadCompletedAt == nil && row.RecoveryStartedAt == nil
+	if firstConfirmation {
+		startedAt = now
+	}
+
 	remote, err := m.remoteForVerify(row, requireHash, shouldBatchVerificationSiblings(currentState, requireHash))
 	if err != nil {
+		if now.Sub(startedAt) >= providerConfirmationTimeout() {
+			requireCloudSyncReupload(
+				row,
+				currentState,
+				ResolutionVerificationExhausted,
+				fmt.Sprintf("115 could not be confirmed within %s: %s; exposing the path as missing so Cloud Sync can re-upload", providerConfirmationTimeout(), summarizeProviderProbeError(err)),
+				row.VerifyCount+1,
+				true,
+			)
+			return
+		}
 		next := now.Add(remoteVerificationRetryDelay(err))
 		updates := map[string]any{
 			"state":      StateVerifying,
 			"retry_at":   &next,
 			"last_error": summarizeProviderProbeError(err),
 		}
-		if row.ProviderUploadCompletedAt == nil && row.RecoveryStartedAt == nil {
-			updates["recovery_started_at"] = &now
+		if firstConfirmation {
+			updates["recovery_started_at"] = &startedAt
 		}
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
@@ -9019,10 +9036,6 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 		return
 	}
 
-	startedAt := providerConfirmationStartedAt(row, now)
-	if row.ProviderUploadCompletedAt == nil && row.RecoveryStartedAt == nil {
-		startedAt = now
-	}
 	if now.Sub(startedAt) >= providerConfirmationTimeout() {
 		requireCloudSyncReupload(
 			row,
@@ -9042,7 +9055,7 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 		"verify_count": row.VerifyCount + 1,
 		"last_error":   "115 content is not confirmed yet; retrying",
 	}
-	if row.ProviderUploadCompletedAt == nil && row.RecoveryStartedAt == nil {
+	if firstConfirmation {
 		updates["recovery_started_at"] = &startedAt
 	}
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
