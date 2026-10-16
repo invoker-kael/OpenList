@@ -331,3 +331,9 @@ There is no manual re-upload action in OpenList. When OpenList can no longer saf
 The operator-facing model is intentionally small: receiving, processing, completed, and failed. Internally queued/uploading/verifying remain implementation details.
 
 A provider PUT is not considered a successful backup until 115 can confirm the object. Temporary 115 lookup failures stay in processing and are retried in the independent verification pool. After VerifyAttempts consecutive unsuccessful confirmations, the task becomes failed, its canonical WebDAV entry is exposed as missing, and Cloud Sync can upload a fresh generation. Completed objects are also reconciled in the background so a later confirmed provider loss can become failed instead of being advertised to Cloud Sync forever.
+
+## Simplified 115 verification
+
+115 verification uses one rule. After a provider upload, OpenList performs fresh parent LIST checks and scans every same-name object. Any object with matching size and SHA-1 completes the task. API errors, WAF/rate limits, missing SHA-1, or a temporarily absent object keep the task processing and do not directly fail it. If no matching object can be confirmed for RetryMaxSeconds after provider upload, the task becomes FAILED and WebDAV exposes it as missing so Cloud Sync can upload a fresh generation.
+
+Completed objects are checked on the slower completed-object cadence. Any matching same-name size+SHA-1 object keeps the task completed. Three successful fresh LIST checks with no matching content change the task to FAILED. Provider/API errors never count toward those three checks.

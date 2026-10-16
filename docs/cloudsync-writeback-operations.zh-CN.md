@@ -331,3 +331,9 @@ OpenList 不提供“手动重传”动作。当 OpenList 已无法安全地让 
 运维页面只保留四种主要结果：接收中、处理中、已完成、失败。queued/uploading/verifying 仅作为内部实现状态。
 
 Provider PUT 返回成功后仍需独立确认 115 实际存在且内容一致，确认后才进入 COMPLETED。115 暂时无法查询时保持“处理中”并由独立确认线程继续重试；连续达到 VerifyAttempts 次仍无法确认或持续不一致时，任务进入 FAILED，WebDAV 将该 canonical 路径暴露为不存在，由 Cloud Sync 自动重新上传新的 generation。已完成对象仍保留低频后台核对，后续若确认 115 丢失，也会转为 FAILED，而不是长期向 Cloud Sync 假报文件正常。
+
+## 简化后的 115 验证
+
+115 只使用一条验证规则：Provider 上传完成后，OpenList 对父目录执行 Fresh LIST，并检查所有同名对象；只要任意一个对象的 Size + SHA1 与当前文件一致，就进入 COMPLETED。API 超时、WAF/限流、SHA1 暂时为空或暂时未看到对象，都只保持“处理中”，不会直接算失败。若从 Provider 上传完成起超过 RetryMaxSeconds 仍无法通过一次成功的 Fresh LIST 找到匹配内容，则进入 FAILED，WebDAV 对 Cloud Sync 显示该文件不存在，由 Cloud Sync 上传新的 generation。
+
+已完成对象按较低频率继续巡检。只要同名对象中存在 Size + SHA1 匹配项就保持完成；只有连续 3 次成功的 Fresh LIST 都找不到匹配内容才转 FAILED。Provider/API 查询失败不计入这 3 次。

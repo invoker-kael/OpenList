@@ -100,6 +100,7 @@ func TestMatchingVerificationRowsUsesOneParentSnapshot(t *testing.T) {
 		{ID: 3, State: StateQueued, Name: "queued.bin", Size: 30, PayloadSHA1: strings.Repeat("c", 40)},
 	}
 	remotes := []model.Obj{
+		&model.Object{Name: "a.bin", Size: 999, HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("f", 40))},
 		&model.Object{Name: "a.bin", Size: 10, HashInfo: utils.NewHashInfo(utils.SHA1, shaA)},
 		&model.Object{Name: "b.bin", Size: 999, HashInfo: utils.NewHashInfo(utils.SHA1, shaB)},
 		&model.Object{Name: "queued.bin", Size: 30, HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("c", 40))},
@@ -2951,30 +2952,34 @@ func TestCloudSyncInconclusiveVerificationNeverConsumesReuploadBudget(t *testing
 	}
 }
 
-func TestVerificationAttemptsUseConfiguredFailureThreshold(t *testing.T) {
+func TestProviderConfirmationTimeoutUsesRetryMax(t *testing.T) {
 	oldConf := conf.Conf
-	conf.Conf = &conf.Config{
-		WebDAVWriteback: conf.WebDAVWritebackConfig{
-			VerifyIntervalSeconds: 5,
-			VerifyAttempts:        60,
-			RetryMaxSeconds:       1800,
-		},
-	}
 	defer func() { conf.Conf = oldConf }()
 
-	for _, row := range []*model.WebDAVWritebackObject{
-		{Size: open115MultipartChunkSize},
-		{Size: open115MultipartChunkSize + 1},
-		{Size: open115MultipartChunkSize + 1, RestartUploadRecovery: true},
-	} {
-		if got := verificationAttemptsFor(row, true); got != 60 {
-			t.Fatalf("verification attempts = %d, want configured threshold 60", got)
-		}
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{RetryMaxSeconds: 1800}}
+	if got := providerConfirmationTimeout(); got != 30*time.Minute {
+		t.Fatalf("provider confirmation timeout=%v, want 30m", got)
 	}
+	conf.Conf.WebDAVWriteback.RetryMaxSeconds = 300
+	if got := providerConfirmationTimeout(); got != 5*time.Minute {
+		t.Fatalf("provider confirmation timeout=%v, want 5m", got)
+	}
+}
 
-	conf.Conf.WebDAVWriteback.VerifyAttempts = 7
-	if got := verificationAttemptsFor(&model.WebDAVWritebackObject{}, true); got != 7 {
-		t.Fatalf("verification attempts = %d, want configured threshold 7", got)
+func TestProviderConfirmationStartedAtPrefersUploadCompletion(t *testing.T) {
+	now := time.Now()
+	uploaded := now.Add(-10 * time.Minute)
+	recovery := now.Add(-20 * time.Minute)
+	row := &model.WebDAVWritebackObject{
+		ProviderUploadCompletedAt: &uploaded,
+		RecoveryStartedAt:          &recovery,
+	}
+	if got := providerConfirmationStartedAt(row, now); !got.Equal(uploaded) {
+		t.Fatalf("confirmation start=%v, want upload completion %v", got, uploaded)
+	}
+	row.ProviderUploadCompletedAt = nil
+	if got := providerConfirmationStartedAt(row, now); !got.Equal(recovery) {
+		t.Fatalf("confirmation start=%v, want recovery start %v", got, recovery)
 	}
 }
 
@@ -3005,6 +3010,19 @@ func TestRemoteVerificationInconclusiveDelayUsesVerificationCadence(t *testing.T
 	conf.Conf.WebDAVWriteback.VerifyIntervalSeconds = 60
 	if got := remoteVerificationInconclusiveDelay(); got != 60*time.Second {
 		t.Fatalf("long configured verify interval=%v, want 60s", got)
+	}
+}
+
+func TestMatchingRemoteContentByNameChecksAllSameNameCandidates(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	row := &model.WebDAVWritebackObject{Name: "same.bin", Size: 10, PayloadSHA1: sha}
+	remotes := []model.Obj{
+		&model.Object{Name: "same.bin", Size: 10, HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40))},
+		&model.Object{Name: "same.bin", Size: 10, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
+	}
+	matched := matchingRemoteContentByName(row, remotes, true)
+	if matched == nil || !remoteMatchesCanonical(row, matched, true) {
+		t.Fatal("verification must accept a matching same-name object even when another same-name object differs")
 	}
 }
 

@@ -1764,6 +1764,21 @@ func exactRemoteByName(objs []model.Obj, name string) model.Obj {
 	return nil
 }
 
+func matchingRemoteContentByName(row *model.WebDAVWritebackObject, objs []model.Obj, requireHash bool) model.Obj {
+	if row == nil {
+		return nil
+	}
+	for _, obj := range objs {
+		if obj == nil || obj.GetName() != row.Name {
+			continue
+		}
+		if compareRemoteContent(row, obj, requireHash) == remoteContentMatch {
+			return obj
+		}
+	}
+	return nil
+}
+
 func deleteCompletedCanonical(row *model.WebDAVWritebackObject) (bool, error) {
 	if row == nil {
 		return false, nil
@@ -2007,20 +2022,13 @@ func matchingCompletedSiblingRows(rows []model.WebDAVWritebackObject, remotes []
 	if len(rows) == 0 || len(remotes) == 0 {
 		return nil
 	}
-	byName := make(map[string]model.Obj, len(remotes))
-	for _, remote := range remotes {
-		if remote != nil {
-			byName[remote.GetName()] = remote
-		}
-	}
 	matches := make([]verificationBatchMatch, 0, min(len(rows), len(remotes)))
 	for i := range rows {
 		row := &rows[i]
 		if row.ID == skipID || row.IsDir || row.State != StateCompleted || row.SpoolPath != "" {
 			continue
 		}
-		remote := byName[row.Name]
-		if remoteMatchesCanonical(row, remote, requireHash) {
+		if remote := matchingRemoteContentByName(row, remotes, requireHash); remote != nil {
 			matches = append(matches, verificationBatchMatch{row: *row, remote: remote})
 		}
 	}
@@ -2071,20 +2079,13 @@ func matchingFreshCompletedEvidenceRows(rows []model.WebDAVWritebackObject, remo
 	if len(rows) == 0 || len(remotes) == 0 {
 		return nil
 	}
-	byName := make(map[string]model.Obj, len(remotes))
-	for _, remote := range remotes {
-		if remote != nil {
-			byName[remote.GetName()] = remote
-		}
-	}
 	matches := make([]verificationBatchMatch, 0, min(len(rows), len(remotes)))
 	for i := range rows {
 		row := &rows[i]
 		if !freshCompletedEvidenceEligible(row) {
 			continue
 		}
-		remote := byName[row.Name]
-		if _, matched := matchedRemoteVerificationEvidence(row, remote, now, true); matched {
+		if remote := matchingRemoteContentByName(row, remotes, true); remote != nil {
 			matches = append(matches, verificationBatchMatch{row: *row, remote: remote})
 		}
 	}
@@ -2373,15 +2374,11 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 	if row == nil || row.IsDir {
 		return false, nil
 	}
-
 	claimed, claimErr := claimCompletedRemoteEvidenceProbe(row, now)
 	if claimErr != nil || !claimed {
 		return false, claimErr
 	}
 
-	// One fresh parent listing is one evidence observation. The retry_at claim
-	// above is only a cross-instance throttle; it deliberately does not alter
-	// verify_count or provider evidence.
 	objs, listErr := providerParentSnapshots.do(ctx.Done(), row.Parent, func() ([]model.Obj, error) {
 		fresh, listErr := providerFreshList(ctx, ctx.Done(), currentProviderProbeSlots(), row.Parent)
 		if listErr == nil {
@@ -2390,67 +2387,39 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 		return fresh, listErr
 	})
 	if listErr != nil {
-		// Provider/network failures are not evidence of remote loss. retry_at
-		// already throttles the next probe without creating a fake observation.
+		// Provider/API failures never count as proof that a completed backup is gone.
 		return false, nil
 	}
-	remote := exactRemoteByName(objs, row.Name)
-	switch compareRemoteContent(row, remote, true) {
-	case remoteContentMatch:
+	if remote := matchingRemoteContentByName(row, objs, true); remote != nil {
 		if err := refreshCompletedRemoteVerification(row, remote, now, true); err != nil {
 			return false, err
 		}
 		refreshMatchingCompletedSiblings(row, objs, true, now)
 		return false, nil
-	case remoteContentInconclusive:
-		// Missing provider SHA-1 is not evidence. Keep the existing streak and
-		// wait for the next throttled fresh observation.
-		return false, nil
 	}
 
-	kind := completedRemoteEvidenceKind(row, remote)
-	nextCount, consistent := nextCompletedRemoteEvidenceCount(row, remote, kind)
-	if !consistent || nextCount < completedRemoteDivergenceConfirmations {
-		_, recordErr := recordCompletedRemoteEvidence(row, remote, kind, now)
-		return false, recordErr
+	nextCount := min(max(0, row.VerifyCount)+1, completedRemoteDivergenceConfirmations)
+	if nextCount < completedRemoteDivergenceConfirmations {
+		nextRetry := now.Add(completedDivergenceConfirmationDelay())
+		return false, db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted).
+			Updates(map[string]any{
+				"verify_count":             nextCount,
+				"retry_at":                 &nextRetry,
+				"last_error":               "115 content did not match this completed object; awaiting repeated fresh confirmation",
+				"provider_evidence_result": "no_match",
+				"remote_generation":        0,
+				"remote_verified_at":       nil,
+			}).Error
 	}
 
-	if kind == ResolutionRemoteHashMismatch {
-		return false, settleCompletedRemoteHashMismatch(row, remote, now)
-	}
-
-	if kind == ResolutionRemoteMissing {
-		// Only pay for a per-file provider lookup after three consistent fresh
-		// parent-listing misses. This keeps the common path at one LIST and
-		// reserves GET for the final missing-object confirmation.
-		missing, direct, directErr := confirmCompletedRemoteMissing(ctx, row)
-		if directErr != nil {
-			_, recordErr := recordCompletedRemoteEvidence(row, remote, kind, now)
-			return false, recordErr
-		}
-		if !missing {
-			switch compareRemoteContent(row, direct, true) {
-			case remoteContentMatch:
-				return false, refreshCompletedRemoteVerification(row, direct, now, true)
-			case remoteContentMismatch:
-				directKind := completedRemoteEvidenceKind(row, direct)
-				_, recordErr := recordCompletedRemoteEvidence(row, direct, directKind, now)
-				return false, recordErr
-			default:
-				return false, nil
-			}
-		}
-		missingRow := *row
-		missingRow.ResolutionReason = ResolutionRemoteMissing
-		return deleteCompletedCanonical(&missingRow)
-	}
-
-	// Persistent non-hash metadata divergence also requires one consistent
-	// evidence streak; mismatch/missing observations cannot be mixed together.
-	missingRow := *row
-	missingRow.ResolutionReason = ResolutionNeedsCloudSyncRehydrate
-	return deleteCompletedCanonical(&missingRow)
+	failed := *row
+	failed.VerifyCount = nextCount
+	failed.ResolutionReason = ResolutionNeedsCloudSyncRehydrate
+	failed.LastError = "115 content did not match after three successful fresh checks; Cloud Sync re-upload is required"
+	return deleteCompletedCanonical(&failed)
 }
+
 func ReconcileDirect(ctx context.Context, p string) (missing bool, err error) {
 	if !Enabled() {
 		return false, nil
@@ -8569,8 +8538,24 @@ const (
 	restartUploadVerificationWindow       = time.Minute
 )
 
-func verificationAttemptsFor(_ *model.WebDAVWritebackObject, _ bool) int {
-	return max(1, conf.Conf.WebDAVWriteback.VerifyAttempts)
+func providerConfirmationTimeout() time.Duration {
+	seconds := 30 * 60
+	if conf.Conf != nil && conf.Conf.WebDAVWriteback.RetryMaxSeconds > 0 {
+		seconds = conf.Conf.WebDAVWriteback.RetryMaxSeconds
+	}
+	return time.Duration(max(1, seconds)) * time.Second
+}
+
+func providerConfirmationStartedAt(row *model.WebDAVWritebackObject, now time.Time) time.Time {
+	if row != nil {
+		if row.ProviderUploadCompletedAt != nil {
+			return *row.ProviderUploadCompletedAt
+		}
+		if row.RecoveryStartedAt != nil {
+			return *row.RecoveryStartedAt
+		}
+	}
+	return now
 }
 
 func remoteVerificationInconclusiveDelay() time.Duration {
@@ -8614,20 +8599,13 @@ func matchingVerificationRows(rows []model.WebDAVWritebackObject, remotes []mode
 	if len(rows) == 0 || len(remotes) == 0 {
 		return nil
 	}
-	byName := make(map[string]model.Obj, len(remotes))
-	for _, remote := range remotes {
-		if remote != nil {
-			byName[remote.GetName()] = remote
-		}
-	}
 	matches := make([]verificationBatchMatch, 0, min(len(rows), len(remotes)))
 	for i := range rows {
 		row := &rows[i]
 		if row.ID == skipID || row.IsDir || row.State != StateVerifying {
 			continue
 		}
-		remote := byName[row.Name]
-		if remoteMatchesCanonical(row, remote, requireHash) {
+		if remote := matchingRemoteContentByName(row, remotes, requireHash); remote != nil {
 			matches = append(matches, verificationBatchMatch{row: *row, remote: remote})
 		}
 	}
@@ -8703,10 +8681,8 @@ func (m *workerManager) wakeVerifyingSiblings(trigger *model.WebDAVWritebackObje
 
 func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject, requireHash, batchSiblings bool) (model.Obj, error) {
 	if requireHash {
-		// 115 directory listings already carry size and SHA-1. Use one fresh
-		// parent snapshot as the verification authority instead of issuing a
-		// single-object GET for every completed upload. The same snapshot also
-		// completes matching VERIFYING siblings in bounded batches.
+		// 115 verification is deliberately simple: use one fresh parent LIST and
+		// accept the generation when any same-name object matches size + SHA-1.
 		objs, listErr := m.refreshParent(row.Parent)
 		if listErr != nil {
 			return nil, listErr
@@ -8714,7 +8690,7 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject, requir
 		if batchSiblings {
 			m.completeMatchingVerifySiblings(row, objs, true)
 		}
-		return exactRemoteByName(objs, row.Name), nil
+		return matchingRemoteContentByName(row, objs, true), nil
 	}
 
 	remote, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true})
@@ -8729,7 +8705,7 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject, requir
 	if listErr != nil {
 		return nil, listErr
 	}
-	if obj := exactRemoteByName(objs, row.Name); obj != nil {
+	if obj := matchingRemoteContentByName(row, objs, requireHash); obj != nil {
 		return obj, nil
 	}
 	return nil, nil
@@ -9021,59 +8997,53 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 	if row == nil {
 		return
 	}
+	now := time.Now()
 	remote, err := m.remoteForVerify(row, requireHash, shouldBatchVerificationSiblings(currentState, requireHash))
-	verification := classifyRemoteVerification(row, remote, err, requireHash)
-	if verification == remoteVerificationMatch {
+	if err != nil {
+		next := now.Add(remoteVerificationRetryDelay(err))
+		updates := map[string]any{
+			"state":      StateVerifying,
+			"retry_at":   &next,
+			"last_error": summarizeProviderProbeError(err),
+		}
+		if row.ProviderUploadCompletedAt == nil && row.RecoveryStartedAt == nil {
+			updates["recovery_started_at"] = &now
+		}
+		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
+			Updates(updates).Error
+		return
+	}
+	if remote != nil {
 		m.completeRemoteVerification(row, remote, []string{currentState}, requireHash)
 		return
 	}
 
-	nextCount := row.VerifyCount + 1
-	attempts := verificationAttemptsFor(row, requireHash)
-	reason := ResolutionVerificationExhausted
-	message := "115 confirmation is temporarily unavailable"
-	if err != nil {
-		message = summarizeProviderProbeError(err)
-	} else if verification == remoteVerificationDivergent {
-		if remote == nil {
-			reason = ResolutionRemoteMissing
-			message = "115 object is absent from refreshed provider evidence"
-		} else if remoteHashMismatch(row, remote, requireHash) {
-			reason = ResolutionRemoteHashMismatch
-			message = remoteHashMismatchMessage(row, remote)
-		} else {
-			message = "115 object does not match the durable Cloud Sync payload"
-		}
-	} else if remote != nil && requireHash && remote.GetSize() == row.Size &&
-		remote.GetHash().GetHash(utils.SHA1) == "" {
-		message = "115 object is visible but SHA-1 is not available yet"
+	startedAt := providerConfirmationStartedAt(row, now)
+	if row.ProviderUploadCompletedAt == nil && row.RecoveryStartedAt == nil {
+		startedAt = now
 	}
-
-	if nextCount >= attempts {
+	if now.Sub(startedAt) >= providerConfirmationTimeout() {
 		requireCloudSyncReupload(
 			row,
 			currentState,
-			reason,
-			fmt.Sprintf("%s; confirmation failed %d times, exposing the path as missing so Cloud Sync can re-upload", message, nextCount),
-			nextCount,
+			ResolutionVerificationExhausted,
+			fmt.Sprintf("115 content was not confirmed within %s after upload; exposing the path as missing so Cloud Sync can re-upload", providerConfirmationTimeout()),
+			row.VerifyCount+1,
 			true,
 		)
 		return
 	}
 
-	next := time.Now().Add(remoteVerificationRetryDelay(err))
+	next := now.Add(remoteVerificationInconclusiveDelay())
 	updates := map[string]any{
 		"state":        StateVerifying,
 		"retry_at":     &next,
-		"verify_count": nextCount,
-		"last_error":   message,
+		"verify_count": row.VerifyCount + 1,
+		"last_error":   "115 content is not confirmed yet; retrying",
 	}
-	if verification == remoteVerificationDivergent {
-		updates = mergeUpdateMaps(updates, applyProviderEvidence(row, time.Now(), reason))
-		if remote != nil {
-			updates["remote_object_id"] = remote.GetID()
-			updates["remote_sha1"] = strings.ToLower(remote.GetHash().GetHash(utils.SHA1))
-		}
+	if row.ProviderUploadCompletedAt == nil && row.RecoveryStartedAt == nil {
+		updates["recovery_started_at"] = &startedAt
 	}
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
