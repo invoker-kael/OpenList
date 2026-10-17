@@ -29,26 +29,26 @@ type webDAVWritebackStateSummary struct {
 }
 
 type webDAVWritebackSummary struct {
-	Enabled                     bool                                   `json:"enabled"`
-	Workers                     int                                    `json:"workers"`
-	Receiving                   int64                                  `json:"receiving"`
-	ReceivingExpectedBytes      int64                                  `json:"receiving_expected_bytes"`
-	ReceivingReservationBytes   uint64                                 `json:"receiving_reservation_bytes"`
-	BacklogBytes                int64                                  `json:"backlog_bytes"`
-	CompletedCacheBytes         int64                                  `json:"completed_cache_bytes"`
-	MaxPendingSpoolBytes        uint64                                 `json:"max_pending_spool_bytes"`
-	ReserveFreeSpaceBytes       uint64                                 `json:"reserve_free_space_bytes"`
-	CompletedCacheTTLMinutes    int                                    `json:"completed_cache_ttl_minutes"`
-	DiskTotalBytes              uint64                                 `json:"disk_total_bytes"`
-	DiskUsedBytes               uint64                                 `json:"disk_used_bytes"`
-	DiskFreeBytes               uint64                                 `json:"disk_free_bytes"`
-	DiskError                   string                                 `json:"disk_error,omitempty"`
-	MissingSpool                int64                                  `json:"missing_spool"`
-	RemoteHashMismatch          int64                                  `json:"remote_hash_mismatch"`
-	Paused                      int64                                  `json:"paused"`
-	Errors                      int64                                  `json:"errors"`
-	States                      map[string]webDAVWritebackStateSummary `json:"states"`
-	UpdatedAt                   time.Time                              `json:"updated_at"`
+	Enabled                   bool                                   `json:"enabled"`
+	Workers                   int                                    `json:"workers"`
+	Receiving                 int64                                  `json:"receiving"`
+	ReceivingExpectedBytes    int64                                  `json:"receiving_expected_bytes"`
+	ReceivingReservationBytes uint64                                 `json:"receiving_reservation_bytes"`
+	BacklogBytes              int64                                  `json:"backlog_bytes"`
+	CompletedCacheBytes       int64                                  `json:"completed_cache_bytes"`
+	MaxPendingSpoolBytes      uint64                                 `json:"max_pending_spool_bytes"`
+	ReserveFreeSpaceBytes     uint64                                 `json:"reserve_free_space_bytes"`
+	CompletedCacheTTLMinutes  int                                    `json:"completed_cache_ttl_minutes"`
+	DiskTotalBytes            uint64                                 `json:"disk_total_bytes"`
+	DiskUsedBytes             uint64                                 `json:"disk_used_bytes"`
+	DiskFreeBytes             uint64                                 `json:"disk_free_bytes"`
+	DiskError                 string                                 `json:"disk_error,omitempty"`
+	MissingSpool              int64                                  `json:"missing_spool"`
+	RemoteHashMismatch        int64                                  `json:"remote_hash_mismatch"`
+	Paused                    int64                                  `json:"paused"`
+	Errors                    int64                                  `json:"errors"`
+	States                    map[string]webDAVWritebackStateSummary `json:"states"`
+	UpdatedAt                 time.Time                              `json:"updated_at"`
 }
 
 type webDAVWritebackCleanupResult struct {
@@ -226,26 +226,26 @@ func WebDAVWritebackMonitorSummary(c *gin.Context) {
 	}
 
 	common.SuccessResp(c, webDAVWritebackSummary{
-		Enabled:                     writeback.Enabled(),
-		Workers:                     conf.Conf.WebDAVWriteback.Workers,
-		Receiving:                   receiving,
-		ReceivingExpectedBytes:      receivingExpectedBytes,
-		ReceivingReservationBytes:   runtimeStats.ReceivingReservationBytes,
-		BacklogBytes:                backlogBytes,
-		CompletedCacheBytes:         completedCacheBytes,
-		MaxPendingSpoolBytes:        conf.Conf.WebDAVWriteback.MaxPendingSpoolMB * uint64(1024*1024),
-		ReserveFreeSpaceBytes:       conf.Conf.WebDAVWriteback.ReserveFreeSpaceMB * uint64(1024*1024),
-		CompletedCacheTTLMinutes:    conf.Conf.WebDAVWriteback.CompletedCacheTTLMinutes,
-		DiskTotalBytes:              runtimeStats.DiskTotalBytes,
-		DiskUsedBytes:               runtimeStats.DiskUsedBytes,
-		DiskFreeBytes:               runtimeStats.DiskFreeBytes,
-		DiskError:                   runtimeStats.DiskError,
-		MissingSpool:                runtimeStats.MissingSpool,
-		RemoteHashMismatch:          runtimeStats.RemoteHashMismatch,
-		Paused:                      runtimeStats.Paused,
-		Errors:                      errorsCount,
-		States:                      states,
-		UpdatedAt:                   now,
+		Enabled:                   writeback.Enabled(),
+		Workers:                   conf.Conf.WebDAVWriteback.Workers,
+		Receiving:                 receiving,
+		ReceivingExpectedBytes:    receivingExpectedBytes,
+		ReceivingReservationBytes: runtimeStats.ReceivingReservationBytes,
+		BacklogBytes:              backlogBytes,
+		CompletedCacheBytes:       completedCacheBytes,
+		MaxPendingSpoolBytes:      conf.Conf.WebDAVWriteback.MaxPendingSpoolMB * uint64(1024*1024),
+		ReserveFreeSpaceBytes:     conf.Conf.WebDAVWriteback.ReserveFreeSpaceMB * uint64(1024*1024),
+		CompletedCacheTTLMinutes:  conf.Conf.WebDAVWriteback.CompletedCacheTTLMinutes,
+		DiskTotalBytes:            runtimeStats.DiskTotalBytes,
+		DiskUsedBytes:             runtimeStats.DiskUsedBytes,
+		DiskFreeBytes:             runtimeStats.DiskFreeBytes,
+		DiskError:                 runtimeStats.DiskError,
+		MissingSpool:              runtimeStats.MissingSpool,
+		RemoteHashMismatch:        runtimeStats.RemoteHashMismatch,
+		Paused:                    runtimeStats.Paused,
+		Errors:                    errorsCount,
+		States:                    states,
+		UpdatedAt:                 now,
 	})
 }
 

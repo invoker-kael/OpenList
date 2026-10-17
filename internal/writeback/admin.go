@@ -21,14 +21,14 @@ type CacheCleanupResult struct {
 }
 
 type AdminRuntimeStats struct {
-	DiskTotalBytes              uint64 `json:"disk_total_bytes"`
-	DiskUsedBytes               uint64 `json:"disk_used_bytes"`
-	DiskFreeBytes               uint64 `json:"disk_free_bytes"`
-	DiskError                   string `json:"disk_error,omitempty"`
-	ReceivingReservationBytes   uint64 `json:"receiving_reservation_bytes"`
-	MissingSpool                int64  `json:"missing_spool"`
-	RemoteHashMismatch          int64  `json:"remote_hash_mismatch"`
-	Paused                      int64  `json:"paused"`
+	DiskTotalBytes            uint64 `json:"disk_total_bytes"`
+	DiskUsedBytes             uint64 `json:"disk_used_bytes"`
+	DiskFreeBytes             uint64 `json:"disk_free_bytes"`
+	DiskError                 string `json:"disk_error,omitempty"`
+	ReceivingReservationBytes uint64 `json:"receiving_reservation_bytes"`
+	MissingSpool              int64  `json:"missing_spool"`
+	RemoteHashMismatch        int64  `json:"remote_hash_mismatch"`
+	Paused                    int64  `json:"paused"`
 }
 
 func ValidateAdminConfig(cfg conf.WebDAVWritebackConfig) error {
