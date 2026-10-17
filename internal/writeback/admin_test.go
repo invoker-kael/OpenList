@@ -352,7 +352,7 @@ func TestProcessUploadProviderErrorKeepsSpoolAndExactRetryMatchAvoidsSecondPut(t
 	listCalls, putCalls := 0, 0
 	remote := &model.Object{Name: row.Name, Size: row.Size, HashInfo: utils.NewHashInfo(utils.SHA1, hash)}
 	manager := &workerManager{
-		ctx: context.Background(),
+		ctx:         context.Background(),
 		requireHash: func(string) bool { return true },
 		listParent: func(string) ([]model.Obj, error) {
 			listCalls++
