@@ -329,16 +329,15 @@ func durableLocalPayloadAvailable(row *model.WebDAVWritebackObject) bool {
 }
 
 func canCoalesceDuplicatePut(row *model.WebDAVWritebackObject, size int64, payloadSHA1 string) bool {
-	return row != nil &&
-		!row.IsDir &&
-		row.State != StateCompleted &&
-		!canonicalDeleted(row) &&
-		!waitingCloudSyncReupload(row) &&
-		(row.SpoolPath != "" || row.Size == 0) &&
-		row.Size == size &&
-		row.PayloadSHA1 != "" &&
-		payloadSHA1 != "" &&
-		strings.EqualFold(row.PayloadSHA1, payloadSHA1)
+	if row == nil || row.IsDir || canonicalDeleted(row) || waitingCloudSyncReupload(row) ||
+		row.Size != size || row.PayloadSHA1 == "" || payloadSHA1 == "" ||
+		!strings.EqualFold(row.PayloadSHA1, payloadSHA1) {
+		return false
+	}
+	if row.State == StateCompleted {
+		return row.ProviderUploadCompletedAt != nil
+	}
+	return row.SpoolPath != "" || row.Size == 0
 }
 func applyDuplicatePutMetadata(row *model.WebDAVWritebackObject, modTime, createTime time.Time, mime string, modTimeProvided, createTimeProvided bool) {
 	if row == nil {
@@ -3664,13 +3663,20 @@ func copyToSpool(dst *os.File, src io.Reader, expected int64, reservation *incom
 	return total, hex.EncodeToString(payloadHasher.Sum(nil)), nil
 }
 
-func syncDir(dir string) {
+func syncDir(dir string) error {
 	f, err := os.Open(dir)
-	if err == nil {
-		_ = f.Sync()
-		_ = f.Close()
+	if err != nil {
+		return err
 	}
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
+
+var syncSpoolDirectory = syncDir
 
 func durableCommitContext(ctx context.Context) context.Context {
 	// Once the complete request body has been fsynced and atomically moved into
@@ -3780,7 +3786,11 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		if err := os.Rename(tmpName, finalName); err != nil {
 			return nil, false, err
 		}
-		syncDir(spoolDir)
+		if err := syncSpoolDirectory(spoolDir); err != nil {
+			_ = os.Remove(finalName)
+			_ = syncDir(spoolDir)
+			return nil, false, fmt.Errorf("persist writeback spool directory: %w", err)
+		}
 		committed = true
 	}
 
@@ -3827,8 +3837,9 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		}
 		if findErr == nil {
 			if canCoalesceDuplicatePut(&row, actualSize, payloadSHA1) {
-				if durableLocalPayloadAvailable(&row) {
+				if row.State == StateCompleted || durableLocalPayloadAvailable(&row) {
 					duplicate = true
+					row.ClientDuplicatePuts++
 					applyDuplicatePutMetadata(&row, modTime, createTime, mime, modTimeProvided, createTimeProvided)
 					markCanonicalAcked(&row, time.Now())
 					updates := map[string]any{
@@ -3838,6 +3849,7 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 						"canonical_state": row.CanonicalState,
 						"ack_time":        row.AckTime,
 						"durable_at":      row.DurableAt,
+						"client_duplicate_puts": row.ClientDuplicatePuts,
 					}
 					if err := tx.Model(&model.WebDAVWritebackObject{}).
 						Where("id = ? AND generation = ?", row.ID, row.Generation).
@@ -3882,6 +3894,9 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		row.LastError = ""
 		row.RetryCount = 0
 		row.VerifyCount = 0
+		row.ClientDuplicatePuts = 0
+		row.ProviderUploadAttempts = 0
+		row.ProviderRetryBytes = 0
 		row.RetryAt = &settleAt
 		row.CompletedAt = nil
 		clearRemoteVerification(&row)
@@ -3914,6 +3929,10 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 		if finalName != "" {
 			_ = os.Remove(finalName)
 			syncDir(spoolDir)
+		}
+		log.Infof("write-back client duplicate PUT coalesced: id=%d path=%q generation=%d size=%d duplicate_puts=%d state=%s", saved.ID, saved.Path, saved.Generation, saved.Size, saved.ClientDuplicatePuts, saved.State)
+		if saved.State == StateCompleted && saved.CompletedAt != nil {
+			recordHistoryOutcomeBestEffort(&saved, HistoryResultCompleted, StateCompleted, historyRecoveryForCompletion(&saved), *saved.CompletedAt, saved.LastError)
 		}
 		return &saved, false, nil
 	}
@@ -6317,6 +6336,9 @@ type workerManager struct {
 	inflight          sync.Map
 	batchCompleted    sync.Map
 	wg                sync.WaitGroup
+	listParent        func(string) ([]model.Obj, error)
+	putProvider       func(string, model.FileStreamer, model.UpdateProgress) error
+	requireHash       func(string) bool
 }
 
 func currentProviderProbeSlots() chan struct{} {
@@ -6441,6 +6463,27 @@ func (m *workerManager) refreshParent(parent string) ([]model.Obj, error) {
 		}
 		return fresh, listErr
 	})
+}
+
+func (m *workerManager) listUploadParent(parent string) ([]model.Obj, error) {
+	if m.listParent != nil {
+		return m.listParent(parent)
+	}
+	return m.refreshParent(parent)
+}
+
+func (m *workerManager) uploadRequiresPayloadHash(p string) bool {
+	if m.requireHash != nil {
+		return m.requireHash(p)
+	}
+	return providerRequiresPayloadHash(p)
+}
+
+func (m *workerManager) putProviderFile(parent string, file model.FileStreamer, progress model.UpdateProgress) error {
+	if m.putProvider != nil {
+		return m.putProvider(parent, file, progress)
+	}
+	return fs.PutDirectlyWithProgress(m.ctx, parent, file, progress, true)
 }
 
 func (m *workerManager) markBatchCompleted(id uint) {
@@ -6606,6 +6649,20 @@ func (m *workerManager) recoverMissingDurablePayloads(now time.Time) error {
 			log.Warnf("write-back restart spool audit could not inspect %s: %v", row.Path, err)
 			continue
 		}
+		if availability == durablePayloadAvailable && row.State == StateVerifying {
+			if err := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
+				Updates(map[string]any{
+					"state":                   StateQueued,
+					"retry_at":                &now,
+					"verify_count":            0,
+					"restart_upload_recovery": true,
+					"last_error":              "resuming provider upload from durable spool after restart",
+				}).Error; err != nil {
+				return err
+			}
+			continue
+		}
 		if availability != durablePayloadMissing {
 			continue
 		}
@@ -6731,11 +6788,11 @@ func (m *workerManager) recoverInterrupted() error {
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, row.State).
 			Updates(map[string]any{
 				"canonical_state":              CanonicalStateAcked,
-				"state":                        StateVerifying,
+				"state":                        StateQueued,
 				"cloud_sync_reupload_required": false,
 				"retry_at":                     &legacyVerifyNow,
 				"verify_count":                 0,
-				"last_error":                   "legacy exhausted provider retry budget; revalidating fresh provider evidence before any further mutation",
+				"last_error":                   "resuming provider upload from durable spool after a fresh content preflight",
 				"resolution_reason":            "",
 				"completed_at":                 nil,
 				"remote_object_id":             "",
@@ -6746,6 +6803,7 @@ func (m *workerManager) recoverInterrupted() error {
 				"provider_evidence_last_at":    nil,
 				"provider_evidence_count":      0,
 				"provider_evidence_result":     "",
+				"restart_upload_recovery":      true,
 				"recovery_started_at":          gorm.Expr("COALESCE(recovery_started_at, updated_at, created_at)"),
 			}).Error; err != nil {
 			return err
@@ -6871,7 +6929,8 @@ func (m *workerManager) recoverInterrupted() error {
 		}
 
 		// An ordinary UPLOADING file remains ambiguous after a crash: the
-		// provider may already contain the exact payload. Resume it in VERIFYING.
+		// provider may already contain the exact payload. Queue one fresh content
+		// preflight before retrying from the durable spool.
 		// Ordinary directories re-enter MKCOL directly.
 		if err := tx.Model(&model.WebDAVWritebackObject{}).
 			Where("state = ? AND is_dir = ? AND cleanup_path = ''", StateUploading, true).
@@ -6886,11 +6945,11 @@ func (m *workerManager) recoverInterrupted() error {
 		return tx.Model(&model.WebDAVWritebackObject{}).
 			Where("state = ? AND is_dir = ? AND cleanup_path = ''", StateUploading, false).
 			Updates(map[string]any{
-				"state":                   StateVerifying,
+				"state":                   StateQueued,
 				"retry_at":                &now,
 				"verify_count":            0,
 				"restart_upload_recovery": true,
-				"last_error":              "resuming remote verification after interrupted upload",
+				"last_error":              "resuming provider upload from durable spool after interruption",
 			}).Error
 	}); err != nil {
 		return err
@@ -8303,20 +8362,18 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		}
 	}()
 
-	if providerRequiresPayloadHash(row.Path) {
-		remotes, probeErr := m.refreshParent(row.Parent)
+	if m.uploadRequiresPayloadHash(row.Path) {
+		remotes, probeErr := m.listUploadParent(row.Parent)
 		if probeErr != nil {
 			if !errs.IsObjectNotFound(probeErr) {
 				m.failAfter(row, fmt.Errorf("check existing 115 object before upload: %w", probeErr), remoteVerificationRetryDelay(probeErr))
 				return
 			}
 		} else if comparison := m.completeExistingRemote(row, remotes); comparison == remoteContentMatch {
-			// A matching remote object satisfies this generation. Keep this branch
-			// terminal even if the completion write needs a retry; never fall
-			// through to another provider PUT after finding the exact content.
+			// An exact existing 115 object satisfies this generation without a PUT.
 			return
 		} else if comparison == remoteContentInconclusive {
-			m.fail(row, errors.New("waiting for a matching 115 SHA-1 before upload"))
+			m.failAfter(row, errors.New("115 retry preflight did not provide a reliable content identity"), retryDelay(row.RetryCount))
 			return
 		}
 	}
@@ -8332,6 +8389,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 			"provider_upload_started_at":   &uploadStartedAt,
 			"provider_upload_completed_at": nil,
 			"provider_uploaded_bytes":      0,
+			"provider_upload_attempts":     gorm.Expr("provider_upload_attempts + 1"),
 			"restart_upload_recovery":      false,
 		})
 	if res.Error != nil || res.RowsAffected == 0 {
@@ -8339,6 +8397,10 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 	row.ProviderUploadStartedAt = &uploadStartedAt
 	row.ProviderUploadCompletedAt = nil
+	row.ProviderUploadAttempts++
+	row.RestartUploadRecovery = false
+	row.State = StateUploading
+	attempt := row.ProviderUploadAttempts
 
 	obj := &model.Object{
 		Name:     row.Name,
@@ -8358,7 +8420,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 	var progressMu sync.Mutex
 	var lastProgressAt time.Time
-	lastProgressBytes := int64(-1)
+	lastProgressBytes := int64(0)
 	updateProviderProgress := func(progress float64) {
 		uploaded := providerUploadProgressBytes(row.Size, progress)
 		now := time.Now()
@@ -8370,14 +8432,30 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		if progress < 100 && !lastProgressAt.IsZero() && now.Sub(lastProgressAt) < time.Second {
 			return
 		}
+		delta := max(int64(0), uploaded-lastProgressBytes)
+		updates := map[string]any{"provider_uploaded_bytes": uploaded}
+		if attempt > 1 && delta > 0 {
+			updates["provider_retry_bytes"] = gorm.Expr("provider_retry_bytes + ?", delta)
+		}
+		res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
+			Updates(updates)
+		if res.Error != nil || res.RowsAffected == 0 {
+			return
+		}
 		lastProgressAt = now
 		lastProgressBytes = uploaded
-		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
-			Update("provider_uploaded_bytes", uploaded).Error
+		row.ProviderUploadedBytes = uploaded
+		if attempt > 1 {
+			row.ProviderRetryBytes += delta
+		}
 	}
-	err = fs.PutDirectlyWithProgress(m.ctx, row.Parent, fsStream, updateProviderProgress, true)
+	err = m.putProviderFile(row.Parent, fsStream, updateProviderProgress)
+	// The pre-upload LIST may now be stale even when the provider call returned
+	// an error: 115 can have accepted the payload before the response was lost.
+	providerParentSnapshots.invalidate(row.Parent)
 	if err != nil {
+		log.Warnf("write-back 115 upload attempt failed: id=%d path=%q generation=%d attempt=%d task_retries=%d bytes_reported=%d", row.ID, row.Path, row.Generation, attempt, row.RetryCount+1, row.ProviderUploadedBytes)
 		if errors.Is(err, ErrWritebackPaused) {
 			parkPausedUpload(row)
 		} else if providerProbeIsWAFBlock(err) {
@@ -8391,32 +8469,82 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		return
 	}
 	uploadCompletedAt := time.Now()
-	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
-		Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateUploading).
-		Updates(map[string]any{
-			"provider_upload_completed_at": &uploadCompletedAt,
-			"provider_uploaded_bytes":      row.Size,
-		}).Error
-	row.ProviderUploadCompletedAt = &uploadCompletedAt
+	if !m.completeProviderUpload(row, uploadCompletedAt) {
+		return
+	}
+}
 
-	var current model.WebDAVWritebackObject
-	if err := db.GetDb().
-		Select("generation", "canonical_state", "state", "path", "spool_path", "paused").
-		Take(&current, row.ID).Error; err != nil {
-		return
+func (m *workerManager) completeProviderUpload(row *model.WebDAVWritebackObject, completedAt time.Time) bool {
+	if row == nil {
+		return false
 	}
-	if current.Generation != row.Generation || canonicalDeleted(&current) || current.Path != row.Path {
-		if shouldRemoveStaleRemote(row.Path, &current) {
-			_ = fs.Remove(m.ctx, row.Path)
-		}
-		if current.SpoolPath != row.SpoolPath {
-			removeSpoolIfUnreferenced(row.SpoolPath)
-		}
-		return
+	providerProbeCooldowns.success(row.Parent)
+	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ? AND canonical_state = ?",
+			row.ID, row.Generation, StateUploading, CanonicalStateAcked).
+		Updates(map[string]any{
+			"state":                        StateCompleted,
+			"paused":                       false,
+			"retry_at":                     nil,
+			"last_error":                   "",
+			"resolution_reason":            "",
+			"completed_at":                 &completedAt,
+			"provider_upload_completed_at": &completedAt,
+			"provider_uploaded_bytes":      row.Size,
+			"remote_object_id":             "",
+			"remote_sha1":                  "",
+			"remote_generation":            0,
+			"remote_verified_at":           nil,
+			"verify_count":                 0,
+			"provider_evidence_first_at":   nil,
+			"provider_evidence_last_at":    nil,
+			"provider_evidence_count":      0,
+			"provider_evidence_result":     "",
+			"restart_upload_recovery":      false,
+		})
+	if res.Error != nil {
+		m.failAfter(row, fmt.Errorf("persist successful 115 upload: %w", res.Error), retryDelay(row.RetryCount))
+		return false
 	}
-	// Provider PUT success is not enough for backup correctness. Keep the
-	// canonical object visible while an independent verifier confirms 115.
-	m.scheduleProviderConfirmation(row, uploadCompletedAt)
+	if res.RowsAffected == 0 {
+		var current model.WebDAVWritebackObject
+		if err := db.GetDb().Select("generation", "canonical_state", "state", "path", "spool_path").Take(&current, row.ID).Error; err == nil {
+			if current.Generation != row.Generation || canonicalDeleted(&current) || current.Path != row.Path {
+				if shouldRemoveStaleRemote(row.Path, &current) {
+					_ = fs.Remove(m.ctx, row.Path)
+				}
+				if current.SpoolPath != row.SpoolPath {
+					removeSpoolIfUnreferenced(row.SpoolPath)
+				}
+			}
+		}
+		return false
+	}
+
+	row.State = StateCompleted
+	row.Paused = false
+	row.RetryAt = nil
+	row.LastError = ""
+	row.ResolutionReason = ""
+	row.CompletedAt = &completedAt
+	row.ProviderUploadCompletedAt = &completedAt
+	row.ProviderUploadedBytes = row.Size
+	row.RemoteObjectID = ""
+	row.RemoteSHA1 = ""
+	row.RemoteGeneration = 0
+	row.RemoteVerifiedAt = nil
+	row.VerifyCount = 0
+	row.ProviderEvidenceFirstAt = nil
+	row.ProviderEvidenceLastAt = nil
+	row.ProviderEvidenceCount = 0
+	row.ProviderEvidenceResult = ""
+	row.RestartUploadRecovery = false
+	clearManualPause(row.ID, row.Generation)
+	if row.ProviderUploadAttempts > 1 {
+		log.Infof("write-back 115 payload retransmission completed: id=%d path=%q generation=%d attempts=%d retry_bytes=%d", row.ID, row.Path, row.Generation, row.ProviderUploadAttempts, row.ProviderRetryBytes)
+	}
+	recordHistoryOutcomeBestEffort(row, HistoryResultCompleted, StateCompleted, historyRecoveryForCompletion(row), completedAt, "")
+	return true
 }
 
 func (m *workerManager) processMkdir(row *model.WebDAVWritebackObject) {
@@ -8644,6 +8772,14 @@ func remoteVerificationRetryDelay(err error) time.Duration {
 	return remoteVerificationInconclusiveDelay()
 }
 
+func remoteRecoveryRetryDelay(attempt int, err error) time.Duration {
+	delay := retryDelay(attempt)
+	if probeDelay := remoteVerificationRetryDelay(err); probeDelay > delay {
+		return probeDelay
+	}
+	return delay
+}
+
 func providerRepairNeedsVerification(state remoteVerificationState) bool {
 	return state == remoteVerificationInconclusive
 }
@@ -8747,7 +8883,7 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject, requir
 	if requireHash {
 		// 115 verification is deliberately simple: use one fresh parent LIST and
 		// accept the generation when any same-name object matches size + SHA-1.
-		objs, listErr := m.refreshParent(row.Parent)
+		objs, listErr := m.listUploadParent(row.Parent)
 		if listErr != nil {
 			return nil, listErr
 		}
@@ -8894,6 +9030,10 @@ func requireCloudSyncReupload(row *model.WebDAVWritebackObject, currentState, re
 	if row == nil || row.IsDir || row.CleanupPath != "" {
 		return false
 	}
+	availability, payloadErr := inspectDurableLocalPayload(row)
+	if payloadErr != nil || availability != durablePayloadMissing {
+		return false
+	}
 	now := time.Now()
 	recoveryStartedAt := row.RecoveryStartedAt
 	if recoveryStartedAt == nil {
@@ -9014,19 +9154,18 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 	remote, err := m.remoteForVerify(row, requireHash, shouldBatchVerificationSiblings(currentState, requireHash))
 	verification := classifyRemoteVerification(row, remote, err, requireHash)
 	if verification == remoteVerificationInconclusive {
-		next := now.Add(remoteVerificationRetryDelay(err))
+		retry := row.RetryCount + 1
 		lastError := "115 SHA-1 is not available yet; retrying"
 		if err != nil {
 			lastError = summarizeProviderProbeError(err)
 		}
 		updates := map[string]any{
-			"state":      StateVerifying,
-			"retry_at":   &next,
-			"last_error": lastError,
+			"state":       StateVerifying,
+			"retry_count": retry,
+			"last_error":  lastError,
 		}
-		if firstConfirmation {
-			updates["recovery_started_at"] = &startedAt
-		}
+		next := now.Add(remoteRecoveryRetryDelay(row.RetryCount, err))
+		updates["retry_at"] = &next
 		_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 			Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, currentState).
 			Updates(updates).Error
@@ -9042,14 +9181,14 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 			row,
 			currentState,
 			ResolutionVerificationExhausted,
-			fmt.Sprintf("115 content was not confirmed within %s after upload; exposing the path as missing so Cloud Sync can re-upload", providerConfirmationTimeout()),
+			fmt.Sprintf("local spool is missing and fresh 115 checks found no matching content for %s; exposing the path as missing for source resend", providerConfirmationTimeout()),
 			row.VerifyCount+1,
 			true,
 		)
 		return
 	}
 
-	next := now.Add(remoteVerificationInconclusiveDelay())
+	next := now.Add(remoteRecoveryRetryDelay(row.VerifyCount, nil))
 	updates := map[string]any{
 		"state":        StateVerifying,
 		"retry_at":     &next,
@@ -9079,6 +9218,29 @@ func (m *workerManager) processVerify(row *model.WebDAVWritebackObject) {
 				"last_error":   "directory verification state repaired to queued",
 			}).Error
 		return
+	}
+	if row.CleanupPath == "" {
+		availability, err := inspectDurableLocalPayload(row)
+		if err != nil {
+			m.failAfter(row, err, retryDelay(row.RetryCount))
+			return
+		}
+		if availability == durablePayloadAvailable {
+			now := time.Now()
+			res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
+				Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateVerifying).
+				Updates(map[string]any{
+					"state":                   StateQueued,
+					"retry_at":                &now,
+					"verify_count":            0,
+					"restart_upload_recovery": true,
+					"last_error":              "resuming provider upload from durable spool",
+				})
+			if res.Error == nil && res.RowsAffected > 0 {
+				wake()
+			}
+			return
+		}
 	}
 
 	requireHash := providerRequiresPayloadHash(row.Path)
@@ -9382,14 +9544,15 @@ func (m *workerManager) failAfter(row *model.WebDAVWritebackObject, err error, d
 		row.ID, row.Path, row.Generation, row.State, row.Size, row.RetryCount+1, err,
 	)
 	next := time.Now().Add(delay)
+	updates := map[string]any{
+		"state":       StateQueued,
+		"retry_at":    &next,
+		"retry_count": row.RetryCount + 1,
+		"last_error":  err.Error(),
+	}
 	_ = db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ?", row.ID, row.Generation).
-		Updates(map[string]any{
-			"state":       StateQueued,
-			"retry_at":    &next,
-			"retry_count": row.RetryCount + 1,
-			"last_error":  err.Error(),
-		}).Error
+		Updates(updates).Error
 }
 
 func (m *workerManager) fail(row *model.WebDAVWritebackObject, err error) {

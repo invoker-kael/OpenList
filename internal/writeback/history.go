@@ -124,6 +124,9 @@ func buildWritebackHistory(row *model.WebDAVWritebackObject, result, finalState,
 		DurableAt:                 durableAt,
 		ProviderUploadStartedAt:   cloneHistoryTime(row.ProviderUploadStartedAt),
 		ProviderUploadCompletedAt: cloneHistoryTime(row.ProviderUploadCompletedAt),
+		ClientDuplicatePuts:       row.ClientDuplicatePuts,
+		ProviderUploadAttempts:    row.ProviderUploadAttempts,
+		ProviderRetryBytes:        row.ProviderRetryBytes,
 		CompletedAt:               completedAt,
 		Result:                    result,
 		FinalState:                finalState,
@@ -196,6 +199,15 @@ func upsertWritebackHistory(database *gorm.DB, value *model.WebDAVWritebackHisto
 	}
 	if existing.ProviderUploadCompletedAt == nil && value.ProviderUploadCompletedAt != nil {
 		updates["provider_upload_completed_at"] = value.ProviderUploadCompletedAt
+	}
+	if value.ClientDuplicatePuts > existing.ClientDuplicatePuts {
+		updates["client_duplicate_puts"] = value.ClientDuplicatePuts
+	}
+	if value.ProviderUploadAttempts > existing.ProviderUploadAttempts {
+		updates["provider_upload_attempts"] = value.ProviderUploadAttempts
+	}
+	if value.ProviderRetryBytes > existing.ProviderRetryBytes {
+		updates["provider_retry_bytes"] = value.ProviderRetryBytes
 	}
 	if existing.CompletedAt == nil && value.CompletedAt != nil {
 		updates["completed_at"] = value.CompletedAt

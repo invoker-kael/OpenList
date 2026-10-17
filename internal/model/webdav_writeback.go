@@ -30,6 +30,9 @@ type WebDAVWritebackObject struct {
 	ProviderUploadStartedAt   *time.Time `json:"provider_upload_started_at"`
 	ProviderUploadCompletedAt *time.Time `json:"provider_upload_completed_at"`
 	ProviderUploadedBytes     int64      `json:"provider_uploaded_bytes"`
+	ClientDuplicatePuts       int        `json:"client_duplicate_puts"`
+	ProviderUploadAttempts    int        `json:"provider_upload_attempts"`
+	ProviderRetryBytes        int64      `json:"provider_retry_bytes"`
 	RestartUploadRecovery     bool       `json:"restart_upload_recovery"`
 	RecoveryStartedAt         *time.Time `json:"recovery_started_at"`
 	CloudSyncReuploadRequired bool       `json:"cloudsync_reupload_required" gorm:"index"`
@@ -73,6 +76,9 @@ type WebDAVWritebackHistory struct {
 	DurableAt                 *time.Time `json:"durable_at"`
 	ProviderUploadStartedAt   *time.Time `json:"provider_upload_started_at"`
 	ProviderUploadCompletedAt *time.Time `json:"provider_upload_completed_at"`
+	ClientDuplicatePuts       int        `json:"client_duplicate_puts"`
+	ProviderUploadAttempts    int        `json:"provider_upload_attempts"`
+	ProviderRetryBytes        int64      `json:"provider_retry_bytes"`
 	CompletedAt               *time.Time `json:"completed_at" gorm:"index"`
 	Result                    string     `json:"result" gorm:"size:32;index"`
 	FinalState                string     `json:"final_state" gorm:"size:128"`

@@ -1,6 +1,11 @@
 package writeback
 
 import (
+	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -163,9 +168,11 @@ func TestExisting115MatchCompletesQueuedGenerationBeforeUpload(t *testing.T) {
 	}
 }
 
-func TestCloudSyncReuploadFailureHidesCanonicalAndReleasesSpool(t *testing.T) {
+func TestCloudSyncReuploadRefusesWhileSpoolIsAvailable(t *testing.T) {
 	oldConf := conf.Conf
-	conf.Conf = &conf.Config{Database: conf.Database{Type: "sqlite"}}
+	cfg := validAdminConfig()
+	cfg.SpoolDir = t.TempDir()
+	conf.Conf = &conf.Config{Database: conf.Database{Type: "sqlite"}, WebDAVWriteback: cfg}
 	defer func() { conf.Conf = oldConf }()
 
 	database, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
@@ -194,18 +201,400 @@ func TestCloudSyncReuploadFailureHidesCanonicalAndReleasesSpool(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !requireCloudSyncReupload(&row, StateVerifying, ResolutionVerificationExhausted, "115 content was not confirmed", 3, true) {
-		t.Fatal("confirmed upload failure should request a Cloud Sync re-upload")
+	if requireCloudSyncReupload(&row, StateVerifying, ResolutionVerificationExhausted, "115 content was not confirmed", 3, true) {
+		t.Fatal("Cloud Sync re-upload must not be requested while the durable spool is available")
 	}
 	obj, found, deleted, err := Canonical(row.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !found || !deleted || obj != nil {
-		t.Fatalf("canonical path after failure = (%v, %v, %v), want a tombstone", obj, found, deleted)
+	if !found || deleted || obj == nil {
+		t.Fatalf("canonical path after inconclusive provider result = (%v, %v, %v), want the ACKed object", obj, found, deleted)
 	}
-	if _, err := os.Stat(spool); !os.IsNotExist(err) {
-		t.Fatalf("released spool still exists or returned unexpected error: %v", err)
+	if _, err := os.Stat(spool); err != nil {
+		t.Fatalf("durable spool was removed or returned unexpected error: %v", err)
+	}
+}
+
+func setupUploadLifecycleTest(t *testing.T) (*gorm.DB, string) {
+	t.Helper()
+	oldConf := conf.Conf
+	spoolDir := t.TempDir()
+	conf.Conf = &conf.Config{
+		Database: conf.Database{Type: "sqlite"},
+		WebDAVWriteback: conf.WebDAVWritebackConfig{
+			Enabled:                 true,
+			SpoolDir:                spoolDir,
+			Workers:                 1,
+			UploadWorkers:           1,
+			LargeUploadWorkers:      1,
+			ProviderProbeWorkers:    1,
+			RetryInitialSeconds:     1,
+			RetryMaxSeconds:         2,
+			VerifyIntervalSeconds:   1,
+			VerifyAttempts:          3,
+			CompletedCacheTTLMinutes: 30,
+		},
+	}
+	database, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Init(database)
+	t.Cleanup(func() { conf.Conf = oldConf })
+	return database, spoolDir
+}
+
+func createUploadLifecycleRow(t *testing.T, database *gorm.DB, spoolDir, payload string) model.WebDAVWritebackObject {
+	t.Helper()
+	spool := filepath.Join(spoolDir, "payload.data")
+	if err := os.WriteFile(spool, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha1.Sum([]byte(payload))
+	row := model.WebDAVWritebackObject{
+		PathKey:        pathKey("/backup/file.bin"),
+		ParentKey:      pathKey("/backup"),
+		Path:           "/backup/file.bin",
+		Parent:         "/backup",
+		Name:           "file.bin",
+		Generation:     1,
+		CanonicalState: CanonicalStateAcked,
+		State:          StateQueued,
+		Size:           int64(len(payload)),
+		PayloadSHA1:    hex.EncodeToString(hash[:]),
+		SpoolPath:      spool,
+	}
+	if err := database.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func reloadUploadLifecycleRow(t *testing.T, database *gorm.DB, id uint) model.WebDAVWritebackObject {
+	t.Helper()
+	var row model.WebDAVWritebackObject
+	if err := database.First(&row, id).Error; err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func TestProcessUploadCompletesOnProviderSuccessWithoutPostUploadVerification(t *testing.T) {
+	database, spoolDir := setupUploadLifecycleTest(t)
+	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
+	listCalls, putCalls := 0, 0
+	manager := &workerManager{
+		ctx: context.Background(),
+		requireHash: func(string) bool { return true },
+		listParent: func(string) ([]model.Obj, error) {
+			listCalls++
+			return nil, nil
+		},
+		putProvider: func(_ string, file model.FileStreamer, progress model.UpdateProgress) error {
+			putCalls++
+			if _, err := io.Copy(io.Discard, file); err != nil {
+				return err
+			}
+			progress(100)
+			return nil
+		},
+	}
+
+	manager.processUpload(&row)
+
+	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	if saved.State != StateCompleted || saved.ProviderUploadCompletedAt == nil {
+		t.Fatalf("provider success state=%q completed_at=%v, want completed", saved.State, saved.ProviderUploadCompletedAt)
+	}
+	if saved.RemoteVerifiedAt != nil || saved.RemoteSHA1 != "" {
+		t.Fatalf("normal upload unexpectedly required remote verification: verified_at=%v remote_sha1=%q", saved.RemoteVerifiedAt, saved.RemoteSHA1)
+	}
+	if saved.ProviderUploadAttempts != 1 || putCalls != 1 || listCalls != 1 {
+		t.Fatalf("attempts=%d PUTs=%d preflight LISTs=%d, want 1/1/1", saved.ProviderUploadAttempts, putCalls, listCalls)
+	}
+}
+
+func TestProcessUploadSkipsPUTWhenFreshListHasExactContent(t *testing.T) {
+	database, spoolDir := setupUploadLifecycleTest(t)
+	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
+	remote := &model.Object{
+		Name:     row.Name,
+		Size:     row.Size,
+		HashInfo: utils.NewHashInfo(utils.SHA1, row.PayloadSHA1),
+	}
+	putCalls := 0
+	manager := &workerManager{
+		ctx:         context.Background(),
+		requireHash: func(string) bool { return true },
+		listParent: func(string) ([]model.Obj, error) { return []model.Obj{remote}, nil },
+		putProvider: func(string, model.FileStreamer, model.UpdateProgress) error {
+			putCalls++
+			return nil
+		},
+	}
+
+	manager.processUpload(&row)
+
+	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	if saved.State != StateCompleted || saved.RemoteSHA1 != row.PayloadSHA1 || saved.ProviderUploadAttempts != 0 {
+		t.Fatalf("existing exact object state=%q remote_sha1=%q attempts=%d", saved.State, saved.RemoteSHA1, saved.ProviderUploadAttempts)
+	}
+	if putCalls != 0 {
+		t.Fatalf("provider PUTs=%d for exact fresh-list match, want 0", putCalls)
+	}
+}
+
+func TestProcessUploadProviderErrorKeepsSpoolAndExactRetryMatchAvoidsSecondPut(t *testing.T) {
+	database, spoolDir := setupUploadLifecycleTest(t)
+	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
+	hash := row.PayloadSHA1
+	listCalls, putCalls := 0, 0
+	remote := &model.Object{Name: row.Name, Size: row.Size, HashInfo: utils.NewHashInfo(utils.SHA1, hash)}
+	manager := &workerManager{
+		ctx: context.Background(),
+		requireHash: func(string) bool { return true },
+		listParent: func(string) ([]model.Obj, error) {
+			listCalls++
+			if listCalls == 1 {
+				return nil, nil
+			}
+			return []model.Obj{remote}, nil
+		},
+		putProvider: func(_ string, file model.FileStreamer, progress model.UpdateProgress) error {
+			putCalls++
+			buf := make([]byte, 4)
+			_, _ = file.Read(buf)
+			progress(40)
+			return errors.New("provider response timed out after accepting the payload")
+		},
+	}
+
+	manager.processUpload(&row)
+	failedAttempt := reloadUploadLifecycleRow(t, database, row.ID)
+	if failedAttempt.State != StateQueued || failedAttempt.CanonicalState != CanonicalStateAcked || failedAttempt.RetryCount != 1 {
+		t.Fatalf("provider error state=%q canonical=%q retries=%d, want queued/ACKed/1", failedAttempt.State, failedAttempt.CanonicalState, failedAttempt.RetryCount)
+	}
+	if _, err := os.Stat(failedAttempt.SpoolPath); err != nil {
+		t.Fatalf("provider error discarded durable spool: %v", err)
+	}
+
+	manager.processUpload(&failedAttempt)
+	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	if saved.State != StateCompleted || saved.RemoteSHA1 != hash {
+		t.Fatalf("retry matching existing object did not complete: state=%q remote_sha1=%q", saved.State, saved.RemoteSHA1)
+	}
+	if putCalls != 1 || listCalls != 2 {
+		t.Fatalf("PUTs=%d preflight LISTs=%d, want one PUT and one retry LIST", putCalls, listCalls)
+	}
+}
+
+func TestProcessUploadListErrorDoesNotBecomeMissingOrStartPut(t *testing.T) {
+	database, spoolDir := setupUploadLifecycleTest(t)
+	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
+	putCalls := 0
+	manager := &workerManager{
+		ctx:         context.Background(),
+		requireHash: func(string) bool { return true },
+		listParent: func(string) ([]model.Obj, error) {
+			return nil, errors.New("115 rate limit")
+		},
+		putProvider: func(string, model.FileStreamer, model.UpdateProgress) error {
+			putCalls++
+			return nil
+		},
+	}
+
+	manager.processUpload(&row)
+
+	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	if saved.State != StateQueued || saved.CanonicalState != CanonicalStateAcked || saved.CloudSyncReuploadRequired {
+		t.Fatalf("list API error changed client-visible existence: state=%q canonical=%q reupload=%v", saved.State, saved.CanonicalState, saved.CloudSyncReuploadRequired)
+	}
+	if putCalls != 0 {
+		t.Fatalf("provider PUTs=%d after inconclusive LIST, want 0", putCalls)
+	}
+	if _, err := os.Stat(saved.SpoolPath); err != nil {
+		t.Fatalf("list API error discarded durable spool: %v", err)
+	}
+}
+
+func TestProcessRemoteVerificationAPIErrorRemainsRetryable(t *testing.T) {
+	database, _ := setupUploadLifecycleTest(t)
+	row := model.WebDAVWritebackObject{
+		PathKey:        pathKey("/backup/file.bin"),
+		ParentKey:      pathKey("/backup"),
+		Path:           "/backup/file.bin",
+		Parent:         "/backup",
+		Name:           "file.bin",
+		Generation:     1,
+		CanonicalState: CanonicalStateAcked,
+		State:          StateVerifying,
+		Size:           100,
+	}
+	if err := database.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	manager := &workerManager{
+		ctx:         context.Background(),
+		requireHash: func(string) bool { return true },
+		listParent: func(string) ([]model.Obj, error) {
+			return nil, errors.New("115 API timeout")
+		},
+	}
+
+	manager.processRemoteVerification(&row, StateVerifying, true)
+
+	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	if saved.State != StateVerifying || saved.CanonicalState != CanonicalStateAcked || saved.CloudSyncReuploadRequired {
+		t.Fatalf("API error state=%q canonical=%q reupload=%v, want retryable/ACKed/not-reuploading", saved.State, saved.CanonicalState, saved.CloudSyncReuploadRequired)
+	}
+	if saved.RetryCount != 1 || saved.VerifyCount != 0 {
+		t.Fatalf("API error retry_count=%d verify_count=%d, want retry=1 and no missing confirmation", saved.RetryCount, saved.VerifyCount)
+	}
+}
+
+func TestRecoverInterruptedUploadQueuesDurableSpoolForPreflight(t *testing.T) {
+	database, spoolDir := setupUploadLifecycleTest(t)
+	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
+	if err := database.Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ?", row.ID, row.Generation).
+		Updates(map[string]any{"state": StateUploading, "provider_upload_attempts": 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	manager := &workerManager{}
+	if err := manager.recoverInterrupted(); err != nil {
+		t.Fatal(err)
+	}
+	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	if saved.State != StateQueued || !saved.RestartUploadRecovery || saved.CanonicalState != CanonicalStateAcked {
+		t.Fatalf("restart state=%q recovery=%v canonical=%q, want queued preflight/ACKed", saved.State, saved.RestartUploadRecovery, saved.CanonicalState)
+	}
+	if _, err := os.Stat(saved.SpoolPath); err != nil {
+		t.Fatalf("restart recovery discarded durable spool: %v", err)
+	}
+}
+
+func TestProcessUploadCountsOnlyRepeatedProviderBytes(t *testing.T) {
+	database, spoolDir := setupUploadLifecycleTest(t)
+	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
+	putCalls := 0
+	manager := &workerManager{
+		ctx:         context.Background(),
+		requireHash: func(string) bool { return true },
+		listParent: func(string) ([]model.Obj, error) { return nil, nil },
+		putProvider: func(_ string, file model.FileStreamer, progress model.UpdateProgress) error {
+			putCalls++
+			if _, err := io.Copy(io.Discard, file); err != nil {
+				return err
+			}
+			progress(50)
+			if putCalls == 1 {
+				return errors.New("115 temporary upload error")
+			}
+			progress(100)
+			return nil
+		},
+	}
+
+	manager.processUpload(&row)
+	retry := reloadUploadLifecycleRow(t, database, row.ID)
+	manager.processUpload(&retry)
+
+	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	if saved.State != StateCompleted || saved.ProviderUploadAttempts != 2 || saved.RetryCount != 1 {
+		t.Fatalf("state=%q provider_attempts=%d retries=%d, want completed/2/1", saved.State, saved.ProviderUploadAttempts, saved.RetryCount)
+	}
+	if saved.ProviderRetryBytes != saved.Size {
+		t.Fatalf("retry bytes=%d, want one payload size %d", saved.ProviderRetryBytes, saved.Size)
+	}
+	var history model.WebDAVWritebackHistory
+	if err := database.Where("path_key = ? AND generation = ?", saved.PathKey, saved.Generation).Take(&history).Error; err != nil {
+		t.Fatal(err)
+	}
+	if history.ProviderUploadAttempts != 2 || history.ProviderRetryBytes != saved.Size {
+		t.Fatalf("history attempts=%d retry_bytes=%d, want 2/%d", history.ProviderUploadAttempts, history.ProviderRetryBytes, saved.Size)
+	}
+}
+
+func TestCommitDoesNotAcknowledgeWhenSpoolDirectorySyncFails(t *testing.T) {
+	database, spoolDir := setupUploadLifecycleTest(t)
+	oldSync := syncSpoolDirectory
+	syncSpoolDirectory = func(string) error { return errors.New("directory sync failed") }
+	defer func() { syncSpoolDirectory = oldSync }()
+
+	payload := "durable payload"
+	if _, _, err := Commit(context.Background(), "/backup/file.bin", strings.NewReader(payload), int64(len(payload)), time.Time{}, time.Time{}, ""); err == nil {
+		t.Fatal("Commit succeeded without durable spool directory metadata")
+	}
+	var count int64
+	if err := database.Model(&model.WebDAVWritebackObject{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("ACKed writeback rows=%d after spool sync failure, want 0", count)
+	}
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spool entries=%v after failed durable commit, want none", entries)
+	}
+}
+
+func TestCommitCoalescesCompletedSameContentWithoutCreatingGeneration(t *testing.T) {
+	database, spoolDir := setupUploadLifecycleTest(t)
+	payload := "durable payload"
+	first, _, err := Commit(context.Background(), "/backup/file.bin", strings.NewReader(payload), int64(len(payload)), time.Time{}, time.Time{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedAt := time.Now()
+	if err := database.Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ?", first.ID, first.Generation).
+		Updates(map[string]any{
+			"state":                         StateCompleted,
+			"completed_at":                  &completedAt,
+			"provider_upload_completed_at": &completedAt,
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	second, created, err := Commit(context.Background(), "/backup/file.bin", strings.NewReader(payload), int64(len(payload)), time.Time{}, time.Time{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := database.Model(&model.WebDAVWritebackObject{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if created || count != 1 || second.ID != first.ID || second.Generation != first.Generation || second.State != StateCompleted || second.ClientDuplicatePuts != 1 {
+		t.Fatalf("duplicate PUT created=%v rows=%d id=%d generation=%d state=%q duplicates=%d; want one unchanged completed generation", created, count, second.ID, second.Generation, second.State, second.ClientDuplicatePuts)
+	}
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("spool entries=%d after coalesced PUT, want only the original payload", len(entries))
+	}
+
+	differentPayload := "different payload"
+	third, created, err := Commit(context.Background(), "/backup/file.bin", strings.NewReader(differentPayload), int64(len(differentPayload)), time.Time{}, time.Time{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || third.ID != first.ID || third.Generation <= first.Generation || third.State != StateQueued || third.ClientDuplicatePuts != 0 {
+		t.Fatalf("different content created=%v id=%d generation=%d state=%q duplicates=%d, want new generation on same row", created, third.ID, third.Generation, third.State, third.ClientDuplicatePuts)
+	}
+	entries, err = os.ReadDir(spoolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("spool entries=%d after content change, want only the new generation payload", len(entries))
 	}
 }
 
