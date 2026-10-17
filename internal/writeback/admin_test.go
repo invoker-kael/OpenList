@@ -914,6 +914,49 @@ func TestClientDuplicatePutCoalescesOnlyWhenSpoolHashMatches(t *testing.T) {
 	}
 }
 
+func TestClientDuplicatePutCoalescesToOneProviderUpload(t *testing.T) {
+	database, _ := setupUploadLifecycleTest(t)
+	payload := "durable payload"
+	first, _, err := Commit(context.Background(), "/backup/file.bin", strings.NewReader(payload), int64(len(payload)), time.Time{}, time.Time{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, created, err := Commit(context.Background(), "/backup/file.bin", strings.NewReader(payload), int64(len(payload)), time.Time{}, time.Time{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || duplicate.Generation != first.Generation || duplicate.ClientDuplicatePuts != 1 {
+		t.Fatalf("duplicate PUT created=%v first_generation=%d duplicate=%+v", created, first.Generation, duplicate)
+	}
+
+	var providerPUTs int
+	var providerBytes int64
+	manager := &workerManager{
+		ctx:         context.Background(),
+		requireHash: func(string) bool { return true },
+		listParent:  func(string) ([]model.Obj, error) { return nil, nil },
+		putProvider: func(_ string, file model.FileStreamer, progress model.UpdateProgress) error {
+			providerPUTs++
+			written, err := io.Copy(io.Discard, file)
+			providerBytes += written
+			if err != nil {
+				return err
+			}
+			progress(100)
+			return nil
+		},
+	}
+	manager.processUpload(duplicate)
+
+	completed := reloadUploadLifecycleRow(t, database, duplicate.ID)
+	if completed.State != StateCompleted || completed.ClientDuplicatePuts != 1 {
+		t.Fatalf("row after upload=%+v, want completed generation with one coalesced PUT", completed)
+	}
+	if providerPUTs != 1 || providerBytes != int64(len(payload)) {
+		t.Fatalf("provider PUTs=%d bytes=%d, want one PUT of %d bytes", providerPUTs, providerBytes, len(payload))
+	}
+}
+
 func TestCompletedDuplicateWithCorruptSpoolKeepsNoExtraCache(t *testing.T) {
 	database, spoolDir := setupUploadLifecycleTest(t)
 	payload := "durable payload"
