@@ -3843,12 +3843,12 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 					applyDuplicatePutMetadata(&row, modTime, createTime, mime, modTimeProvided, createTimeProvided)
 					markCanonicalAcked(&row, time.Now())
 					updates := map[string]any{
-						"mod_time":        row.ModTime,
-						"create_time":     row.CreateTime,
-						"mime_type":       row.MimeType,
-						"canonical_state": row.CanonicalState,
-						"ack_time":        row.AckTime,
-						"durable_at":      row.DurableAt,
+						"mod_time":              row.ModTime,
+						"create_time":           row.CreateTime,
+						"mime_type":             row.MimeType,
+						"canonical_state":       row.CanonicalState,
+						"ack_time":              row.AckTime,
+						"durable_at":            row.DurableAt,
 						"client_duplicate_puts": row.ClientDuplicatePuts,
 					}
 					if err := tx.Model(&model.WebDAVWritebackObject{}).

@@ -223,16 +223,16 @@ func setupUploadLifecycleTest(t *testing.T) (*gorm.DB, string) {
 	conf.Conf = &conf.Config{
 		Database: conf.Database{Type: "sqlite"},
 		WebDAVWriteback: conf.WebDAVWritebackConfig{
-			Enabled:                 true,
-			SpoolDir:                spoolDir,
-			Workers:                 1,
-			UploadWorkers:           1,
-			LargeUploadWorkers:      1,
-			ProviderProbeWorkers:    1,
-			RetryInitialSeconds:     1,
-			RetryMaxSeconds:         2,
-			VerifyIntervalSeconds:   1,
-			VerifyAttempts:          3,
+			Enabled:                  true,
+			SpoolDir:                 spoolDir,
+			Workers:                  1,
+			UploadWorkers:            1,
+			LargeUploadWorkers:       1,
+			ProviderProbeWorkers:     1,
+			RetryInitialSeconds:      1,
+			RetryMaxSeconds:          2,
+			VerifyIntervalSeconds:    1,
+			VerifyAttempts:           3,
 			CompletedCacheTTLMinutes: 30,
 		},
 	}
@@ -285,7 +285,7 @@ func TestProcessUploadCompletesOnProviderSuccessWithoutPostUploadVerification(t 
 	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
 	listCalls, putCalls := 0, 0
 	manager := &workerManager{
-		ctx: context.Background(),
+		ctx:         context.Background(),
 		requireHash: func(string) bool { return true },
 		listParent: func(string) ([]model.Obj, error) {
 			listCalls++
@@ -327,7 +327,7 @@ func TestProcessUploadSkipsPUTWhenFreshListHasExactContent(t *testing.T) {
 	manager := &workerManager{
 		ctx:         context.Background(),
 		requireHash: func(string) bool { return true },
-		listParent: func(string) ([]model.Obj, error) { return []model.Obj{remote}, nil },
+		listParent:  func(string) ([]model.Obj, error) { return []model.Obj{remote}, nil },
 		putProvider: func(string, model.FileStreamer, model.UpdateProgress) error {
 			putCalls++
 			return nil
@@ -483,7 +483,7 @@ func TestProcessUploadCountsOnlyRepeatedProviderBytes(t *testing.T) {
 	manager := &workerManager{
 		ctx:         context.Background(),
 		requireHash: func(string) bool { return true },
-		listParent: func(string) ([]model.Obj, error) { return nil, nil },
+		listParent:  func(string) ([]model.Obj, error) { return nil, nil },
 		putProvider: func(_ string, file model.FileStreamer, progress model.UpdateProgress) error {
 			putCalls++
 			if _, err := io.Copy(io.Discard, file); err != nil {
@@ -555,8 +555,8 @@ func TestCommitCoalescesCompletedSameContentWithoutCreatingGeneration(t *testing
 	if err := database.Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ?", first.ID, first.Generation).
 		Updates(map[string]any{
-			"state":                         StateCompleted,
-			"completed_at":                  &completedAt,
+			"state":                        StateCompleted,
+			"completed_at":                 &completedAt,
 			"provider_upload_completed_at": &completedAt,
 		}).Error; err != nil {
 		t.Fatal(err)
