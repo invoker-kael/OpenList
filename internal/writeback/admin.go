@@ -519,3 +519,53 @@ func CancelTasks(ids []uint, all bool) (int64, error) {
 func VerifyNow(ids []uint) (int64, error) {
 	return ReuploadNow(ids)
 }
+
+
+type RebuildAllResult struct {
+	Tasks              int64 `json:"tasks"`
+	History            int64 `json:"history"`
+	ReceiveFences      int64 `json:"receive_fences"`
+	Reservations       int64 `json:"reservations"`
+	ProviderOperations int64 `json:"provider_operations"`
+}
+
+func RebuildAllTaskRecords() (RebuildAllResult, error) {
+	rebuildGate.Lock()
+	defer rebuildGate.Unlock()
+
+	Stop()
+	defer Start()
+
+	result := RebuildAllResult{}
+	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		deleteAll := func(dst any) (int64, error) {
+			res := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(dst)
+			return res.RowsAffected, res.Error
+		}
+		var err error
+		if result.ProviderOperations, err = deleteAll(&model.WebDAVProviderOperation{}); err != nil {
+			return err
+		}
+		if result.Reservations, err = deleteAll(&model.WebDAVWritebackReceiveReservation{}); err != nil {
+			return err
+		}
+		if result.ReceiveFences, err = deleteAll(&model.WebDAVWritebackReceiveFence{}); err != nil {
+			return err
+		}
+		if result.History, err = deleteAll(&model.WebDAVWritebackHistory{}); err != nil {
+			return err
+		}
+		if result.Tasks, err = deleteAll(&model.WebDAVWritebackObject{}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return result, err
+	}
+
+	providerParentSnapshots.clear()
+	providerProbeCooldowns.clear()
+	clearAllManualPauseRequests()
+	return result, nil
+}

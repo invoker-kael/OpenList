@@ -204,6 +204,7 @@ func admin(g *gin.RouterGroup) {
 	webdavWriteback.POST("/batch-action", handles.WebDAVWritebackBatchAction)
 	webdavWriteback.POST("/reupload-now", handles.WebDAVWritebackReuploadNow)
 	webdavWriteback.POST("/verify-now", handles.WebDAVWritebackVerifyNow)
+	webdavWriteback.POST("/rebuild-all", handles.WebDAVWritebackRebuildAll)
 }
 
 func fsAndShare(g *gin.RouterGroup) {

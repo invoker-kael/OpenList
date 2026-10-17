@@ -1293,3 +1293,13 @@ func WebDAVWritebackBatchAction(c *gin.Context) {
 func WebDAVWritebackVerifyNow(c *gin.Context) {
 	WebDAVWritebackReuploadNow(c)
 }
+
+
+func WebDAVWritebackRebuildAll(c *gin.Context) {
+	result, err := writeback.RebuildAllTaskRecords()
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError)
+		return
+	}
+	common.SuccessResp(c, result)
+}

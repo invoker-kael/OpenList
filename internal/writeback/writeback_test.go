@@ -3013,6 +3013,21 @@ func TestRemoteVerificationInconclusiveDelayUsesVerificationCadence(t *testing.T
 	}
 }
 
+func TestCompletedSpoolReleaseAcceptsRemoteSatisfiedGeneration(t *testing.T) {
+	now := time.Now()
+	completed := now.Add(-time.Minute)
+	providerSatisfied := now.Add(-30 * time.Second)
+	row := &model.WebDAVWritebackObject{
+		State:                     StateCompleted,
+		SpoolPath:                 "/tmp/existing-remote.data",
+		CompletedAt:               &completed,
+		ProviderUploadCompletedAt: &providerSatisfied,
+	}
+	if !completedSpoolReleaseEligible(row, now) {
+		t.Fatal("remote-satisfied completed generation should be eligible for spool release")
+	}
+}
+
 func TestMatchingRemoteContentByNameChecksAllSameNameCandidates(t *testing.T) {
 	sha := strings.Repeat("a", 40)
 	row := &model.WebDAVWritebackObject{Name: "same.bin", Size: 10, PayloadSHA1: sha}

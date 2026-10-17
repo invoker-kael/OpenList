@@ -3666,6 +3666,8 @@ func durableCommitContext(ctx context.Context) context.Context {
 // Commit receives the complete opaque WebDAV object into the local spool and
 // only then commits a new canonical generation into MySQL.
 func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTime, createTime time.Time, mime string) (*model.WebDAVWritebackObject, bool, error) {
+	rebuildGate.RLock()
+	defer rebuildGate.RUnlock()
 	if !Enabled() {
 		return nil, false, errors.New("WebDAV write-back is disabled")
 	}
@@ -3935,6 +3937,8 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 // persists directory creation so provider-side path visibility can catch up in
 // the background.
 func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*model.WebDAVWritebackObject, bool, error) {
+	rebuildGate.RLock()
+	defer rebuildGate.RUnlock()
 	if !Enabled() {
 		return nil, false, errors.New("WebDAV write-back is disabled")
 	}
@@ -6235,6 +6239,7 @@ func (g *providerRefreshGroup) do(stop <-chan struct{}, parent string, refresh f
 var (
 	providerParentSnapshots providerRefreshGroup
 	providerProbeCooldowns  providerProbeCooldownGroup
+	rebuildGate             sync.RWMutex
 )
 
 // ProviderListForWebDAV serves ordinary directory revalidation from a recent
@@ -8281,6 +8286,20 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	row.ProviderUploadStartedAt = &uploadStartedAt
 	row.ProviderUploadCompletedAt = nil
 
+	if providerRequiresPayloadHash(row.Path) {
+		remotes, probeErr := m.refreshParent(row.Parent)
+		if probeErr != nil {
+			if !errs.IsObjectNotFound(probeErr) {
+				m.fail(row, fmt.Errorf("check existing 115 object before upload: %w", probeErr))
+				return
+			}
+		} else if remote := matchingRemoteContentByName(row, remotes, true); remote != nil {
+			if m.completeRemoteVerification(row, remote, []string{StateUploading}, true) {
+				return
+			}
+		}
+	}
+
 	obj := &model.Object{
 		Name:     row.Name,
 		Size:     row.Size,
@@ -8796,6 +8815,9 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 		"remote_generation":       evidence.generation,
 		"remote_verified_at":      &evidence.verifiedAt,
 		"restart_upload_recovery": false,
+	}
+	if row.ProviderUploadCompletedAt == nil {
+		updates["provider_upload_completed_at"] = &now
 	}
 	updates = mergeUpdateMaps(updates, applyProviderEvidence(row, now, "matched"))
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
