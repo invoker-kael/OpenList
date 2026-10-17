@@ -3013,6 +3013,21 @@ func TestRemoteVerificationInconclusiveDelayUsesVerificationCadence(t *testing.T
 	}
 }
 
+func TestRebuildStateRejectsNewMutationWithoutBlocking(t *testing.T) {
+	if !beginRebuild() {
+		t.Fatal("expected rebuild state to start")
+	}
+	defer endRebuild()
+
+	if !Rebuilding() {
+		t.Fatal("rebuild state should be visible")
+	}
+	if enterWritebackMutation() {
+		rebuildGate.RUnlock()
+		t.Fatal("new writeback mutation must be rejected while rebuilding")
+	}
+}
+
 func TestCompletedSpoolReleaseAcceptsRemoteSatisfiedGeneration(t *testing.T) {
 	now := time.Now()
 	completed := now.Add(-time.Minute)

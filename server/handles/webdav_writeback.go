@@ -30,6 +30,7 @@ type webDAVWritebackStateSummary struct {
 
 type webDAVWritebackSummary struct {
 	Enabled                   bool                                   `json:"enabled"`
+	Rebuilding                bool                                   `json:"rebuilding"`
 	Workers                   int                                    `json:"workers"`
 	Receiving                 int64                                  `json:"receiving"`
 	ReceivingExpectedBytes    int64                                  `json:"receiving_expected_bytes"`
@@ -227,6 +228,7 @@ func WebDAVWritebackMonitorSummary(c *gin.Context) {
 
 	common.SuccessResp(c, webDAVWritebackSummary{
 		Enabled:                   writeback.Enabled(),
+		Rebuilding:                writeback.Rebuilding(),
 		Workers:                   conf.Conf.WebDAVWriteback.Workers,
 		Receiving:                 receiving,
 		ReceivingExpectedBytes:    receivingExpectedBytes,
@@ -1295,10 +1297,9 @@ func WebDAVWritebackVerifyNow(c *gin.Context) {
 }
 
 func WebDAVWritebackRebuildAll(c *gin.Context) {
-	result, err := writeback.RebuildAllTaskRecords()
-	if err != nil {
-		common.ErrorResp(c, err, http.StatusInternalServerError)
-		return
-	}
-	common.SuccessResp(c, result)
+	started := writeback.StartRebuildAllTaskRecords()
+	common.SuccessResp(c, gin.H{
+		"started":    started,
+		"rebuilding": writeback.Rebuilding(),
+	})
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/shirou/gopsutil/v4/disk"
+	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
 
@@ -526,6 +527,29 @@ type RebuildAllResult struct {
 	ReceiveFences      int64 `json:"receive_fences"`
 	Reservations       int64 `json:"reservations"`
 	ProviderOperations int64 `json:"provider_operations"`
+}
+
+func StartRebuildAllTaskRecords() bool {
+	if !beginRebuild() {
+		return false
+	}
+	go func() {
+		defer endRebuild()
+		result, err := RebuildAllTaskRecords()
+		if err != nil {
+			log.Errorf("write-back full rebuild failed: %v", err)
+			return
+		}
+		log.Infof(
+			"write-back full rebuild completed: tasks=%d history=%d receive_fences=%d reservations=%d provider_operations=%d",
+			result.Tasks,
+			result.History,
+			result.ReceiveFences,
+			result.Reservations,
+			result.ProviderOperations,
+		)
+	}()
+	return true
 }
 
 func RebuildAllTaskRecords() (RebuildAllResult, error) {

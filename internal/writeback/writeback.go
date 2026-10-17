@@ -374,6 +374,7 @@ var (
 	ErrProviderOperationStale    = errors.New("provider COPY/MOVE source generation was superseded")
 	ErrSpoolCapacity             = errors.New("write-back spool capacity unavailable")
 	ErrReceiveInProgress         = errors.New("write-back receive already in progress")
+	ErrRebuildInProgress         = errors.New("write-back rebuild is in progress")
 )
 
 func ReceiveRetrySeconds() int {
@@ -3666,7 +3667,9 @@ func durableCommitContext(ctx context.Context) context.Context {
 // Commit receives the complete opaque WebDAV object into the local spool and
 // only then commits a new canonical generation into MySQL.
 func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTime, createTime time.Time, mime string) (*model.WebDAVWritebackObject, bool, error) {
-	rebuildGate.RLock()
+	if !enterWritebackMutation() {
+		return nil, false, ErrRebuildInProgress
+	}
 	defer rebuildGate.RUnlock()
 	if !Enabled() {
 		return nil, false, errors.New("WebDAV write-back is disabled")
@@ -3937,7 +3940,9 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 // persists directory creation so provider-side path visibility can catch up in
 // the background.
 func CommitDir(ctx context.Context, p string, modTime, createTime time.Time) (*model.WebDAVWritebackObject, bool, error) {
-	rebuildGate.RLock()
+	if !enterWritebackMutation() {
+		return nil, false, ErrRebuildInProgress
+	}
 	defer rebuildGate.RUnlock()
 	if !Enabled() {
 		return nil, false, errors.New("WebDAV write-back is disabled")
@@ -6240,7 +6245,42 @@ var (
 	providerParentSnapshots providerRefreshGroup
 	providerProbeCooldowns  providerProbeCooldownGroup
 	rebuildGate             sync.RWMutex
+	rebuildStateMu          sync.Mutex
+	rebuildInProgress       bool
 )
+
+func Rebuilding() bool {
+	rebuildStateMu.Lock()
+	defer rebuildStateMu.Unlock()
+	return rebuildInProgress
+}
+
+func beginRebuild() bool {
+	rebuildStateMu.Lock()
+	defer rebuildStateMu.Unlock()
+	if rebuildInProgress {
+		return false
+	}
+	rebuildInProgress = true
+	return true
+}
+
+func endRebuild() {
+	rebuildStateMu.Lock()
+	rebuildInProgress = false
+	rebuildStateMu.Unlock()
+}
+
+func enterWritebackMutation() bool {
+	if Rebuilding() || !rebuildGate.TryRLock() {
+		return false
+	}
+	if Rebuilding() {
+		rebuildGate.RUnlock()
+		return false
+	}
+	return true
+}
 
 // ProviderListForWebDAV serves ordinary directory revalidation from a recent
 // successful fresh provider snapshot. Expired/missing snapshots perform one

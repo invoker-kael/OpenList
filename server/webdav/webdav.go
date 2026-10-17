@@ -63,6 +63,16 @@ func (h *Handler) stripPrefix(p string) (string, int, error) {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if writeback.Enabled() && writeback.Rebuilding() {
+		switch r.Method {
+		case "DELETE", "PUT", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "PROPPATCH":
+			w.Header().Set("Retry-After", strconv.Itoa(writeback.ReceiveRetrySeconds()))
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(StatusText(http.StatusServiceUnavailable)))
+			return
+		}
+	}
+
 	status, err := http.StatusBadRequest, errUnsupportedMethod
 	brw := newBufferedResponseWriter()
 	useBufferedWriter := true
@@ -649,7 +659,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 		writebackCreateTime := h.getWritebackHeaderTime(r, "X-OC-Ctime")
 		row, created, wbErr := writeback.Commit(ctx, reqPath, r.Body, size, writebackModTime, writebackCreateTime, mimeType)
 		if wbErr != nil {
-			if errors.Is(wbErr, writeback.ErrReceiveInProgress) {
+			if errors.Is(wbErr, writeback.ErrReceiveInProgress) || errors.Is(wbErr, writeback.ErrRebuildInProgress) {
 				drainBody = false
 				r.Close = true
 				w.Header().Set("Retry-After", strconv.Itoa(writeback.ReceiveRetrySeconds()))
@@ -782,6 +792,10 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 		_, _, wbErr = writeback.CommitDir(ctx, reqPath, time.Now(), time.Now())
 		if errors.Is(wbErr, writeback.ErrDestinationExists) {
 			return http.StatusMethodNotAllowed, wbErr
+		}
+		if errors.Is(wbErr, writeback.ErrRebuildInProgress) {
+			w.Header().Set("Retry-After", strconv.Itoa(writeback.ReceiveRetrySeconds()))
+			return http.StatusServiceUnavailable, wbErr
 		}
 		if wbErr != nil {
 			return http.StatusInternalServerError, wbErr
