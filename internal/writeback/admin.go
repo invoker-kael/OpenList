@@ -520,7 +520,6 @@ func VerifyNow(ids []uint) (int64, error) {
 	return ReuploadNow(ids)
 }
 
-
 type RebuildAllResult struct {
 	Tasks              int64 `json:"tasks"`
 	History            int64 `json:"history"`
