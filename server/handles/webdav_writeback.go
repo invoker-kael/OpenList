@@ -394,6 +394,7 @@ func webDAVMonitorCanonicalState(row *model.WebDAVWritebackObject) string {
 
 const (
 	webDAVStatusReceiving              = "receiving"
+	webDAVStatusProcessing             = "processing"
 	webDAVStatusDurableAcked           = "durable_acked"
 	webDAVStatusRemoteUploading        = "remote_uploading"
 	webDAVStatusRemoteVerifying        = "remote_verifying"
@@ -453,20 +454,18 @@ func webDAVCurrentEffectiveStatus(row *model.WebDAVWritebackObject) (string, str
 	case "needs_cloudsync_rehydrate":
 		return webDAVStatusNeedsCloudSyncReupload, webDAVActionRestartCloudSync
 	case "missing_spool", "restart_recovery", "waiting_provider_verification":
-		return webDAVStatusAutomaticRecovery, webDAVActionRetryingAutomatically
+		return webDAVStatusProcessing, webDAVActionRetryingAutomatically
 	}
 	switch row.State {
 	case writeback.StateQueued:
 		if row.RetryCount > 0 || row.LastError != "" {
-			return webDAVStatusDurableAcked, webDAVActionRetryingAutomatically
+			return webDAVStatusProcessing, webDAVActionRetryingAutomatically
 		}
-		return webDAVStatusDurableAcked, webDAVActionWait
+		return webDAVStatusProcessing, webDAVActionWait
 	case writeback.StateUploading:
-		return webDAVStatusRemoteUploading, webDAVActionWait
+		return webDAVStatusProcessing, webDAVActionWait
 	case writeback.StateVerifying:
-		// VERIFYING is now an exceptional recovery check only. Normal successful
-		// provider PUTs transition directly to COMPLETED.
-		return webDAVStatusAutomaticRecovery, webDAVActionRetryingAutomatically
+		return webDAVStatusProcessing, webDAVActionWait
 	case writeback.StateCompleted:
 		return webDAVStatusCompleted, webDAVActionNone
 	default:

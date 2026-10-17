@@ -184,9 +184,6 @@ func RecoveryLabel(row *model.WebDAVWritebackObject) string {
 		(strings.Contains(msg, "interrupted upload") || strings.Contains(msg, "after restart")) {
 		return "restart_recovery"
 	}
-	if row.State == StateVerifying {
-		return "waiting_provider_verification"
-	}
 	return ""
 }
 
