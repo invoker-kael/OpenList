@@ -20,7 +20,7 @@ import (
 const (
 	webDAVMonitorDefaultLimit     = 100
 	webDAVMonitorMaxLimit         = 500
-	webDAVWritebackMonitorColumns = "id, path, name, is_dir, size, e_tag, canonical_state, state, generation, remote_generation, payload_sha1, remote_sha1, remote_object_id, retry_count, verify_count, last_error, resolution_reason, retry_at, remote_verified_at, receive_started_at, ack_time, durable_at, provider_upload_started_at, provider_upload_completed_at, provider_uploaded_bytes, client_duplicate_puts, provider_upload_attempts, provider_retry_bytes, recovery_started_at, cloudsync_reupload_required, provider_evidence_first_at, provider_evidence_last_at, provider_evidence_count, provider_evidence_result, paused, completed_at, created_at, updated_at"
+	webDAVWritebackMonitorColumns = "id, path, name, is_dir, size, e_tag, canonical_state, state, generation, remote_generation, payload_sha1, remote_sha1, remote_object_id, retry_count, verify_count, last_error, resolution_reason, retry_at, remote_verified_at, receive_started_at, ack_time, durable_at, provider_upload_started_at, provider_upload_completed_at, provider_uploaded_bytes, client_duplicate_puts, provider_upload_attempts, provider_retry_bytes, recovery_started_at, cloud_sync_reupload_required, provider_evidence_first_at, provider_evidence_last_at, provider_evidence_count, provider_evidence_result, paused, completed_at, created_at, updated_at"
 )
 
 type webDAVWritebackStateSummary struct {

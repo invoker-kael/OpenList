@@ -11,24 +11,36 @@ import (
 	"gorm.io/gorm/schema"
 )
 
-func TestWebDAVWritebackMonitorUsesGormETagColumnName(t *testing.T) {
+func TestWebDAVWritebackMonitorColumnsMatchGormSchema(t *testing.T) {
 	parsed, err := schema.Parse(&model.WebDAVWritebackObject{}, &sync.Map{}, schema.NamingStrategy{})
 	if err != nil {
 		t.Fatalf("parse writeback schema: %v", err)
 	}
-	field := parsed.LookUpField("ETag")
-	if field == nil {
-		t.Fatal("ETag field missing from GORM schema")
+	validColumns := make(map[string]struct{}, len(parsed.Fields))
+	for _, field := range parsed.Fields {
+		if field.DBName != "" {
+			validColumns[field.DBName] = struct{}{}
+		}
 	}
-	if field.DBName != "e_tag" {
-		t.Fatalf("unexpected ETag DB column: got %q want %q", field.DBName, "e_tag")
+	for _, column := range strings.Split(webDAVWritebackMonitorColumns, ",") {
+		column = strings.TrimSpace(column)
+		if _, ok := validColumns[column]; !ok {
+			t.Errorf("monitor SELECT column %q does not match a GORM DB column", column)
+		}
 	}
-	if !strings.Contains(webDAVWritebackMonitorColumns, field.DBName) {
-		t.Fatalf("monitor SELECT %q does not contain GORM ETag column %q", webDAVWritebackMonitorColumns, field.DBName)
+
+	checkFieldColumn := func(fieldName, wantColumn string) {
+		field := parsed.LookUpField(fieldName)
+		if field == nil {
+			t.Errorf("%s field missing from GORM schema", fieldName)
+			return
+		}
+		if field.DBName != wantColumn {
+			t.Errorf("unexpected %s DB column: got %q want %q", fieldName, field.DBName, wantColumn)
+		}
 	}
-	if strings.Contains(webDAVWritebackMonitorColumns, " etag") {
-		t.Fatalf("monitor SELECT must not use non-existent raw column etag: %q", webDAVWritebackMonitorColumns)
-	}
+	checkFieldColumn("ETag", "e_tag")
+	checkFieldColumn("CloudSyncReuploadRequired", "cloud_sync_reupload_required")
 }
 
 
