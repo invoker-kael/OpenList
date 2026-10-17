@@ -1,7 +1,7 @@
 ### Default image is base. You can add other support by modifying BASE_IMAGE_TAG. The following parameters are supported: base (default), aria2, ffmpeg, aio
 ARG BASE_IMAGE_TAG=base
 ARG FRONTEND_REPO=invoker-kael/OpenList-Frontend
-ARG FRONTEND_REF=b099d1ae9612bec4844b7629f0f9414ea7b4eb46
+ARG FRONTEND_REF=6b66c15e033e1f5162069f400a6fce3606090c75
 ARG FRONTEND_I18N_URL=https://github.com/OpenListTeam/OpenList-Frontend/releases/download/v4.2.6/i18n.tar.gz
 
 FROM node:24-alpine AS frontend-builder
