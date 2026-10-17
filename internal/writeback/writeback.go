@@ -1861,26 +1861,55 @@ func reconcileCompletedDirectory(ctx context.Context, p string) error {
 	if !directoryShadowExpired(row, now) {
 		return nil
 	}
+	ops, err := activeProviderOperations()
+	if err != nil {
+		if deferErr := deferCompletedDirectoryReconcile(row, now); deferErr != nil {
+			return errors.Join(err, deferErr)
+		}
+		return err
+	}
+	if providerOperationProtectsCanonicalPath(ops, row.Path, now) {
+		return deferCompletedDirectoryReconcile(row, now)
+	}
+
 	remote, err := fs.Get(ctx, row.Path, &fs.GetArgs{NoLog: true})
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
 		if errs.IsObjectNotFound(err) {
-			return nil
+			return deferCompletedDirectoryReconcile(row, time.Now())
+		}
+		if deferErr := deferCompletedDirectoryReconcile(row, time.Now()); deferErr != nil {
+			return errors.Join(err, deferErr)
 		}
 		return err
 	}
 	if remote == nil || !remote.IsDir() {
-		return nil
+		return deferCompletedDirectoryReconcile(row, time.Now())
 	}
-	ops, err := activeProviderOperations()
+	ops, err = activeProviderOperations()
 	if err != nil {
+		if deferErr := deferCompletedDirectoryReconcile(row, time.Now()); deferErr != nil {
+			return errors.Join(err, deferErr)
+		}
 		return err
 	}
+	now = time.Now()
 	if providerOperationProtectsCanonicalPath(ops, row.Path, now) {
-		return nil
+		return deferCompletedDirectoryReconcile(row, now)
 	}
 	return db.GetDb().
 		Where("id = ? AND generation = ? AND state = ? AND is_dir = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted, true).
 		Delete(&model.WebDAVWritebackObject{}).Error
+}
+
+func deferCompletedDirectoryReconcile(row *model.WebDAVWritebackObject, now time.Time) error {
+	next := now.Add(completedRemoteProbeInterval())
+	return db.GetDb().Model(&model.WebDAVWritebackObject{}).
+		Where("id = ? AND generation = ? AND state = ? AND is_dir = ? AND spool_path = ''", row.ID, row.Generation, StateCompleted, true).
+		Where("(retry_at IS NULL OR retry_at <= ?)", now).
+		Update("retry_at", &next).Error
 }
 
 func canonicalShadowInGrace(row *model.WebDAVWritebackObject, now time.Time) bool {
@@ -6444,8 +6473,8 @@ func (m *workerManager) recoverInterrupted() error {
 }
 
 const (
-	completedCanonicalReconcileEvery      = 30 * time.Second
-	completedCanonicalReconcileBatchLimit = 32
+	completedCanonicalReconcileEvery      = 5 * time.Minute
+	completedCanonicalReconcileBatchLimit = 1
 )
 
 func completedCanonicalReconcileDue(row *model.WebDAVWritebackObject, now time.Time) bool {

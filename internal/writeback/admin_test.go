@@ -245,6 +245,39 @@ func setupUploadLifecycleTest(t *testing.T) (*gorm.DB, string) {
 	return database, spoolDir
 }
 
+func TestCompletedDirectoryProbeDefersRetry(t *testing.T) {
+	database, _ := setupUploadLifecycleTest(t)
+	now := time.Now()
+	completed := now.Add(-time.Hour)
+	row := model.WebDAVWritebackObject{
+		PathKey:        pathKey("/backup/folder"),
+		ParentKey:      pathKey("/backup"),
+		Path:           "/backup/folder",
+		Parent:         "/backup",
+		Name:           "folder",
+		Generation:     1,
+		CanonicalState: CanonicalStateAcked,
+		State:          StateCompleted,
+		IsDir:          true,
+		CompletedAt:    &completed,
+	}
+	if err := database.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := deferCompletedDirectoryReconcile(&row, now); err != nil {
+		t.Fatalf("defer completed directory probe: %v", err)
+	}
+	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	minimumRetry := now.Add(completedRemoteProbeInterval() - time.Second)
+	if saved.RetryAt == nil || saved.RetryAt.Before(minimumRetry) {
+		t.Fatalf("directory retry_at=%v, want at least %v", saved.RetryAt, minimumRetry)
+	}
+	if completedCanonicalReconcileDue(&saved, now.Add(5*time.Minute)) {
+		t.Fatal("deferred completed directory should not be eligible for the next scheduler pass")
+	}
+}
+
 func createUploadLifecycleRow(t *testing.T, database *gorm.DB, spoolDir, payload string) model.WebDAVWritebackObject {
 	t.Helper()
 	spool := filepath.Join(spoolDir, "payload.data")

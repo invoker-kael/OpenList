@@ -1284,6 +1284,15 @@ func TestCompletedCanonicalReconcileDueIsBackgroundOnly(t *testing.T) {
 	}
 }
 
+func TestCompletedCanonicalReconcileIsRateLimited(t *testing.T) {
+	if completedCanonicalReconcileEvery != 5*time.Minute {
+		t.Fatalf("completed reconcile interval=%v, want 5m", completedCanonicalReconcileEvery)
+	}
+	if completedCanonicalReconcileBatchLimit != 1 {
+		t.Fatalf("completed reconcile batch limit=%d, want 1", completedCanonicalReconcileBatchLimit)
+	}
+}
+
 func TestSplitOverlayRowsExcludesRootSelfReference(t *testing.T) {
 	parent := "/"
 	parentKey := pathKey(parent)
