@@ -1051,78 +1051,6 @@ func TestShouldRemoveStaleRemote(t *testing.T) {
 	}
 }
 
-func TestCompletedDivergenceConfirmationRequiresSeparatedObservation(t *testing.T) {
-	now := time.Unix(100, 0)
-	next := now.Add(5 * time.Second)
-	if completedDivergenceConfirmed(0, nil, now) {
-		t.Fatal("first divergence observation must not request fresh confirmation")
-	}
-	if completedDivergenceConfirmed(1, &next, now.Add(4*time.Second)) {
-		t.Fatal("repeated scans inside the confirmation window must not request fresh confirmation")
-	}
-	if !completedDivergenceConfirmed(1, &next, now.Add(5*time.Second)) {
-		t.Fatal("a separated observation should require a force-refreshed provider confirmation")
-	}
-}
-
-func TestCompletedDivergenceConfirmationDelayUsesVerifyInterval(t *testing.T) {
-	oldConf := conf.Conf
-	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyIntervalSeconds: 7}}
-	defer func() { conf.Conf = oldConf }()
-	if got := completedDivergenceConfirmationDelay(); got != 7*time.Second {
-		t.Fatalf("divergence confirmation delay=%v, want 7s", got)
-	}
-}
-
-func TestCompletedDivergenceProbeStateFirstObservationOnlyArms(t *testing.T) {
-	oldConf := conf.Conf
-	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyIntervalSeconds: 7}}
-	defer func() { conf.Conf = oldConf }()
-
-	now := time.Unix(100, 0)
-	claim, count, retryAt := completedDivergenceProbeState(0, nil, now)
-	if claim {
-		t.Fatal("first divergence observation must not claim a provider refresh")
-	}
-	if count != 1 {
-		t.Fatalf("verify count=%d, want 1", count)
-	}
-	if retryAt == nil || !retryAt.Equal(now.Add(7*time.Second)) {
-		t.Fatalf("retry_at=%v, want %v", retryAt, now.Add(7*time.Second))
-	}
-}
-
-func TestCompletedDivergenceProbeStateClaimsAndRearms(t *testing.T) {
-	oldConf := conf.Conf
-	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyIntervalSeconds: 7}}
-	defer func() { conf.Conf = oldConf }()
-
-	now := time.Unix(200, 0)
-	due := now.Add(-time.Second)
-	claim, count, retryAt := completedDivergenceProbeState(1, &due, now)
-	if !claim {
-		t.Fatal("due divergence must claim the fresh provider confirmation")
-	}
-	if count != 2 {
-		t.Fatalf("verify count=%d, want 2", count)
-	}
-	wantRetry := now.Add(7 * time.Second)
-	if retryAt == nil || !retryAt.Equal(wantRetry) {
-		t.Fatalf("retry_at=%v, want %v", retryAt, wantRetry)
-	}
-
-	claim, count, next := completedDivergenceProbeState(count, retryAt, now.Add(time.Second))
-	if claim {
-		t.Fatal("a second scan inside the claimed window must not refresh again")
-	}
-	if count != 2 {
-		t.Fatalf("verify count changed inside claim window: %d", count)
-	}
-	if next != nil {
-		t.Fatalf("claimed window unexpectedly requested a persistence update: %v", next)
-	}
-}
-
 func TestSplitOverlayRowsIncludesParentWithoutListingItAsAChild(t *testing.T) {
 	parent := "/encrypted/album"
 	parentKey := pathKey(parent)
@@ -1411,38 +1339,6 @@ func TestOverlayRowsSkipProviderOperationLookupOnDurableHotPath(t *testing.T) {
 	}
 }
 
-func TestShouldDropCanonicalAfterRemoteList(t *testing.T) {
-	completedNoSpool := &model.WebDAVWritebackObject{
-		State:     StateCompleted,
-		SpoolPath: "",
-	}
-	if !shouldDropCanonicalAfterRemoteList(completedNoSpool, true, nil, time.Now(), false) {
-		t.Fatal("missing remote object should be surfaced after a reliable listing")
-	}
-	if shouldDropCanonicalAfterRemoteList(completedNoSpool, false, nil, time.Now(), false) {
-		t.Fatal("provider/listing failure must not drop canonical metadata")
-	}
-	if shouldDropCanonicalAfterRemoteList(completedNoSpool, true, &model.Object{Size: completedNoSpool.Size}, time.Now(), false) {
-		t.Fatal("present remote object must keep canonical metadata")
-	}
-
-	completedCached := &model.WebDAVWritebackObject{
-		State:     StateCompleted,
-		SpoolPath: "/spool/object.data",
-	}
-	if shouldDropCanonicalAfterRemoteList(completedCached, true, nil, time.Now(), false) {
-		t.Fatal("locally cached completed object must remain authoritative")
-	}
-
-	queued := &model.WebDAVWritebackObject{
-		State:     StateQueued,
-		SpoolPath: "/spool/object.data",
-	}
-	if shouldDropCanonicalAfterRemoteList(queued, true, nil, time.Now(), false) {
-		t.Fatal("pending upload must remain visible even before provider listing catches up")
-	}
-}
-
 func TestLockNullRetryAt(t *testing.T) {
 	now := time.Unix(100, 0)
 	expires := lockNullRetryAt(now, 30*time.Second)
@@ -1454,12 +1350,12 @@ func TestLockNullRetryAt(t *testing.T) {
 	}
 }
 
-func TestLockNullCanonicalSurvivesMissingProviderList(t *testing.T) {
+func TestLockNullCanonicalRemainsVisible(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
 		State:     StateLockNull,
 		SpoolPath: "",
 	}
-	if shouldDropCanonicalAfterRemoteList(row, true, nil, time.Now(), true) {
+	if canonicalDeleted(row) {
 		t.Fatal("lock-null resource must remain canonical while the lock is active")
 	}
 }
@@ -2699,7 +2595,7 @@ func TestCopyToSpoolComputesPayloadSHA1(t *testing.T) {
 	}
 }
 
-func TestCanonicalShadowGraceProtectsFreshCompletedFile(t *testing.T) {
+func TestCanonicalDirectoryShadowGrace(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = &conf.Config{
 		WebDAVWriteback: conf.WebDAVWritebackConfig{DirectoryGraceSeconds: 60},
@@ -2710,22 +2606,23 @@ func TestCanonicalShadowGraceProtectsFreshCompletedFile(t *testing.T) {
 	completed := now.Add(-30 * time.Second)
 	row := &model.WebDAVWritebackObject{
 		State:       StateCompleted,
+		IsDir:       true,
 		CompletedAt: &completed,
 	}
 	if !canonicalShadowInGrace(row, now) {
-		t.Fatal("fresh completed file metadata should stay canonical during provider consistency grace")
+		t.Fatal("fresh completed directory should stay canonical during provider consistency grace")
 	}
-	if shouldDropCanonicalAfterRemoteList(row, true, nil, now, false) {
-		t.Fatal("fresh completed file must not be dropped on a transient provider miss")
+	if directoryShadowExpired(row, now) {
+		t.Fatal("fresh completed directory should not be reconciled during its grace period")
 	}
 
 	completed = now.Add(-61 * time.Second)
 	row.CompletedAt = &completed
 	if canonicalShadowInGrace(row, now) {
-		t.Fatal("completed file metadata should leave grace after the configured window")
+		t.Fatal("completed directory should leave grace after the configured window")
 	}
-	if !shouldDropCanonicalAfterRemoteList(row, true, nil, now, false) {
-		t.Fatal("expired completed file should expose a confirmed provider loss")
+	if !directoryShadowExpired(row, now) {
+		t.Fatal("expired completed directory should become eligible to retire its metadata shadow")
 	}
 }
 
@@ -2843,112 +2740,6 @@ func TestCloudSyncRemoteVerificationEvidencePolicy(t *testing.T) {
 				t.Fatalf("classifyRemoteVerification()=%v, want %v", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestCompletedRemoteVerificationIntervalSeparatesHealthyProbeCadence(t *testing.T) {
-	oldConf := conf.Conf
-	conf.Conf = &conf.Config{
-		WebDAVWriteback: conf.WebDAVWritebackConfig{
-			VerifyIntervalSeconds:       5,
-			CompletedRemoteProbeSeconds: 1800,
-		},
-	}
-	defer func() { conf.Conf = oldConf }()
-
-	if got := completedRemoteVerificationInterval(); got != 30*time.Minute {
-		t.Fatalf("completed remote probe interval=%v, want 30m", got)
-	}
-
-	conf.Conf.WebDAVWriteback.CompletedRemoteProbeSeconds = 2
-	if got := completedRemoteVerificationInterval(); got != 5*time.Second {
-		t.Fatalf("completed probe must not run faster than upload verification: %v", got)
-	}
-
-	conf.Conf.WebDAVWriteback.CompletedRemoteProbeSeconds = 0
-	if got := completedRemoteVerificationInterval(); got != 30*time.Minute {
-		t.Fatalf("zero completed probe setting should use the 30m default, got %v", got)
-	}
-}
-
-func TestCompletedRemoteVerificationFresh(t *testing.T) {
-	oldConf := conf.Conf
-	conf.Conf = &conf.Config{
-		WebDAVWriteback: conf.WebDAVWritebackConfig{
-			VerifyIntervalSeconds:       5,
-			CompletedRemoteProbeSeconds: 10,
-		},
-	}
-	defer func() { conf.Conf = oldConf }()
-
-	now := time.Now()
-	verified := now.Add(-5 * time.Second)
-	row := &model.WebDAVWritebackObject{
-		State:            StateCompleted,
-		Generation:       7,
-		RemoteGeneration: 7,
-		RemoteVerifiedAt: &verified,
-	}
-	if !completedRemoteVerificationFresh(row, now) {
-		t.Fatal("recent generation-scoped provider verification should suppress an immediate direct provider lookup")
-	}
-
-	stale := now.Add(-11 * time.Second)
-	row.RemoteVerifiedAt = &stale
-	if completedRemoteVerificationFresh(row, now) {
-		t.Fatal("verification older than the configured interval must be rechecked")
-	}
-
-	row.RemoteVerifiedAt = &verified
-	row.RemoteGeneration = 6
-	if completedRemoteVerificationFresh(row, now) {
-		t.Fatal("verification evidence from an older generation must not suppress reconciliation")
-	}
-
-	row.RemoteGeneration = 7
-	row.PayloadSHA1 = strings.Repeat("a", 40)
-	row.RemoteSHA1 = strings.Repeat("b", 40)
-	if completedRemoteVerificationFresh(row, now) {
-		t.Fatal("contradictory remote SHA1 must invalidate completed verification freshness")
-	}
-	row.RemoteSHA1 = row.PayloadSHA1
-
-	retryAt := now.Add(time.Second)
-	row.RetryAt = &retryAt
-	if completedRemoteVerificationFresh(row, now) {
-		t.Fatal("pending divergence retry must bypass the verification cooldown")
-	}
-
-	row.RetryAt = nil
-	row.SpoolPath = "/spool/current.data"
-	if completedRemoteVerificationFresh(row, now) {
-		t.Fatal("locally cached completed payloads do not use direct provider reconciliation cooldown")
-	}
-}
-
-func TestCloudSyncInconclusiveVerificationNeverConsumesReuploadBudget(t *testing.T) {
-	count := 0
-	for i := 0; i < 100; i++ {
-		var retry bool
-		count, retry = advanceRemoteVerification(remoteVerificationInconclusive, count, 3)
-		if retry {
-			t.Fatalf("inconclusive observation %d unexpectedly requested provider reupload", i+1)
-		}
-	}
-	if count != 0 {
-		t.Fatalf("inconclusive observations consumed divergence budget: %d", count)
-	}
-
-	for i := 0; i < 2; i++ {
-		var retry bool
-		count, retry = advanceRemoteVerification(remoteVerificationDivergent, count, 3)
-		if retry {
-			t.Fatalf("divergence %d retried before configured threshold", i+1)
-		}
-	}
-	count, retry := advanceRemoteVerification(remoteVerificationDivergent, count, 3)
-	if !retry || count != 3 {
-		t.Fatalf("three conclusive divergences should permit one repair upload: count=%d retry=%v", count, retry)
 	}
 }
 
@@ -3580,70 +3371,6 @@ func TestMatchedRemoteVerificationEvidenceRequiresExactContent(t *testing.T) {
 	}
 }
 
-func TestMatchingCompletedSiblingRows(t *testing.T) {
-	sha := strings.Repeat("a", 40)
-	rows := []model.WebDAVWritebackObject{
-		{ID: 1, Name: "one.bin", State: StateCompleted, Size: 100, PayloadSHA1: sha},
-		{ID: 2, Name: "two.bin", State: StateCompleted, Size: 200, PayloadSHA1: sha},
-		{ID: 3, Name: "pending.bin", State: StateQueued, Size: 300, PayloadSHA1: sha},
-		{ID: 4, Name: "cached.bin", State: StateCompleted, Size: 400, PayloadSHA1: sha, SpoolPath: "/spool/cached.data"},
-	}
-	remotes := []model.Obj{
-		&model.Object{Name: "one.bin", Size: 100, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
-		&model.Object{Name: "two.bin", Size: 201, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
-		&model.Object{Name: "pending.bin", Size: 300, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
-		&model.Object{Name: "cached.bin", Size: 400, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
-	}
-	got := matchingCompletedSiblingRows(rows, remotes, 0, true)
-	if len(got) != 1 || got[0].row.ID != 1 {
-		t.Fatalf("completed sibling matches=%v, want only row 1", got)
-	}
-	if got := matchingCompletedSiblingRows(rows, remotes, 1, true); len(got) != 0 {
-		t.Fatalf("trigger row must be skipped, got %v", got)
-	}
-}
-
-func TestMatchingFreshCompletedEvidenceRowsRequiresHealthyExact115Evidence(t *testing.T) {
-	now := time.Date(2026, time.September, 22, 1, 0, 0, 0, time.UTC)
-	sha := strings.Repeat("a", 40)
-	retryAt := now.Add(time.Minute)
-	rows := []model.WebDAVWritebackObject{
-		{ID: 1, Name: "healthy.bin", State: StateCompleted, Size: 100, PayloadSHA1: sha, Generation: 7},
-		{ID: 2, Name: "divergent.bin", State: StateCompleted, Size: 100, PayloadSHA1: sha, Generation: 7, VerifyCount: 1},
-		{ID: 3, Name: "retry.bin", State: StateCompleted, Size: 100, PayloadSHA1: sha, Generation: 7, RetryAt: &retryAt},
-		{ID: 4, Name: "error.bin", State: StateCompleted, Size: 100, PayloadSHA1: sha, Generation: 7, LastError: "active divergence"},
-		{ID: 5, Name: "missing-hash.bin", State: StateCompleted, Size: 100, Generation: 7},
-		{ID: 6, Name: "spooled.bin", State: StateCompleted, Size: 100, PayloadSHA1: sha, Generation: 7, SpoolPath: "/spool/current.data"},
-	}
-	remotes := []model.Obj{
-		&model.Object{Name: "healthy.bin", Size: 100, HashInfo: utils.NewHashInfo(utils.SHA1, strings.ToUpper(sha))},
-		&model.Object{Name: "divergent.bin", Size: 100, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
-		&model.Object{Name: "retry.bin", Size: 100, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
-		&model.Object{Name: "error.bin", Size: 100, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
-		&model.Object{Name: "missing-hash.bin", Size: 100},
-		&model.Object{Name: "spooled.bin", Size: 100, HashInfo: utils.NewHashInfo(utils.SHA1, sha)},
-	}
-
-	got := matchingFreshCompletedEvidenceRows(rows, remotes, now)
-	if len(got) != 1 || got[0].row.ID != 1 {
-		t.Fatalf("fresh completed evidence matches=%v, want only healthy row 1", got)
-	}
-	if !freshCompletedEvidenceEligible(&rows[0]) {
-		t.Fatal("healthy completed no-spool row should be eligible for piggyback verification")
-	}
-	for i := 1; i < len(rows); i++ {
-		if freshCompletedEvidenceEligible(&rows[i]) {
-			t.Fatalf("row %d with active/incomplete evidence unexpectedly eligible", rows[i].ID)
-		}
-	}
-}
-
-func TestFreshParentCompletedEvidenceBatchIsBounded(t *testing.T) {
-	if freshParentCompletedEvidenceBatchLimit <= 0 || freshParentCompletedEvidenceBatchLimit > 64 {
-		t.Fatalf("fresh parent completed evidence batch limit=%d, want 1..64", freshParentCompletedEvidenceBatchLimit)
-	}
-}
-
 func TestCompletedSpoolReleaseEligibleRequiresAcceptedProviderUpload(t *testing.T) {
 	now := time.Now()
 	completed := now.Add(-time.Minute)
@@ -3957,105 +3684,6 @@ func TestNextReceiveGenerationUsesDurableSequenceAcrossRecreate(t *testing.T) {
 	}
 }
 
-func TestRemoteHashMismatchRequiresStrongSameSizeEvidence(t *testing.T) {
-	shaA := strings.Repeat("a", 40)
-	shaB := strings.Repeat("b", 40)
-	row := &model.WebDAVWritebackObject{Size: 4096, PayloadSHA1: shaA}
-	remote := &model.Object{Size: 4096, HashInfo: utils.NewHashInfo(utils.SHA1, shaB)}
-
-	if !remoteHashMismatch(row, remote, true) {
-		t.Fatal("same-size objects with two different strong SHA1 values must be classified as a provider hash difference")
-	}
-	if remoteHashMismatch(row, remote, false) {
-		t.Fatal("providers that do not require a strong payload hash must not enter the terminal hash-difference path")
-	}
-	remote.Size = 2048
-	if remoteHashMismatch(row, remote, true) {
-		t.Fatal("size divergence is a content divergence, not a hash-only difference")
-	}
-}
-
-func TestRemoteHashMismatchVerificationBudgetCapsAtThree(t *testing.T) {
-	oldConf := conf.Conf
-	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{VerifyAttempts: 60}}
-	defer func() { conf.Conf = oldConf }()
-
-	row := &model.WebDAVWritebackObject{}
-	remote := &model.Object{ID: "remote-1", HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40))}
-	for attempt := 1; attempt <= remoteHashMismatchMaxAttempts; attempt++ {
-		next, terminal := advanceRemoteHashMismatch(row, remote)
-		row.VerifyCount = next
-		row.RemoteObjectID = remote.GetID()
-		row.RemoteSHA1 = remote.GetHash().GetHash(utils.SHA1)
-		if attempt < remoteHashMismatchMaxAttempts && terminal {
-			t.Fatalf("hash mismatch became terminal too early at attempt %d", attempt)
-		}
-		if attempt == remoteHashMismatchMaxAttempts && !terminal {
-			t.Fatal("third confirmed hash difference must become terminal")
-		}
-	}
-	row.VerifyCount = 54
-	next, terminal := advanceRemoteHashMismatch(row, remote)
-	if next != remoteHashMismatchMaxAttempts || !terminal {
-		t.Fatalf("legacy high verify count must converge immediately: count=%d terminal=%v", next, terminal)
-	}
-}
-
-func TestCompletedRemoteHashMismatchEvidenceRequiresStableIdentity(t *testing.T) {
-	canonicalSHA1 := strings.Repeat("a", 40)
-	mismatchSHA1 := strings.Repeat("b", 40)
-	row := &model.WebDAVWritebackObject{
-		Size:                   4096,
-		PayloadSHA1:            canonicalSHA1,
-		VerifyCount:            1,
-		ProviderEvidenceResult: ResolutionRemoteHashMismatch,
-		RemoteObjectID:         "remote-1",
-		RemoteSHA1:             mismatchSHA1,
-	}
-	remote := &model.Object{
-		ID:       "remote-1",
-		Size:     4096,
-		HashInfo: utils.NewHashInfo(utils.SHA1, mismatchSHA1),
-	}
-
-	next, consistent := nextCompletedRemoteEvidenceCount(row, remote, ResolutionRemoteHashMismatch)
-	if !consistent || next != 2 {
-		t.Fatalf("stable mismatch evidence should advance to 2, got count=%d consistent=%v", next, consistent)
-	}
-
-	changedHash := *remote
-	changedHash.HashInfo = utils.NewHashInfo(utils.SHA1, strings.Repeat("c", 40))
-	next, consistent = nextCompletedRemoteEvidenceCount(row, &changedHash, ResolutionRemoteHashMismatch)
-	if consistent || next != 1 {
-		t.Fatalf("changed remote SHA1 must restart the streak, got count=%d consistent=%v", next, consistent)
-	}
-
-	changedID := *remote
-	changedID.ID = "remote-2"
-	next, consistent = nextCompletedRemoteEvidenceCount(row, &changedID, ResolutionRemoteHashMismatch)
-	if consistent || next != 1 {
-		t.Fatalf("changed remote object identity must restart the streak, got count=%d consistent=%v", next, consistent)
-	}
-}
-
-func TestShouldAutomaticallyRepairHashMismatchOnlyOnce(t *testing.T) {
-	row := &model.WebDAVWritebackObject{RetryCount: 0}
-	if !shouldAutomaticallyRepairHashMismatch(row, durablePayloadAvailable) {
-		t.Fatal("first confirmed mismatch with a durable spool should auto-repair")
-	}
-	row.RetryCount = 1
-	if shouldAutomaticallyRepairHashMismatch(row, durablePayloadAvailable) {
-		t.Fatal("automatic hash repair must have a one-upload budget")
-	}
-	row.RetryCount = 0
-	if shouldAutomaticallyRepairHashMismatch(row, durablePayloadMissing) {
-		t.Fatal("missing durable payload cannot be repaired by OpenList")
-	}
-	if shouldAutomaticallyRepairHashMismatch(nil, durablePayloadAvailable) {
-		t.Fatal("nil row cannot schedule an automatic repair")
-	}
-}
-
 func TestWaitingCloudSyncReuploadIsTerminalForProviderWorkers(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
 		State:                     StateWaitingCloudSyncReupload,
@@ -4136,62 +3764,6 @@ func TestLegacyExhaustedRetryNeedsFreshVerification(t *testing.T) {
 	}
 }
 
-func TestCompletedRemoteEvidenceKindChangeRestartsConfirmation(t *testing.T) {
-	row := &model.WebDAVWritebackObject{
-		VerifyCount:            2,
-		ProviderEvidenceResult: ResolutionRemoteHashMismatch,
-		RemoteObjectID:         "remote-1",
-		RemoteSHA1:             strings.Repeat("b", 40),
-	}
-	next, consistent := nextCompletedRemoteEvidenceCount(row, nil, ResolutionRemoteMissing)
-	if consistent || next != 1 {
-		t.Fatalf("hash mismatch followed by missing must restart at 1, got count=%d consistent=%v", next, consistent)
-	}
-
-	row.ProviderEvidenceResult = ResolutionRemoteMissing
-	row.RemoteObjectID = ""
-	row.RemoteSHA1 = ""
-	next, consistent = nextCompletedRemoteEvidenceCount(row, nil, ResolutionRemoteMissing)
-	if !consistent || next != completedRemoteDivergenceConfirmations {
-		t.Fatalf("third stable missing observation should reach confirmation threshold, got count=%d consistent=%v", next, consistent)
-	}
-}
-
-func TestCompletedRemoteGenericDivergenceRequiresStableObject(t *testing.T) {
-	row := &model.WebDAVWritebackObject{
-		VerifyCount:            1,
-		ProviderEvidenceResult: "divergent",
-		RemoteObjectID:         "remote-1",
-	}
-	remote := &model.Object{ID: "remote-1", Size: 0}
-	next, consistent := nextCompletedRemoteEvidenceCount(row, remote, "divergent")
-	if !consistent || next != 2 {
-		t.Fatalf("stable generic divergence should advance, got count=%d consistent=%v", next, consistent)
-	}
-
-	remote.ID = "remote-2"
-	next, consistent = nextCompletedRemoteEvidenceCount(row, remote, "divergent")
-	if consistent || next != 1 {
-		t.Fatalf("generic divergence with a changed object must restart, got count=%d consistent=%v", next, consistent)
-	}
-}
-
-func TestRemoteHashMismatchChangedObjectRestartsConfirmation(t *testing.T) {
-	row := &model.WebDAVWritebackObject{
-		VerifyCount:    2,
-		RemoteObjectID: "old-object",
-		RemoteSHA1:     strings.Repeat("b", 40),
-	}
-	remote := &model.Object{
-		ID:       "new-object",
-		HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("c", 40)),
-	}
-	next, terminal := advanceRemoteHashMismatch(row, remote)
-	if next != 1 || terminal {
-		t.Fatalf("changed provider identity must restart hash-difference confirmation: count=%d terminal=%v", next, terminal)
-	}
-}
-
 func TestWaitingCloudSyncReuploadKeepsCanonicalVisibleAndDoesNotDispatch(t *testing.T) {
 	row := &model.WebDAVWritebackObject{
 		State:                     StateWaitingCloudSyncReupload,
@@ -4207,25 +3779,6 @@ func TestWaitingCloudSyncReuploadKeepsCanonicalVisibleAndDoesNotDispatch(t *test
 	}
 	if canCoalesceDuplicatePut(row, 0, emptyPayloadSHA1()) {
 		t.Fatal("an actual re-upload must publish a new generation instead of being coalesced into the waiting repair row")
-	}
-}
-
-func TestRemoteHashMismatchDoesNotDropCompletedCanonical(t *testing.T) {
-	shaA := strings.Repeat("a", 40)
-	shaB := strings.Repeat("b", 40)
-	row := &model.WebDAVWritebackObject{
-		State:       StateCompleted,
-		Size:        123,
-		PayloadSHA1: shaA,
-	}
-	remote := &model.Object{
-		ID:       "provider-object",
-		Name:     "file.bin",
-		Size:     123,
-		HashInfo: utils.NewHashInfo(utils.SHA1, shaB),
-	}
-	if shouldDropCanonicalAfterRemoteList(row, true, remote, time.Now(), true) {
-		t.Fatal("same-size provider hash mismatch must not be treated as remote missing")
 	}
 }
 
@@ -4438,10 +3991,6 @@ func TestProviderProbeCooldownDoesNotCountAsDivergence(t *testing.T) {
 	}
 	if got := classifyRemoteVerification(row, nil, deferred, true); got != remoteVerificationInconclusive {
 		t.Fatalf("provider cooldown must remain inconclusive, got %v", got)
-	}
-	next, retryUpload := advanceRemoteVerification(remoteVerificationInconclusive, row.VerifyCount, 3)
-	if next != row.VerifyCount || retryUpload {
-		t.Fatalf("provider cooldown must not advance destructive evidence: count=%d retryUpload=%v", next, retryUpload)
 	}
 }
 
