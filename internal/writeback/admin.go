@@ -1,7 +1,11 @@
 package writeback
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -530,12 +534,16 @@ type RebuildAllResult struct {
 }
 
 func StartRebuildAllTaskRecords() bool {
+	return startRebuildTask(RebuildAllTaskRecords)
+}
+
+func startRebuildTask(rebuild func() (RebuildAllResult, error)) bool {
 	if !beginRebuild() {
 		return false
 	}
 	go func() {
 		defer endRebuild()
-		result, err := RebuildAllTaskRecords()
+		result, err := rebuild()
 		if err != nil {
 			log.Errorf("write-back full rebuild failed: %v", err)
 			return
@@ -557,10 +565,15 @@ func RebuildAllTaskRecords() (RebuildAllResult, error) {
 	defer rebuildGate.Unlock()
 
 	Stop()
-	defer Start()
+	defer startWorker(false)
+
+	spoolFiles, err := collectRebuildSpoolFiles(conf.Conf.WebDAVWriteback.SpoolDir)
+	if err != nil {
+		return RebuildAllResult{}, fmt.Errorf("collect write-back spool files: %w", err)
+	}
 
 	result := RebuildAllResult{}
-	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+	err = db.GetDb().Transaction(func(tx *gorm.DB) error {
 		deleteAll := func(dst any) (int64, error) {
 			res := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(dst)
 			return res.RowsAffected, res.Error
@@ -586,9 +599,51 @@ func RebuildAllTaskRecords() (RebuildAllResult, error) {
 	if err != nil {
 		return result, err
 	}
+	if err := removeRebuildSpoolFiles(spoolFiles); err != nil {
+		return result, fmt.Errorf("remove write-back spool files: %w", err)
+	}
 
 	providerParentSnapshots.clear()
 	providerProbeCooldowns.clear()
 	clearAllManualPauseRequests()
 	return result, nil
+}
+
+func collectRebuildSpoolFiles(spoolDir string) ([]string, error) {
+	entries, err := os.ReadDir(spoolDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || (!strings.HasSuffix(entry.Name(), ".part") && !strings.HasSuffix(entry.Name(), ".data")) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		if info.Mode().IsRegular() {
+			files = append(files, filepath.Join(spoolDir, entry.Name()))
+		}
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+func removeRebuildSpoolFiles(files []string) error {
+	var removeErrors []error
+	for _, file := range files {
+		if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
+			removeErrors = append(removeErrors, fmt.Errorf("remove %s: %w", file, err))
+		}
+	}
+	if len(removeErrors) > 0 {
+		return errors.Join(removeErrors...)
+	}
+	return nil
 }

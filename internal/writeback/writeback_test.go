@@ -3028,6 +3028,55 @@ func TestRebuildStateRejectsNewMutationWithoutBlocking(t *testing.T) {
 	}
 }
 
+func TestRebuildWaitsForCurrentMutationAndAllowsNewMutationAfterward(t *testing.T) {
+	if !enterWritebackMutation() {
+		t.Fatal("expected the active PUT to acquire the mutation read lock")
+	}
+	if !beginRebuild() {
+		rebuildGate.RUnlock()
+		t.Fatal("expected rebuild to begin")
+	}
+	if enterWritebackMutation() {
+		rebuildGate.RUnlock()
+		rebuildGate.RUnlock()
+		endRebuild()
+		t.Fatal("new PUT entered while rebuild was active")
+	}
+	if rebuildGate.TryLock() {
+		rebuildGate.Unlock()
+		rebuildGate.RUnlock()
+		endRebuild()
+		t.Fatal("rebuild acquired the exclusive gate before the active PUT finished")
+	}
+	rebuildGate.RUnlock()
+	if !rebuildGate.TryLock() {
+		endRebuild()
+		t.Fatal("rebuild could not acquire the gate after the active PUT finished")
+	}
+	rebuildGate.Unlock()
+	endRebuild()
+	if !enterWritebackMutation() {
+		t.Fatal("PUT did not resume after rebuild finished")
+	}
+	rebuildGate.RUnlock()
+}
+
+func TestCommitRejectsPutBeforeReadingBodyDuringRebuild(t *testing.T) {
+	body := bytes.NewReader([]byte("payload"))
+	if !beginRebuild() {
+		t.Fatal("expected rebuild to begin")
+	}
+	defer endRebuild()
+
+	_, _, err := Commit(context.Background(), "/backup/file.bin", body, int64(body.Len()), time.Time{}, time.Time{}, "")
+	if !errors.Is(err, ErrRebuildInProgress) {
+		t.Fatalf("Commit error=%v, want ErrRebuildInProgress", err)
+	}
+	if body.Len() != len("payload") {
+		t.Fatalf("rejected PUT consumed %d request bytes", len("payload")-body.Len())
+	}
+}
+
 func TestCompletedSpoolReleaseAcceptsRemoteSatisfiedGeneration(t *testing.T) {
 	now := time.Now()
 	completed := now.Add(-time.Minute)
@@ -3053,6 +3102,51 @@ func TestMatchingRemoteContentByNameChecksAllSameNameCandidates(t *testing.T) {
 	matched := matchingRemoteContentByName(row, remotes, true)
 	if matched == nil || !remoteMatchesCanonical(row, matched, true) {
 		t.Fatal("verification must accept a matching same-name object even when another same-name object differs")
+	}
+}
+
+func TestRemoteContentByNameKeepsMissingSHA1Inconclusive(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	row := &model.WebDAVWritebackObject{Name: "same.bin", Size: 10, PayloadSHA1: sha}
+	remotes := []model.Obj{
+		&model.Object{Name: "same.bin", Size: 10, HashInfo: utils.NewHashInfo(utils.SHA1, "")},
+		&model.Object{Name: "same.bin", Size: 10, HashInfo: utils.NewHashInfo(utils.SHA1, strings.Repeat("b", 40))},
+	}
+	remote, comparison := remoteContentByName(row, remotes, true)
+	if remote == nil || comparison != remoteContentInconclusive {
+		t.Fatalf("missing remote SHA-1 comparison=(%v,%v), want an inconclusive same-name candidate", remote, comparison)
+	}
+	if got := matchingRemoteContentByName(row, remotes, true); got != nil {
+		t.Fatal("a same-size object without SHA-1 must not count as an exact content match")
+	}
+}
+
+func TestProviderConfirmationFailureRequiresConclusiveFreshEvidence(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{RetryMaxSeconds: 60}}
+	defer func() { conf.Conf = oldConf }()
+
+	now := time.Now()
+	startedAt := now.Add(-time.Hour)
+	row := &model.WebDAVWritebackObject{Name: "file.bin", Size: 10, PayloadSHA1: strings.Repeat("a", 40)}
+	for _, err := range []error{
+		errors.New("HTTP 405 request blocked by provider WAF"),
+		errors.New("HTTP 429 Too Many Requests"),
+		errors.New("context deadline exceeded"),
+	} {
+		if shouldFailProviderConfirmation(row, nil, err, startedAt, now, true) {
+			t.Fatalf("provider error %q was treated as evidence that the remote file is missing", err)
+		}
+	}
+	if !shouldFailProviderConfirmation(row, nil, nil, startedAt, now, true) {
+		t.Fatal("a successful fresh LIST with no matching object should fail after the confirmation window")
+	}
+	if shouldFailProviderConfirmation(row, nil, nil, now.Add(-time.Second), now, true) {
+		t.Fatal("a fresh absence inside the confirmation window must remain processing")
+	}
+	noHash := &model.Object{Name: row.Name, Size: row.Size}
+	if shouldFailProviderConfirmation(row, noHash, nil, startedAt, now, true) {
+		t.Fatal("a same-size object without SHA-1 is inconclusive, not proof of absence")
 	}
 }
 

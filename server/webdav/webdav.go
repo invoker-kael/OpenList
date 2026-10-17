@@ -62,15 +62,28 @@ func (h *Handler) stripPrefix(p string) (string, int, error) {
 	return p, http.StatusNotFound, errPrefixMismatch
 }
 
+func webDAVMethodAllowedDuringWritebackRebuild(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, "PROPFIND", http.MethodOptions:
+		return true
+	default:
+		return false
+	}
+}
+
+func rejectWebDAVMutationDuringWritebackRebuild(w http.ResponseWriter, r *http.Request) bool {
+	if webDAVMethodAllowedDuringWritebackRebuild(r.Method) {
+		return false
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(writeback.ReceiveRetrySeconds()))
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte(StatusText(http.StatusServiceUnavailable)))
+	return true
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if writeback.Enabled() && writeback.Rebuilding() {
-		switch r.Method {
-		case "DELETE", "PUT", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "PROPPATCH":
-			w.Header().Set("Retry-After", strconv.Itoa(writeback.ReceiveRetrySeconds()))
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(StatusText(http.StatusServiceUnavailable)))
-			return
-		}
+	if writeback.Enabled() && writeback.Rebuilding() && rejectWebDAVMutationDuringWritebackRebuild(w, r) {
+		return
 	}
 
 	status, err := http.StatusBadRequest, errUnsupportedMethod

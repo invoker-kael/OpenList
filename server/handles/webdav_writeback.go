@@ -1300,6 +1300,6 @@ func WebDAVWritebackRebuildAll(c *gin.Context) {
 	started := writeback.StartRebuildAllTaskRecords()
 	common.SuccessResp(c, gin.H{
 		"started":    started,
-		"rebuilding": writeback.Rebuilding(),
+		"rebuilding": started || writeback.Rebuilding(),
 	})
 }

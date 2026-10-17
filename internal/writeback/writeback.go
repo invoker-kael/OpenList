@@ -1766,18 +1766,43 @@ func exactRemoteByName(objs []model.Obj, name string) model.Obj {
 }
 
 func matchingRemoteContentByName(row *model.WebDAVWritebackObject, objs []model.Obj, requireHash bool) model.Obj {
-	if row == nil {
+	remote, comparison := remoteContentByName(row, objs, requireHash)
+	if comparison != remoteContentMatch {
 		return nil
 	}
+	return remote
+}
+
+func remoteContentByName(row *model.WebDAVWritebackObject, objs []model.Obj, requireHash bool) (model.Obj, remoteContentComparison) {
+	if row == nil {
+		return nil, remoteContentInconclusive
+	}
+	var inconclusive model.Obj
 	for _, obj := range objs {
 		if obj == nil || obj.GetName() != row.Name {
 			continue
 		}
-		if compareRemoteContent(row, obj, requireHash) == remoteContentMatch {
-			return obj
+		switch compareRemoteContent(row, obj, requireHash) {
+		case remoteContentMatch:
+			return obj, remoteContentMatch
+		case remoteContentInconclusive:
+			if inconclusive == nil {
+				inconclusive = obj
+			}
 		}
 	}
-	return nil
+	if inconclusive != nil {
+		return inconclusive, remoteContentInconclusive
+	}
+	return nil, remoteContentMismatch
+}
+
+func (m *workerManager) completeExistingRemote(row *model.WebDAVWritebackObject, remotes []model.Obj) remoteContentComparison {
+	remote, comparison := remoteContentByName(row, remotes, true)
+	if comparison == remoteContentMatch {
+		m.completeRemoteVerification(row, remote, []string{StateQueued}, true)
+	}
+	return comparison
 }
 
 func deleteCompletedCanonical(row *model.WebDAVWritebackObject) (bool, error) {
@@ -2391,11 +2416,15 @@ func reconcileCompletedHashProvider(ctx context.Context, row *model.WebDAVWriteb
 		// Provider/API failures never count as proof that a completed backup is gone.
 		return false, nil
 	}
-	if remote := matchingRemoteContentByName(row, objs, true); remote != nil {
+	remote, comparison := remoteContentByName(row, objs, true)
+	if comparison == remoteContentMatch {
 		if err := refreshCompletedRemoteVerification(row, remote, now, true); err != nil {
 			return false, err
 		}
 		refreshMatchingCompletedSiblings(row, objs, true, now)
+		return false, nil
+	}
+	if comparison == remoteContentInconclusive {
 		return false, nil
 	}
 
@@ -6481,6 +6510,10 @@ func wake() {
 }
 
 func Start() {
+	startWorker(true)
+}
+
+func startWorker(cleanupOrphans bool) {
 	if !Enabled() {
 		return
 	}
@@ -6535,7 +6568,9 @@ func Start() {
 			log.Errorf("write-back recovery failed: %v", err)
 		}
 		m.maintainProviderOperations()
-		m.cleanupOrphans()
+		if cleanupOrphans {
+			m.cleanupOrphans()
+		}
 		for i := 0; i < workers; i++ {
 			m.wg.Add(1)
 			go m.worker()
@@ -8308,6 +8343,24 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 		}
 	}()
 
+	if providerRequiresPayloadHash(row.Path) {
+		remotes, probeErr := m.refreshParent(row.Parent)
+		if probeErr != nil {
+			if !errs.IsObjectNotFound(probeErr) {
+				m.failAfter(row, fmt.Errorf("check existing 115 object before upload: %w", probeErr), remoteVerificationRetryDelay(probeErr))
+				return
+			}
+		} else if comparison := m.completeExistingRemote(row, remotes); comparison == remoteContentMatch {
+			// A matching remote object satisfies this generation. Keep this branch
+			// terminal even if the completion write needs a retry; never fall
+			// through to another provider PUT after finding the exact content.
+			return
+		} else if comparison == remoteContentInconclusive {
+			m.fail(row, errors.New("waiting for a matching 115 SHA-1 before upload"))
+			return
+		}
+	}
+
 	uploadStartedAt := time.Now()
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state IN ?", row.ID, row.Generation, []string{StateQueued}).
@@ -8325,20 +8378,6 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 	row.ProviderUploadStartedAt = &uploadStartedAt
 	row.ProviderUploadCompletedAt = nil
-
-	if providerRequiresPayloadHash(row.Path) {
-		remotes, probeErr := m.refreshParent(row.Parent)
-		if probeErr != nil {
-			if !errs.IsObjectNotFound(probeErr) {
-				m.fail(row, fmt.Errorf("check existing 115 object before upload: %w", probeErr))
-				return
-			}
-		} else if remote := matchingRemoteContentByName(row, remotes, true); remote != nil {
-			if m.completeRemoteVerification(row, remote, []string{StateUploading}, true) {
-				return
-			}
-		}
-	}
 
 	obj := &model.Object{
 		Name:     row.Name,
@@ -8569,8 +8608,8 @@ func classifyRemoteVerification(row *model.WebDAVWritebackObject, remote model.O
 		return remoteVerificationInconclusive
 	}
 	// remoteForVerify returns nil,nil only after a force-refreshed parent
-	// listing succeeded and the exact name was absent. A direct NotFound or a
-	// failed refresh is returned as an error and therefore stays inconclusive.
+	// listing found no same-name content match. A direct NotFound, incomplete
+	// same-name metadata, or a failed refresh stays inconclusive.
 	if remote == nil {
 		return remoteVerificationDivergent
 	}
@@ -8582,6 +8621,11 @@ func classifyRemoteVerification(row *model.WebDAVWritebackObject, remote model.O
 	default:
 		return remoteVerificationInconclusive
 	}
+}
+
+func shouldFailProviderConfirmation(row *model.WebDAVWritebackObject, remote model.Obj, verifyErr error, startedAt, now time.Time, requireHash bool) bool {
+	return classifyRemoteVerification(row, remote, verifyErr, requireHash) == remoteVerificationDivergent &&
+		now.Sub(startedAt) >= providerConfirmationTimeout()
 }
 
 func advanceRemoteVerification(state remoteVerificationState, current, attempts int) (next int, retryUpload bool) {
@@ -8749,7 +8793,8 @@ func (m *workerManager) remoteForVerify(row *model.WebDAVWritebackObject, requir
 		if batchSiblings {
 			m.completeMatchingVerifySiblings(row, objs, true)
 		}
-		return matchingRemoteContentByName(row, objs, true), nil
+		remote, _ := remoteContentByName(row, objs, true)
+		return remote, nil
 	}
 
 	remote, getErr := fs.Get(m.ctx, row.Path, &fs.GetArgs{NoLog: true})
@@ -9067,23 +9112,17 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 	}
 
 	remote, err := m.remoteForVerify(row, requireHash, shouldBatchVerificationSiblings(currentState, requireHash))
-	if err != nil {
-		if now.Sub(startedAt) >= providerConfirmationTimeout() {
-			requireCloudSyncReupload(
-				row,
-				currentState,
-				ResolutionVerificationExhausted,
-				fmt.Sprintf("115 could not be confirmed within %s: %s; exposing the path as missing so Cloud Sync can re-upload", providerConfirmationTimeout(), summarizeProviderProbeError(err)),
-				row.VerifyCount+1,
-				true,
-			)
-			return
-		}
+	verification := classifyRemoteVerification(row, remote, err, requireHash)
+	if verification == remoteVerificationInconclusive {
 		next := now.Add(remoteVerificationRetryDelay(err))
+		lastError := "115 SHA-1 is not available yet; retrying"
+		if err != nil {
+			lastError = summarizeProviderProbeError(err)
+		}
 		updates := map[string]any{
 			"state":      StateVerifying,
 			"retry_at":   &next,
-			"last_error": summarizeProviderProbeError(err),
+			"last_error": lastError,
 		}
 		if firstConfirmation {
 			updates["recovery_started_at"] = &startedAt
@@ -9093,12 +9132,12 @@ func (m *workerManager) processRemoteVerification(row *model.WebDAVWritebackObje
 			Updates(updates).Error
 		return
 	}
-	if remote != nil {
+	if verification == remoteVerificationMatch {
 		m.completeRemoteVerification(row, remote, []string{currentState}, requireHash)
 		return
 	}
 
-	if now.Sub(startedAt) >= providerConfirmationTimeout() {
+	if shouldFailProviderConfirmation(row, remote, err, startedAt, now, requireHash) {
 		requireCloudSyncReupload(
 			row,
 			currentState,

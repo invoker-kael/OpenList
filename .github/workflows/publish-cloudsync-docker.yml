@@ -1,11 +1,6 @@
 name: Publish CloudSync Docker
 
 on:
-  push:
-    branches:
-      - feature/cloudsync-writeback
-    paths:
-      - .github/workflows/publish-cloudsync-docker.yml
   workflow_dispatch:
 
 permissions:

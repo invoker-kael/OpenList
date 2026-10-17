@@ -26,7 +26,7 @@ The stable WebDAV view is:
 
 The remote provider's mtime is informational only.
 
-## State machine
+## Client-visible status and internal lifecycle
 
 Client-visible canonical state and provider replication state are deliberately separate:
 
@@ -334,14 +334,16 @@ The focused WebDAV write-back workflow is intentionally not triggered by ordinar
 
 Internal correctness state remains detailed, but the normal admin UI intentionally presents a smaller Cloud Sync-oriented lifecycle.
 
-### User-facing Active states
+### Overview states
 
-- **Receiving** — Cloud Sync is still sending the PUT body.
-- **Syncing** — the payload is durable/ACKed and OpenList is queueing, uploading, verifying, or automatically recovering the provider replica.
-- **Waiting for Cloud Sync re-upload** — OpenList has stopped automatic provider recovery for the old generation and needs Cloud Sync to issue a fresh PUT.
-- **Deleted** — delete lifecycle.
+Overview displays only four Cloud Sync task states:
 
-The Active status filter is an Excel-style dropdown in the table header. Internal values such as `queued`, `uploading`, `verifying`, retry counters, recovery types, hashes, and resolution reasons stay under Advanced information.
+- **Receiving** — Cloud Sync is sending the PUT body.
+- **Processing** — the payload is durable and OpenList is checking or writing it to 115.
+- **Completed** — 115 has matching content evidence.
+- **Failed** — OpenList exposes the path as missing so Cloud Sync can upload it again.
+
+Internal queue, upload, retry, and verification values are implementation details and do not appear as additional Overview states.
 
 ### Live progress
 
@@ -466,6 +468,10 @@ The WebDAV Writeback admin surface is **Overview | Active | History | Settings**
 History is per-generation audit data keyed by `PathKey + Generation`. It never participates in Durable ACK, PROPFIND, provider verification, or retry decisions.
 
 The redundant History summary cards and helper text have been removed. Path search, Excel-style header filters, Advanced filters, per-row Advanced diagnostics, and History cleanup remain.
+
+### Full rebuild
+
+The rebuild request returns immediately and runs in the background. It waits for active PUTs, stops the worker, clears only OpenList writeback tables and local `.part` / `.data` spool files, clears provider caches, and restarts the worker. During rebuild, GET/HEAD/PROPFIND remain available and new writes receive `503` with `Retry-After`. No provider delete operation is part of this flow; files on 115 are not touched.
 
 A final Cloud Sync fallback **does not hide or delete the canonical Durable ACK**. The operator fully stops/disables and then starts/enables the same Cloud Sync task. A fresh same-path PUT creates a newer generation and supersedes the old recovery incident. Recovery correlation uses same-path generation/ACK ordering and does not require encrypted payload size or SHA-1 equality.
 

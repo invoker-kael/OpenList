@@ -1,13 +1,18 @@
 package writeback
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 func validAdminConfig() conf.WebDAVWritebackConfig {
@@ -68,6 +73,217 @@ func TestValidateAdminConfigPreservesDocumentedSentinels(t *testing.T) {
 	cfg.ReserveFreeSpaceMB = 0
 	if err := ValidateAdminConfig(cfg); err != nil {
 		t.Fatalf("documented disabled/unlimited values should remain valid: %v", err)
+	}
+}
+
+func TestCollectAndRemoveRebuildSpoolFilesIsScopedToPayloads(t *testing.T) {
+	spoolDir := t.TempDir()
+	payload := filepath.Join(spoolDir, "payload.data")
+	partial := filepath.Join(spoolDir, "recv.part")
+	keep := filepath.Join(spoolDir, "keep.txt")
+	nested := filepath.Join(spoolDir, "nested")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{payload, partial, keep, filepath.Join(nested, "nested.data")} {
+		if err := os.WriteFile(name, []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	files, err := collectRebuildSpoolFiles(spoolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 || files[0] != payload || files[1] != partial {
+		t.Fatalf("rebuild spool files=%v, want only top-level .data and .part payloads", files)
+	}
+	if err := removeRebuildSpoolFiles(files); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{payload, partial} {
+		if _, err := os.Stat(name); !os.IsNotExist(err) {
+			t.Fatalf("spool payload %q still exists or returned unexpected error: %v", name, err)
+		}
+	}
+	for _, name := range []string{keep, filepath.Join(nested, "nested.data")} {
+		if _, err := os.Stat(name); err != nil {
+			t.Fatalf("non-payload file %q was touched: %v", name, err)
+		}
+	}
+}
+
+func TestExisting115MatchCompletesQueuedGenerationBeforeUpload(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{Database: conf.Database{Type: "sqlite"}}
+	defer func() { conf.Conf = oldConf }()
+
+	database, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Init(database)
+
+	sha := strings.Repeat("a", 40)
+	row := model.WebDAVWritebackObject{
+		PathKey:        pathKey("/backup/file.bin"),
+		ParentKey:      pathKey("/backup"),
+		Path:           "/backup/file.bin",
+		Parent:         "/backup",
+		Name:           "file.bin",
+		Generation:     7,
+		CanonicalState: CanonicalStateAcked,
+		State:          StateQueued,
+		Size:           10,
+		PayloadSHA1:    sha,
+	}
+	if err := database.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	remote := &model.Object{
+		ID:       "115-object-id",
+		Name:     row.Name,
+		Size:     row.Size,
+		HashInfo: utils.NewHashInfo(utils.SHA1, sha),
+	}
+	comparison := (&workerManager{}).completeExistingRemote(&row, []model.Obj{remote})
+	if comparison != remoteContentMatch {
+		t.Fatalf("remote comparison=%v, want exact match", comparison)
+	}
+	var saved model.WebDAVWritebackObject
+	if err := database.First(&saved, row.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if saved.State != StateCompleted || saved.RemoteObjectID != remote.GetID() || saved.RemoteSHA1 != sha {
+		t.Fatalf("existing remote match did not complete generation: state=%q object_id=%q sha1_match=%t", saved.State, saved.RemoteObjectID, saved.RemoteSHA1 == sha)
+	}
+	if saved.ProviderUploadStartedAt != nil {
+		t.Fatalf("existing remote match started a provider upload at %v", saved.ProviderUploadStartedAt)
+	}
+}
+
+func TestRebuildTaskReturnsBeforeBackgroundWorkCompletes(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	startResult := make(chan bool, 1)
+
+	go func() {
+		startResult <- startRebuildTask(func() (RebuildAllResult, error) {
+			close(started)
+			<-release
+			close(finished)
+			return RebuildAllResult{}, nil
+		})
+	}()
+
+	select {
+	case ok := <-startResult:
+		if !ok {
+			t.Fatal("rebuild did not start")
+		}
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("rebuild start waited for background work")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("background rebuild did not start")
+	}
+	if !Rebuilding() {
+		close(release)
+		t.Fatal("rebuild state cleared before background work completed")
+	}
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("background rebuild did not finish")
+	}
+	deadline := time.Now().Add(time.Second)
+	for Rebuilding() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if Rebuilding() {
+		t.Fatal("rebuild state remained set after background work finished")
+	}
+}
+
+func TestRebuildClearsWritebackRowsAndLocalSpoolOnly(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{
+		Database:        conf.Database{Type: "sqlite"},
+		WebDAVWriteback: conf.WebDAVWritebackConfig{SpoolDir: t.TempDir()},
+	}
+	defer func() { conf.Conf = oldConf }()
+
+	database, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Init(database)
+	spoolDir := conf.Conf.WebDAVWriteback.SpoolDir
+
+	rows := []any{
+		&model.WebDAVWritebackObject{PathKey: "object", Path: "/backup/file.bin", Name: "file.bin", State: StateQueued},
+		&model.WebDAVWritebackHistory{PathKey: "history", Path: "/backup/file.bin", Generation: 1},
+		&model.WebDAVWritebackReceiveFence{PathKey: "fence", Path: "/backup/file.bin"},
+		&model.WebDAVWritebackReceiveReservation{PathKey: "reservation", Sequence: 1},
+		&model.WebDAVProviderOperation{OperationKey: "operation"},
+	}
+	for _, row := range rows {
+		if err := database.Create(row).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"payload.data", "recv.part", "keep.txt"} {
+		if err := os.WriteFile(filepath.Join(spoolDir, name), []byte("payload"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	providerFile := filepath.Join(t.TempDir(), "provider-content.data")
+	if err := os.WriteFile(providerFile, []byte("115 content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := RebuildAllTaskRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Tasks != 1 || result.History != 1 || result.ReceiveFences != 1 || result.Reservations != 1 || result.ProviderOperations != 1 {
+		t.Fatalf("rebuild result=%+v, want one row removed from each writeback table", result)
+	}
+	for _, table := range []struct {
+		name  string
+		model any
+	}{
+		{"objects", &model.WebDAVWritebackObject{}},
+		{"history", &model.WebDAVWritebackHistory{}},
+		{"receive fences", &model.WebDAVWritebackReceiveFence{}},
+		{"reservations", &model.WebDAVWritebackReceiveReservation{}},
+		{"provider operations", &model.WebDAVProviderOperation{}},
+	} {
+		var count int64
+		if err := database.Model(table.model).Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Errorf("%s rows=%d after rebuild, want 0", table.name, count)
+		}
+	}
+	for _, name := range []string{"payload.data", "recv.part"} {
+		if _, err := os.Stat(filepath.Join(spoolDir, name)); !os.IsNotExist(err) {
+			t.Errorf("local spool file %q remains after rebuild: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(spoolDir, "keep.txt")); err != nil {
+		t.Errorf("unrelated local file was touched: %v", err)
+	}
+	if _, err := os.Stat(providerFile); err != nil {
+		t.Errorf("provider content was touched by rebuild: %v", err)
 	}
 }
 

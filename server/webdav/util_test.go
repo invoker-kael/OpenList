@@ -1,10 +1,40 @@
 package webdav
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+func TestWebDAVRebuildAllowsOnlyReadMethods(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodHead, "PROPFIND", http.MethodOptions} {
+		if !webDAVMethodAllowedDuringWritebackRebuild(method) {
+			t.Errorf("%s should remain available during rebuild", method)
+		}
+	}
+	for _, method := range []string{
+		http.MethodPut, http.MethodPost, http.MethodDelete, "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "PROPPATCH", "PATCH",
+	} {
+		if webDAVMethodAllowedDuringWritebackRebuild(method) {
+			t.Errorf("%s should be rejected during rebuild", method)
+		}
+	}
+}
+
+func TestWebDAVMutationGetsRetryableResponseDuringRebuild(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPut, "http://example.test/file.bin", nil)
+	res := httptest.NewRecorder()
+	if !rejectWebDAVMutationDuringWritebackRebuild(res, req) {
+		t.Fatal("PUT should be rejected during rebuild")
+	}
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503", res.Code)
+	}
+	if res.Header().Get("Retry-After") == "" {
+		t.Fatal("503 response is missing Retry-After")
+	}
+}
 
 func TestGetWritebackHeaderTimeRequiresExplicitHeader(t *testing.T) {
 	h := &Handler{}
