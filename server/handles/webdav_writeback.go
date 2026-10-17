@@ -1294,7 +1294,6 @@ func WebDAVWritebackVerifyNow(c *gin.Context) {
 	WebDAVWritebackReuploadNow(c)
 }
 
-
 func WebDAVWritebackRebuildAll(c *gin.Context) {
 	result, err := writeback.RebuildAllTaskRecords()
 	if err != nil {
