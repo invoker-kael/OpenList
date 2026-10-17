@@ -113,7 +113,7 @@ func TestCompletedSpoolReleaseSafeProtectsActiveAndUnacceptedPayloads(t *testing
 	}
 }
 
-func TestRecoveryLabelMakesMissingAndRestartStatesVisible(t *testing.T) {
+func TestRecoveryLabelOnlyMarksActualRecovery(t *testing.T) {
 	cases := []struct {
 		row  model.WebDAVWritebackObject
 		want string
@@ -128,7 +128,7 @@ func TestRecoveryLabelMakesMissingAndRestartStatesVisible(t *testing.T) {
 		},
 		{
 			row:  model.WebDAVWritebackObject{State: StateVerifying, CanonicalState: CanonicalStateAcked},
-			want: "waiting_provider_verification",
+			want: "",
 		},
 		{
 			row:  model.WebDAVWritebackObject{State: StateDeleted, CanonicalState: CanonicalStateDeleted, LastError: "exposing the loss so Cloud Sync can re-upload"},
