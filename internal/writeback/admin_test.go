@@ -163,6 +163,52 @@ func TestExisting115MatchCompletesQueuedGenerationBeforeUpload(t *testing.T) {
 	}
 }
 
+func TestCloudSyncReuploadFailureHidesCanonicalAndReleasesSpool(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = &conf.Config{Database: conf.Database{Type: "sqlite"}}
+	defer func() { conf.Conf = oldConf }()
+
+	database, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Init(database)
+
+	spool := filepath.Join(t.TempDir(), "payload.data")
+	if err := os.WriteFile(spool, []byte("durable payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	row := model.WebDAVWritebackObject{
+		PathKey:        pathKey("/backup/file.bin"),
+		ParentKey:      pathKey("/backup"),
+		Path:           "/backup/file.bin",
+		Parent:         "/backup",
+		Name:           "file.bin",
+		Generation:     3,
+		CanonicalState: CanonicalStateAcked,
+		State:          StateVerifying,
+		Size:           int64(len("durable payload")),
+		SpoolPath:      spool,
+	}
+	if err := database.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if !requireCloudSyncReupload(&row, StateVerifying, ResolutionVerificationExhausted, "115 content was not confirmed", 3, true) {
+		t.Fatal("confirmed upload failure should request a Cloud Sync re-upload")
+	}
+	obj, found, deleted, err := Canonical(row.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || !deleted || obj != nil {
+		t.Fatalf("canonical path after failure = (%v, %v, %v), want a tombstone", obj, found, deleted)
+	}
+	if _, err := os.Stat(spool); !os.IsNotExist(err) {
+		t.Fatalf("released spool still exists or returned unexpected error: %v", err)
+	}
+}
+
 func TestRebuildTaskReturnsBeforeBackgroundWorkCompletes(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
