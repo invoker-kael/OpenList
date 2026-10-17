@@ -331,6 +331,7 @@ func durableLocalPayloadAvailable(row *model.WebDAVWritebackObject) bool {
 func canCoalesceDuplicatePut(row *model.WebDAVWritebackObject, size int64, payloadSHA1 string) bool {
 	return row != nil &&
 		!row.IsDir &&
+		row.State != StateCompleted &&
 		!canonicalDeleted(row) &&
 		!waitingCloudSyncReupload(row) &&
 		(row.SpoolPath != "" || row.Size == 0) &&
@@ -339,20 +340,6 @@ func canCoalesceDuplicatePut(row *model.WebDAVWritebackObject, size int64, paylo
 		payloadSHA1 != "" &&
 		strings.EqualFold(row.PayloadSHA1, payloadSHA1)
 }
-
-func canCoalesceCompletedDuplicatePut(row *model.WebDAVWritebackObject, size int64, payloadSHA1 string) bool {
-	if row == nil ||
-		row.IsDir ||
-		row.State != StateCompleted ||
-		row.SpoolPath != "" ||
-		row.Size != size ||
-		payloadSHA1 == "" {
-		return false
-	}
-	canonicalSHA1 := canonicalContentSHA1(row)
-	return canonicalSHA1 != "" && strings.EqualFold(canonicalSHA1, payloadSHA1)
-}
-
 func applyDuplicatePutMetadata(row *model.WebDAVWritebackObject, modTime, createTime time.Time, mime string, modTimeProvided, createTimeProvided bool) {
 	if row == nil {
 		return
@@ -3860,25 +3847,6 @@ func Commit(ctx context.Context, p string, body io.Reader, expected int64, modTi
 					saved = row
 					return finalizeReceiveSequenceTx(tx, p, fence, receiveSequence, backlogReserved, true)
 				}
-			}
-			if canCoalesceCompletedDuplicatePut(&row, actualSize, payloadSHA1) {
-				duplicate = true
-				applyDuplicatePutMetadata(&row, modTime, createTime, mime, modTimeProvided, createTimeProvided)
-				markCanonicalAcked(&row, time.Now())
-				if err := tx.Model(&model.WebDAVWritebackObject{}).
-					Where("id = ? AND generation = ? AND state = ?", row.ID, row.Generation, StateCompleted).
-					Updates(map[string]any{
-						"mod_time":        row.ModTime,
-						"create_time":     row.CreateTime,
-						"mime_type":       row.MimeType,
-						"canonical_state": row.CanonicalState,
-						"ack_time":        row.AckTime,
-						"durable_at":      row.DurableAt,
-					}).Error; err != nil {
-					return err
-				}
-				saved = row
-				return finalizeReceiveSequenceTx(tx, p, fence, receiveSequence, backlogReserved, true)
 			}
 			oldSpool = row.SpoolPath
 			if canonicalDeleted(&row) {

@@ -3201,6 +3201,11 @@ func TestCanCoalesceDuplicatePut(t *testing.T) {
 	if !canCoalesceDuplicatePut(base, 1024, strings.ToUpper(sha)) {
 		t.Fatal("identical durable payload should coalesce")
 	}
+	completedWithSpool := *base
+	completedWithSpool.State = StateCompleted
+	if canCoalesceDuplicatePut(&completedWithSpool, 1024, sha) {
+		t.Fatal("a completed generation must re-check 115 after a new Cloud Sync PUT")
+	}
 
 	noSpool := *base
 	noSpool.SpoolPath = ""
@@ -3847,40 +3852,31 @@ func TestProviderMoveSourceTombstone(t *testing.T) {
 	}
 }
 
-func TestCanCoalesceCompletedDuplicatePut(t *testing.T) {
+func TestCompletedDuplicatePutMustBeReprocessed(t *testing.T) {
 	sha := strings.Repeat("e", 40)
-	row := &model.WebDAVWritebackObject{
-		Size:        64 * 1024,
-		Generation:  8,
-		State:       StateCompleted,
-		PayloadSHA1: sha,
+	rows := []*model.WebDAVWritebackObject{
+		{
+			Size:        64 * 1024,
+			Generation:  8,
+			State:       StateCompleted,
+			PayloadSHA1: sha,
+		},
+		{
+			Size:        64 * 1024,
+			Generation:  8,
+			State:       StateCompleted,
+			SpoolPath:   "/spool/completed.data",
+			PayloadSHA1: sha,
+		},
+		{
+			Size:  0,
+			State: StateCompleted,
+		},
 	}
-	if !canCoalesceCompletedDuplicatePut(row, row.Size, strings.ToUpper(sha)) {
-		t.Fatal("completed same-content PUT without a spool should converge as an ACK-only duplicate")
-	}
-	if canCoalesceCompletedDuplicatePut(row, row.Size, strings.Repeat("f", 40)) {
-		t.Fatal("different encrypted content must create a new canonical generation")
-	}
-	row.State = StateQueued
-	if canCoalesceCompletedDuplicatePut(row, row.Size, sha) {
-		t.Fatal("only a completed generation may be revived for duplicate re-verification")
-	}
-
-	row.State = StateCompleted
-	row.PayloadSHA1 = ""
-	row.RemoteSHA1 = sha
-	row.RemoteGeneration = row.Generation
-	if canCoalesceCompletedDuplicatePut(row, row.Size, sha) {
-		t.Fatal("remote SHA1 without verified_at must not coalesce completed content")
-	}
-	verifiedAt := time.Now()
-	row.RemoteVerifiedAt = &verifiedAt
-	if !canCoalesceCompletedDuplicatePut(row, row.Size, sha) {
-		t.Fatal("current-generation verified SHA1 should identify duplicate content after spool cleanup")
-	}
-	row.RemoteGeneration--
-	if canCoalesceCompletedDuplicatePut(row, row.Size, sha) {
-		t.Fatal("stale remote evidence must not coalesce a newer canonical generation")
+	for _, row := range rows {
+		if canCoalesceDuplicatePut(row, row.Size, sha) {
+			t.Fatalf("completed generation size=%d spool=%q was ACKed without a fresh 115 check", row.Size, row.SpoolPath)
+		}
 	}
 }
 

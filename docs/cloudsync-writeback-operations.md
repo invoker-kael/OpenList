@@ -10,6 +10,8 @@
 4. A matching object completes the task. Timeouts, rate limits, WAF responses, API errors, and missing SHA-1 remain **Processing**; they are not evidence that a file is absent.
 5. Completed objects receive low-frequency fresh checks. A match keeps them completed. Only three successful fresh checks with no match mark one failed; provider/API errors do not count.
 
+A Cloud Sync PUT received for an already completed path starts a new generation and repeats the fresh `LIST` check. If 115 still has the same content, the task completes without another upload; if the file is missing or different, OpenList uploads the received payload. This makes a full Cloud Sync resend a safe way to recheck and restore files.
+
 Cloud Sync remains the source copy. OpenList's local spool is the durable handoff until provider confirmation. Keep the spool on persistent local storage and do not manually remove files used by active tasks.
 
 ## Overview statuses
