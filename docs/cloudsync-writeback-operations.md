@@ -12,6 +12,8 @@
 
 A Cloud Sync PUT received for an already completed path starts a new generation and repeats the fresh `LIST` check. If 115 still has the same content, the task completes without another upload; if the file is missing or different, OpenList uploads the received payload. This makes a full Cloud Sync resend a safe way to recheck and restore files.
 
+After a WAF or rate-limit response, OpenList waits through the provider cooldown and then starts the same fresh `LIST` check again. It does not skip directly to another PUT.
+
 Cloud Sync remains the source copy. OpenList's local spool is the durable handoff until provider confirmation. Keep the spool on persistent local storage and do not manually remove files used by active tasks.
 
 ## Overview statuses

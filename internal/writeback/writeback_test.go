@@ -4289,15 +4289,19 @@ func TestSummarizeProviderProbeErrorStripsBlockedHTML(t *testing.T) {
 	if !strings.Contains(summary, "784e2ca117901350881961589e96dc") {
 		t.Fatalf("provider error summary must retain trace id: %q", summary)
 	}
-	if !strings.Contains(summary, "direct re-upload scheduled after cooldown") {
-		t.Fatalf("provider error summary must describe delayed direct re-upload recovery: %q", summary)
+	if !strings.Contains(summary, "retry after cooldown") || strings.Contains(summary, "direct re-upload") {
+		t.Fatalf("provider error summary must describe a delayed retry without promising a direct upload: %q", summary)
 	}
 }
 
 func TestProviderProbeIsWAFBlockRecognizesPersistedSummary(t *testing.T) {
-	err := errors.New("provider/WAF blocked remote listing (HTTP 405); direct re-upload scheduled after cooldown")
-	if !providerProbeIsWAFBlock(err) {
-		t.Fatal("persisted WAF diagnostic must remain recognizable after restart")
+	for _, summary := range []string{
+		"provider/WAF blocked remote listing (HTTP 405); direct re-upload scheduled after cooldown",
+		"provider/WAF blocked a request (HTTP 405); retry after cooldown",
+	} {
+		if !providerProbeIsWAFBlock(errors.New(summary)) {
+			t.Fatalf("persisted WAF diagnostic must remain recognizable after restart: %q", summary)
+		}
 	}
 }
 
@@ -4362,21 +4366,6 @@ func TestManualCloudSyncResetRemainsClientInvisible(t *testing.T) {
 	}
 	if !waitingCloudSyncReupload(row) {
 		t.Fatal("manual Cloud Sync reset must remain a rehydrate state")
-	}
-}
-
-func TestDirectRepairUploadQueuedUsesResolutionMarker(t *testing.T) {
-	row := &model.WebDAVWritebackObject{State: StateQueued, ResolutionReason: ResolutionWAFReupload}
-	if !directRepairUploadQueued(row) {
-		t.Fatal("queued WAF recovery row must bypass the provider pre-upload verification")
-	}
-	row.ResolutionReason = ResolutionManualReupload
-	if !directRepairUploadQueued(row) {
-		t.Fatal("manual immediate re-upload must bypass provider pre-upload verification")
-	}
-	row.ResolutionReason = ""
-	if directRepairUploadQueued(row) {
-		t.Fatal("ordinary queued row must not be marked as a special direct-recovery upload")
 	}
 }
 

@@ -12,6 +12,8 @@
 
 Cloud Sync 对已完成路径发起 PUT 时会建立新代次并重新 fresh LIST。115 上仍有相同内容时直接完成，不会重复上传；文件缺失或内容不同则上传这次收到的 payload。因此可以安全地让 Cloud Sync 全量重传，以重新检查并补回缺失文件。
 
+遇到 WAF 或限流后，OpenList 会等待 Provider 冷却时间，再重新执行同一套 fresh LIST 检查；不会跳过检查直接再次 PUT。
+
 Cloud Sync 是源数据。115 确认前，本地 spool 是持久交接副本。请将 spool 放在持久本地存储中，不要手工删除活动任务使用的文件。
 
 ## Overview 状态
