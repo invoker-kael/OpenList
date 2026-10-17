@@ -27,10 +27,6 @@ type AdminRuntimeStats struct {
 	DiskError                   string `json:"disk_error,omitempty"`
 	ReceivingReservationBytes   uint64 `json:"receiving_reservation_bytes"`
 	MissingSpool                int64  `json:"missing_spool"`
-	RestartRecovery             int64  `json:"restart_recovery"`
-	WaitingProviderVerification int64  `json:"waiting_provider_verification"`
-	NeedsCloudSyncRehydrate     int64  `json:"needs_cloudsync_rehydrate"`
-	AutomaticRecovery           int64  `json:"automatic_recovery"`
 	RemoteHashMismatch          int64  `json:"remote_hash_mismatch"`
 	Paused                      int64  `json:"paused"`
 }
@@ -218,31 +214,6 @@ func AdminRuntimeSnapshot() (AdminRuntimeStats, error) {
 	stats.MissingSpool, err = count(
 		"is_dir = ? AND canonical_state = ? AND state IN ? AND LOWER(last_error) LIKE ?",
 		false, CanonicalStateAcked, []string{StateQueued, StateVerifying}, "%durable spool is missing%",
-	)
-	if err != nil {
-		return stats, err
-	}
-	stats.RestartRecovery, err = count(
-		"state = ? AND (LOWER(last_error) LIKE ? OR LOWER(last_error) LIKE ?)",
-		StateVerifying, "%interrupted upload%", "%after restart%",
-	)
-	if err != nil {
-		return stats, err
-	}
-	stats.WaitingProviderVerification, err = count("state = ?", StateVerifying)
-	if err != nil {
-		return stats, err
-	}
-	stats.NeedsCloudSyncRehydrate, err = count(
-		"state = ? OR cloud_sync_reupload_required = ? OR state = ? OR resolution_reason = ?",
-		StateFailed, true, StateWaitingCloudSyncReupload, ResolutionNeedsCloudSyncRehydrate,
-	)
-	if err != nil {
-		return stats, err
-	}
-	stats.AutomaticRecovery, err = count(
-		"state IN ? AND (retry_count > 0 OR verify_count > 0 OR last_error <> '')",
-		[]string{StateQueued, StateUploading, StateVerifying},
 	)
 	if err != nil {
 		return stats, err

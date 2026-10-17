@@ -44,10 +44,6 @@ type webDAVWritebackSummary struct {
 	DiskFreeBytes               uint64                                 `json:"disk_free_bytes"`
 	DiskError                   string                                 `json:"disk_error,omitempty"`
 	MissingSpool                int64                                  `json:"missing_spool"`
-	RestartRecovery             int64                                  `json:"restart_recovery"`
-	WaitingProviderVerification int64                                  `json:"waiting_provider_verification"`
-	NeedsCloudSyncRehydrate     int64                                  `json:"needs_cloudsync_rehydrate"`
-	AutomaticRecovery           int64                                  `json:"automatic_recovery"`
 	RemoteHashMismatch          int64                                  `json:"remote_hash_mismatch"`
 	Paused                      int64                                  `json:"paused"`
 	Errors                      int64                                  `json:"errors"`
@@ -245,10 +241,6 @@ func WebDAVWritebackMonitorSummary(c *gin.Context) {
 		DiskFreeBytes:               runtimeStats.DiskFreeBytes,
 		DiskError:                   runtimeStats.DiskError,
 		MissingSpool:                runtimeStats.MissingSpool,
-		RestartRecovery:             runtimeStats.RestartRecovery,
-		WaitingProviderVerification: runtimeStats.WaitingProviderVerification,
-		NeedsCloudSyncRehydrate:     runtimeStats.NeedsCloudSyncRehydrate,
-		AutomaticRecovery:           runtimeStats.AutomaticRecovery,
 		RemoteHashMismatch:          runtimeStats.RemoteHashMismatch,
 		Paused:                      runtimeStats.Paused,
 		Errors:                      errorsCount,
