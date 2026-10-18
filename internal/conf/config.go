@@ -128,7 +128,6 @@ type WebDAVWritebackConfig struct {
 	RetryInitialSeconds         int    `json:"retry_initial_seconds" env:"RETRY_INITIAL_SECONDS"`
 	RetryMaxSeconds             int    `json:"retry_max_seconds" env:"RETRY_MAX_SECONDS"`
 	VerifyIntervalSeconds       int    `json:"verify_interval_seconds" env:"VERIFY_INTERVAL_SECONDS"`
-	VerifyAttempts              int    `json:"verify_attempts" env:"VERIFY_ATTEMPTS"`
 	CompletedCacheTTLMinutes    int    `json:"completed_cache_ttl_minutes" env:"COMPLETED_CACHE_TTL_MINUTES"`
 	CompletedRemoteProbeSeconds int    `json:"completed_remote_probe_seconds" env:"COMPLETED_REMOTE_PROBE_SECONDS"`
 	ProviderSnapshotTTLSeconds  int    `json:"provider_snapshot_ttl_seconds" env:"PROVIDER_SNAPSHOT_TTL_SECONDS"`
@@ -295,7 +294,6 @@ func DefaultConfig(dataDir string) *Config {
 			RetryInitialSeconds:         30,
 			RetryMaxSeconds:             30 * 60,
 			VerifyIntervalSeconds:       5,
-			VerifyAttempts:              60,
 			CompletedCacheTTLMinutes:    30,
 			CompletedRemoteProbeSeconds: 30 * 60,
 			ProviderSnapshotTTLSeconds:  10 * 60,

@@ -1840,9 +1840,13 @@ func remoteContentByName(row *model.WebDAVWritebackObject, objs []model.Obj, req
 }
 
 func (m *workerManager) completeExistingRemote(row *model.WebDAVWritebackObject, remotes []model.Obj) remoteContentComparison {
+	return m.completeExistingRemoteAt(row, remotes, time.Now())
+}
+
+func (m *workerManager) completeExistingRemoteAt(row *model.WebDAVWritebackObject, remotes []model.Obj, observedAt time.Time) remoteContentComparison {
 	remote, comparison := remoteContentByName(row, remotes, true)
 	if comparison == remoteContentMatch {
-		m.completeRemoteVerification(row, remote, []string{StateQueued}, true)
+		m.completeRemoteVerificationAt(row, remote, []string{StateQueued}, true, observedAt)
 	}
 	return comparison
 }
@@ -5601,6 +5605,8 @@ func providerFreshList(ctx context.Context, stop <-chan struct{}, slots chan str
 			retryAt: state.until,
 		}
 	}
+	indexVersion := beginRemoteIndexCapture(parent)
+	defer endRemoteIndexCapture(parent)
 
 	reserved, err := acquireWorkerSlot(slots, stop)
 	if err != nil {
@@ -5610,6 +5616,7 @@ func providerFreshList(ctx context.Context, stop <-chan struct{}, slots chan str
 	releaseWorkerSlot(slots, reserved)
 	if listErr == nil {
 		providerProbeCooldowns.success(parent)
+		persistRemoteIndexSnapshot(parent, fresh, time.Now(), indexVersion)
 		return fresh, nil
 	}
 	if !providerTransientProbeError(listErr) {
@@ -5808,6 +5815,7 @@ func ProviderListForWebDAV(ctx context.Context, parent string) ([]model.Obj, boo
 
 func InvalidateProviderSnapshots(parents ...string) {
 	providerParentSnapshots.invalidate(parents...)
+	invalidateRemoteIndexSnapshots(parents...)
 }
 
 type workerManager struct {
@@ -5836,6 +5844,18 @@ func currentProviderProbeSlots() chan struct{} {
 		return nil
 	}
 	return m.providerProbes
+}
+
+func ProviderProbeSlotsSnapshot() (int, int) {
+	slots := currentProviderProbeSlots()
+	if slots != nil {
+		return len(slots), cap(slots)
+	}
+	configured := 1
+	if conf.Conf != nil {
+		configured = providerProbeWorkerLimit(conf.Conf.WebDAVWriteback.Workers, conf.Conf.WebDAVWriteback.ProviderProbeWorkers)
+	}
+	return 0, configured
 }
 
 func boundedWorkerLimit(workers, configured int) int {
@@ -6033,10 +6053,7 @@ func startWorker(cleanupOrphans bool) {
 	if largeUploadWorkers < workers {
 		largeUploads = make(chan struct{}, largeUploadWorkers)
 	}
-	var providerProbes chan struct{}
-	if providerProbeWorkers < workers {
-		providerProbes = make(chan struct{}, providerProbeWorkers)
-	}
+	providerProbes := make(chan struct{}, providerProbeWorkers)
 	m := &workerManager{
 		ctx:               workerCtx,
 		cancel:            cancel,
@@ -7887,6 +7904,11 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	}
 
 	if m.uploadRequiresPayloadHash(row.Path) {
+		if cached, observedAt, ok := cachedRemoteMatches(row); ok {
+			if comparison := m.completeExistingRemoteAt(row, cached, observedAt); comparison == remoteContentMatch {
+				return
+			}
+		}
 		remotes, probeErr := m.listUploadParent(row.Parent)
 		if probeErr != nil {
 			if !errs.IsObjectNotFound(probeErr) {
@@ -7977,7 +7999,7 @@ func (m *workerManager) processUpload(row *model.WebDAVWritebackObject) {
 	err = m.putProviderFile(row.Parent, fsStream, updateProviderProgress)
 	// The pre-upload LIST may now be stale even when the provider call returned
 	// an error: 115 can have accepted the payload before the response was lost.
-	providerParentSnapshots.invalidate(row.Parent)
+	InvalidateProviderSnapshots(row.Parent)
 	if err != nil {
 		log.Warnf("write-back 115 upload attempt failed: id=%d path=%q generation=%d attempt=%d task_retries=%d bytes_reported=%d", row.ID, row.Path, row.Generation, attempt, row.RetryCount+1, row.ProviderUploadedBytes)
 		if errors.Is(err, ErrWritebackPaused) {
@@ -8440,7 +8462,12 @@ func mergeUpdateMaps(dst, src map[string]any) map[string]any {
 
 func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObject, remote model.Obj, allowedStates []string, requireHash bool) bool {
 	now := time.Now()
-	evidence, matched := matchedRemoteVerificationEvidence(row, remote, now, requireHash)
+	return m.completeRemoteVerificationAt(row, remote, allowedStates, requireHash, now)
+}
+
+func (m *workerManager) completeRemoteVerificationAt(row *model.WebDAVWritebackObject, remote model.Obj, allowedStates []string, requireHash bool, observedAt time.Time) bool {
+	now := time.Now()
+	evidence, matched := matchedRemoteVerificationEvidence(row, remote, observedAt, requireHash)
 	if !matched {
 		return false
 	}
@@ -8606,7 +8633,7 @@ func (m *workerManager) scheduleProviderConfirmation(row *model.WebDAVWritebackO
 		return false
 	}
 	providerProbeCooldowns.success(row.Parent)
-	providerParentSnapshots.invalidate(row.Parent)
+	InvalidateProviderSnapshots(row.Parent)
 	return true
 }
 

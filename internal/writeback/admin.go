@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -26,14 +27,22 @@ type CacheCleanupResult struct {
 }
 
 type AdminRuntimeStats struct {
-	DiskTotalBytes            uint64 `json:"disk_total_bytes"`
-	DiskUsedBytes             uint64 `json:"disk_used_bytes"`
-	DiskFreeBytes             uint64 `json:"disk_free_bytes"`
-	DiskError                 string `json:"disk_error,omitempty"`
-	ReceivingReservationBytes uint64 `json:"receiving_reservation_bytes"`
-	MissingSpool              int64  `json:"missing_spool"`
-	RemoteHashMismatch        int64  `json:"remote_hash_mismatch"`
-	Paused                    int64  `json:"paused"`
+	GoVersion                 string           `json:"go_version"`
+	NumCPU                    int              `json:"num_cpu"`
+	Goroutines                int              `json:"goroutines"`
+	MemoryAllocBytes          uint64           `json:"memory_alloc_bytes"`
+	MemorySysBytes            uint64           `json:"memory_sys_bytes"`
+	ProviderProbeInFlight     int              `json:"provider_probe_in_flight"`
+	ProviderProbeCapacity     int              `json:"provider_probe_capacity"`
+	RemoteIndex               RemoteIndexStats `json:"remote_index"`
+	DiskTotalBytes            uint64           `json:"disk_total_bytes"`
+	DiskUsedBytes             uint64           `json:"disk_used_bytes"`
+	DiskFreeBytes             uint64           `json:"disk_free_bytes"`
+	DiskError                 string           `json:"disk_error,omitempty"`
+	ReceivingReservationBytes uint64           `json:"receiving_reservation_bytes"`
+	MissingSpool              int64            `json:"missing_spool"`
+	RemoteHashMismatch        int64            `json:"remote_hash_mismatch"`
+	Paused                    int64            `json:"paused"`
 }
 
 func ValidateAdminConfig(cfg conf.WebDAVWritebackConfig) error {
@@ -70,8 +79,8 @@ func ValidateAdminConfig(cfg conf.WebDAVWritebackConfig) error {
 	if cfg.RetryMaxSeconds < cfg.RetryInitialSeconds {
 		return fmt.Errorf("retry_max_seconds must be greater than or equal to retry_initial_seconds")
 	}
-	if cfg.VerifyIntervalSeconds <= 0 || cfg.VerifyAttempts <= 0 {
-		return fmt.Errorf("verification interval and attempts must be greater than 0")
+	if cfg.VerifyIntervalSeconds <= 0 {
+		return fmt.Errorf("verification interval must be greater than 0")
 	}
 	if cfg.CompletedCacheTTLMinutes < -1 {
 		return fmt.Errorf("completed_cache_ttl_minutes must be -1 (disabled) or non-negative")
@@ -195,6 +204,19 @@ func RecoveryLabel(row *model.WebDAVWritebackObject) string {
 func AdminRuntimeSnapshot() (AdminRuntimeStats, error) {
 	now := time.Now()
 	stats := AdminRuntimeStats{}
+	stats.GoVersion = runtime.Version()
+	stats.NumCPU = runtime.NumCPU()
+	stats.Goroutines = runtime.NumGoroutine()
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	stats.MemoryAllocBytes = memory.Alloc
+	stats.MemorySysBytes = memory.Sys
+	stats.ProviderProbeInFlight, stats.ProviderProbeCapacity = ProviderProbeSlotsSnapshot()
+	var err error
+	stats.RemoteIndex, err = RemoteIndexSnapshot()
+	if err != nil {
+		return stats, err
+	}
 
 	var reservation struct {
 		Bytes uint64 `gorm:"column:bytes"`
@@ -212,7 +234,6 @@ func AdminRuntimeSnapshot() (AdminRuntimeStats, error) {
 		err := db.GetDb().Model(&model.WebDAVWritebackObject{}).Where(query, args...).Count(&n).Error
 		return n, err
 	}
-	var err error
 	stats.MissingSpool, err = count(
 		"is_dir = ? AND canonical_state = ? AND state IN ? AND LOWER(last_error) LIKE ?",
 		false, CanonicalStateAcked, []string{StateQueued, StateVerifying}, "%durable spool is missing%",
@@ -329,7 +350,7 @@ func ReuploadNow(ids []uint) (int64, error) {
 	}
 
 	for parent := range parents {
-		providerParentSnapshots.invalidate(parent)
+		InvalidateProviderSnapshots(parent)
 	}
 	if scheduled > 0 {
 		wake()
@@ -514,7 +535,7 @@ func CancelTasks(ids []uint, all bool) (int64, error) {
 
 	removeSpoolsIfUnreferenced(spools)
 	for parent := range parents {
-		providerParentSnapshots.invalidate(parent)
+		InvalidateProviderSnapshots(parent)
 	}
 	return reset, nil
 }
@@ -531,6 +552,7 @@ type RebuildAllResult struct {
 	ReceiveFences      int64 `json:"receive_fences"`
 	Reservations       int64 `json:"reservations"`
 	ProviderOperations int64 `json:"provider_operations"`
+	RemoteSnapshots    int64 `json:"remote_snapshots"`
 }
 
 func StartRebuildAllTaskRecords() bool {
@@ -549,18 +571,20 @@ func startRebuildTask(rebuild func() (RebuildAllResult, error)) bool {
 			return
 		}
 		log.Infof(
-			"write-back full rebuild completed: tasks=%d history=%d receive_fences=%d reservations=%d provider_operations=%d",
+			"write-back full rebuild completed: tasks=%d history=%d receive_fences=%d reservations=%d provider_operations=%d remote_snapshots=%d",
 			result.Tasks,
 			result.History,
 			result.ReceiveFences,
 			result.Reservations,
 			result.ProviderOperations,
+			result.RemoteSnapshots,
 		)
 	}()
 	return true
 }
 
 func RebuildAllTaskRecords() (RebuildAllResult, error) {
+	StopRemoteIndexRefresh()
 	rebuildGate.Lock()
 	defer rebuildGate.Unlock()
 
@@ -592,6 +616,9 @@ func RebuildAllTaskRecords() (RebuildAllResult, error) {
 			return err
 		}
 		if result.Tasks, err = deleteAll(&model.WebDAVWritebackObject{}); err != nil {
+			return err
+		}
+		if result.RemoteSnapshots, err = clearRemoteIndexSnapshots(tx); err != nil {
 			return err
 		}
 		return nil

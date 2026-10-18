@@ -32,6 +32,7 @@ type webDAVWritebackSummary struct {
 	Enabled                   bool                                   `json:"enabled"`
 	Rebuilding                bool                                   `json:"rebuilding"`
 	Workers                   int                                    `json:"workers"`
+	ProviderProbeWorkers      int                                    `json:"provider_probe_workers"`
 	Receiving                 int64                                  `json:"receiving"`
 	ReceivingExpectedBytes    int64                                  `json:"receiving_expected_bytes"`
 	ReceivingReservationBytes uint64                                 `json:"receiving_reservation_bytes"`
@@ -48,6 +49,14 @@ type webDAVWritebackSummary struct {
 	RemoteHashMismatch        int64                                  `json:"remote_hash_mismatch"`
 	Paused                    int64                                  `json:"paused"`
 	Errors                    int64                                  `json:"errors"`
+	GoVersion                 string                                 `json:"go_version"`
+	NumCPU                    int                                    `json:"num_cpu"`
+	Goroutines                int                                    `json:"goroutines"`
+	MemoryAllocBytes          uint64                                 `json:"memory_alloc_bytes"`
+	MemorySysBytes            uint64                                 `json:"memory_sys_bytes"`
+	ProviderProbeInFlight     int                                    `json:"provider_probe_in_flight"`
+	ProviderProbeCapacity     int                                    `json:"provider_probe_capacity"`
+	RemoteIndex               writeback.RemoteIndexStats             `json:"remote_index"`
 	States                    map[string]webDAVWritebackStateSummary `json:"states"`
 	UpdatedAt                 time.Time                              `json:"updated_at"`
 }
@@ -90,7 +99,7 @@ type webDAVWritebackSettingsUpdate struct {
 	RetryInitialSeconds         int    `json:"retry_initial_seconds"`
 	RetryMaxSeconds             int    `json:"retry_max_seconds"`
 	VerifyIntervalSeconds       int    `json:"verify_interval_seconds"`
-	VerifyAttempts              int    `json:"verify_attempts"`
+	ProviderSnapshotTTLSeconds  int    `json:"provider_snapshot_ttl_seconds"`
 }
 
 type webDAVWritebackSettings struct {
@@ -233,6 +242,7 @@ func WebDAVWritebackMonitorSummary(c *gin.Context) {
 		Enabled:                   writeback.Enabled(),
 		Rebuilding:                writeback.Rebuilding(),
 		Workers:                   conf.Conf.WebDAVWriteback.Workers,
+		ProviderProbeWorkers:      conf.Conf.WebDAVWriteback.ProviderProbeWorkers,
 		Receiving:                 receiving,
 		ReceivingExpectedBytes:    receivingExpectedBytes,
 		ReceivingReservationBytes: runtimeStats.ReceivingReservationBytes,
@@ -249,6 +259,14 @@ func WebDAVWritebackMonitorSummary(c *gin.Context) {
 		RemoteHashMismatch:        runtimeStats.RemoteHashMismatch,
 		Paused:                    runtimeStats.Paused,
 		Errors:                    errorsCount,
+		GoVersion:                 runtimeStats.GoVersion,
+		NumCPU:                    runtimeStats.NumCPU,
+		Goroutines:                runtimeStats.Goroutines,
+		MemoryAllocBytes:          runtimeStats.MemoryAllocBytes,
+		MemorySysBytes:            runtimeStats.MemorySysBytes,
+		ProviderProbeInFlight:     runtimeStats.ProviderProbeInFlight,
+		ProviderProbeCapacity:     runtimeStats.ProviderProbeCapacity,
+		RemoteIndex:               runtimeStats.RemoteIndex,
 		States:                    states,
 		UpdatedAt:                 now,
 	})
@@ -305,7 +323,7 @@ func webDAVWritebackSettingsFromConfig(cfg conf.WebDAVWritebackConfig, restartFi
 			RetryInitialSeconds:         cfg.RetryInitialSeconds,
 			RetryMaxSeconds:             cfg.RetryMaxSeconds,
 			VerifyIntervalSeconds:       cfg.VerifyIntervalSeconds,
-			VerifyAttempts:              cfg.VerifyAttempts,
+			ProviderSnapshotTTLSeconds:  cfg.ProviderSnapshotTTLSeconds,
 		},
 		SpoolDir:              cfg.SpoolDir,
 		RestartRequiredFields: restartFields,
@@ -340,7 +358,7 @@ func WebDAVWritebackSaveSettings(c *gin.Context) {
 	next.RetryInitialSeconds = req.RetryInitialSeconds
 	next.RetryMaxSeconds = req.RetryMaxSeconds
 	next.VerifyIntervalSeconds = req.VerifyIntervalSeconds
-	next.VerifyAttempts = req.VerifyAttempts
+	next.ProviderSnapshotTTLSeconds = req.ProviderSnapshotTTLSeconds
 	if err := writeback.ValidateAdminConfig(next); err != nil {
 		common.ErrorResp(c, err, http.StatusBadRequest)
 		return
@@ -1300,6 +1318,14 @@ func WebDAVWritebackBatchAction(c *gin.Context) {
 
 func WebDAVWritebackVerifyNow(c *gin.Context) {
 	WebDAVWritebackReuploadNow(c)
+}
+
+func WebDAVWritebackRemoteIndexRefresh(c *gin.Context) {
+	started := writeback.StartRemoteIndexRefresh()
+	common.SuccessResp(c, gin.H{
+		"started": started,
+		"running": writeback.RemoteIndexRefreshSnapshot().Running,
+	})
 }
 
 func WebDAVWritebackRebuildAll(c *gin.Context) {

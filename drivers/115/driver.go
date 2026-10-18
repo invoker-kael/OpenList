@@ -39,21 +39,11 @@ func (d *Pan115) Init(ctx context.Context) error {
 	return d.login()
 }
 
-func (d *Pan115) WaitLimit(ctx context.Context) error {
-	if d.limiter != nil {
-		return d.limiter.Wait(ctx)
-	}
-	return nil
-}
-
 func (d *Pan115) Drop(ctx context.Context) error {
 	return nil
 }
 
 func (d *Pan115) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
-		return nil, err
-	}
 	files, err := d.getFiles(dir.GetID())
 	if err != nil && !errors.Is(err, driver115.ErrNotExist) {
 		return nil, err
@@ -64,9 +54,6 @@ func (d *Pan115) List(ctx context.Context, dir model.Obj, args model.ListArgs) (
 }
 
 func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	if err := d.WaitLimit(ctx); err != nil {
-		return nil, err
-	}
 	userAgent := args.Header.Get("User-Agent")
 	downloadInfo, err := d.client.DownloadWithUA(file.(*FileObj).PickCode, userAgent)
 	if err != nil {
@@ -80,10 +67,6 @@ func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 }
 
 func (d *Pan115) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
-		return nil, err
-	}
-
 	result := driver115.MkdirResp{}
 	form := map[string]string{
 		"pid":   parentDir.GetID(),
@@ -108,9 +91,6 @@ func (d *Pan115) MakeDir(ctx context.Context, parentDir model.Obj, dirName strin
 }
 
 func (d *Pan115) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
-		return nil, err
-	}
 	if err := d.client.Move(dstDir.GetID(), srcObj.GetID()); err != nil {
 		return nil, err
 	}
@@ -122,9 +102,6 @@ func (d *Pan115) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj,
 }
 
 func (d *Pan115) Rename(ctx context.Context, srcObj model.Obj, newName string) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
-		return nil, err
-	}
 	if err := d.client.Rename(srcObj.GetID(), newName); err != nil {
 		return nil, err
 	}
@@ -136,24 +113,14 @@ func (d *Pan115) Rename(ctx context.Context, srcObj model.Obj, newName string) (
 }
 
 func (d *Pan115) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
-	if err := d.WaitLimit(ctx); err != nil {
-		return err
-	}
 	return d.client.Copy(dstDir.GetID(), srcObj.GetID())
 }
 
 func (d *Pan115) Remove(ctx context.Context, obj model.Obj) error {
-	if err := d.WaitLimit(ctx); err != nil {
-		return err
-	}
 	return d.client.Delete(obj.GetID())
 }
 
 func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
-		return nil, err
-	}
-
 	var (
 		fastInfo *driver115.UploadInitResp
 		dirID    = dstDir.GetID()

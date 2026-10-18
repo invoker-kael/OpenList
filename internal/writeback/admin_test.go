@@ -38,7 +38,6 @@ func validAdminConfig() conf.WebDAVWritebackConfig {
 		RetryInitialSeconds:         30,
 		RetryMaxSeconds:             1800,
 		VerifyIntervalSeconds:       5,
-		VerifyAttempts:              60,
 		CompletedCacheTTLMinutes:    30,
 		CompletedRemoteProbeSeconds: 1800,
 		ProviderSnapshotTTLSeconds:  600,
@@ -55,7 +54,6 @@ func TestValidateAdminConfigRejectsUnsafeValues(t *testing.T) {
 		{"reservation chunk zero", func(c *conf.WebDAVWritebackConfig) { c.IncomingReservationChunkMB = 0 }},
 		{"retry max before initial", func(c *conf.WebDAVWritebackConfig) { c.RetryMaxSeconds = c.RetryInitialSeconds - 1 }},
 		{"verify interval zero", func(c *conf.WebDAVWritebackConfig) { c.VerifyIntervalSeconds = 0 }},
-		{"verify attempts zero", func(c *conf.WebDAVWritebackConfig) { c.VerifyAttempts = 0 }},
 		{"invalid negative cache ttl", func(c *conf.WebDAVWritebackConfig) { c.CompletedCacheTTLMinutes = -2 }},
 		{"empty spool directory", func(c *conf.WebDAVWritebackConfig) { c.SpoolDir = "" }},
 	}
@@ -232,7 +230,6 @@ func setupUploadLifecycleTest(t *testing.T) (*gorm.DB, string) {
 			RetryInitialSeconds:      1,
 			RetryMaxSeconds:          2,
 			VerifyIntervalSeconds:    1,
-			VerifyAttempts:           3,
 			CompletedCacheTTLMinutes: 30,
 		},
 	}
@@ -375,6 +372,43 @@ func TestProcessUploadSkipsPUTWhenFreshListHasExactContent(t *testing.T) {
 	}
 	if putCalls != 0 {
 		t.Fatalf("provider PUTs=%d for exact fresh-list match, want 0", putCalls)
+	}
+}
+
+func TestProcessUploadUsesRecentRemoteIndexBeforeFreshList(t *testing.T) {
+	database, spoolDir := setupUploadLifecycleTest(t)
+	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
+	remote := &model.Object{
+		ID:       "cached-115-object",
+		Name:     row.Name,
+		Size:     row.Size,
+		HashInfo: utils.NewHashInfo(utils.SHA1, row.PayloadSHA1),
+	}
+	version := beginRemoteIndexCapture(row.Parent)
+	persistRemoteIndexSnapshot(row.Parent, []model.Obj{remote}, time.Now(), version)
+	endRemoteIndexCapture(row.Parent)
+
+	listCalls, putCalls := 0, 0
+	manager := &workerManager{
+		ctx:         context.Background(),
+		requireHash: func(string) bool { return true },
+		listParent: func(string) ([]model.Obj, error) {
+			listCalls++
+			return nil, nil
+		},
+		putProvider: func(string, model.FileStreamer, model.UpdateProgress) error {
+			putCalls++
+			return nil
+		},
+	}
+	manager.processUpload(&row)
+
+	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	if saved.State != StateCompleted || saved.RemoteObjectID != remote.ID || saved.ProviderUploadAttempts != 0 {
+		t.Fatalf("cached exact match state=%q object_id=%q attempts=%d", saved.State, saved.RemoteObjectID, saved.ProviderUploadAttempts)
+	}
+	if listCalls != 0 || putCalls != 0 {
+		t.Fatalf("fresh LISTs=%d provider PUTs=%d, want both skipped for a recent exact index match", listCalls, putCalls)
 	}
 }
 
@@ -701,6 +735,7 @@ func TestRebuildClearsWritebackRowsAndLocalSpoolOnly(t *testing.T) {
 		&model.WebDAVWritebackReceiveFence{PathKey: "fence", Path: "/backup/file.bin"},
 		&model.WebDAVWritebackReceiveReservation{PathKey: "reservation", Sequence: 1},
 		&model.WebDAVProviderOperation{OperationKey: "operation"},
+		&model.WebDAVWritebackRemoteSnapshot{ParentKey: "snapshot", Parent: "/backup"},
 	}
 	for _, row := range rows {
 		if err := database.Create(row).Error; err != nil {
@@ -721,7 +756,7 @@ func TestRebuildClearsWritebackRowsAndLocalSpoolOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Tasks != 1 || result.History != 1 || result.ReceiveFences != 1 || result.Reservations != 1 || result.ProviderOperations != 1 {
+	if result.Tasks != 1 || result.History != 1 || result.ReceiveFences != 1 || result.Reservations != 1 || result.ProviderOperations != 1 || result.RemoteSnapshots != 1 {
 		t.Fatalf("rebuild result=%+v, want one row removed from each writeback table", result)
 	}
 	for _, table := range []struct {
@@ -733,6 +768,7 @@ func TestRebuildClearsWritebackRowsAndLocalSpoolOnly(t *testing.T) {
 		{"receive fences", &model.WebDAVWritebackReceiveFence{}},
 		{"reservations", &model.WebDAVWritebackReceiveReservation{}},
 		{"provider operations", &model.WebDAVProviderOperation{}},
+		{"remote snapshots", &model.WebDAVWritebackRemoteSnapshot{}},
 	} {
 		var count int64
 		if err := database.Model(table.model).Count(&count).Error; err != nil {

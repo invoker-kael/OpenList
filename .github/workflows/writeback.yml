@@ -11,6 +11,7 @@ on:
       - "server/webdav/**"
       - "server/handles/webdav_writeback.go"
       - "server/router.go"
+      - "drivers/115/**"
       - ".github/workflows/writeback.yml"
   pull_request:
     branches: ["main"]
@@ -20,6 +21,7 @@ on:
       - "server/common/proxy.go"
       - "server/common/proxy_test.go"
       - "drivers/115_open/**"
+      - "drivers/115/**"
       - "internal/model/webdav_writeback.go"
       - "internal/db/db.go"
       - "internal/conf/**"
@@ -56,6 +58,8 @@ jobs:
             internal/conf/persist.go
             internal/writeback/admin.go
             internal/writeback/admin_test.go
+            internal/writeback/remote_index.go
+            internal/writeback/remote_index_test.go
             internal/writeback/history.go
             internal/writeback/history_test.go
             internal/writeback/writeback.go
@@ -70,6 +74,9 @@ jobs:
             server/common/proxy_test.go
             server/handles/webdav_writeback.go
             server/router.go
+            drivers/115/driver.go
+            drivers/115/driver_test.go
+            drivers/115/util.go
             drivers/115_open/driver.go
             drivers/115_open/types.go
             drivers/115_open/upload.go
@@ -81,7 +88,7 @@ jobs:
           fi
 
       - name: Unit and compile tests
-        run: go test ./internal/writeback ./server/webdav ./server/common ./server/handles ./server ./drivers/115_open
+        run: go test ./internal/writeback ./server/webdav ./server/common ./server/handles ./server ./drivers/115 ./drivers/115_open
 
       - name: Format gate
         run: git diff --exit-code

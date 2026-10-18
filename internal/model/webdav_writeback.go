@@ -188,3 +188,17 @@ type WebDAVProviderOperation struct {
 	CreatedAt                     time.Time  `json:"created_at"`
 	UpdatedAt                     time.Time  `json:"updated_at" gorm:"index:idx_webdav_provider_prepared_expiry,priority:2"`
 }
+
+// WebDAVWritebackRemoteSnapshot stores a short-lived provider directory
+// observation for exact content comparisons. ObjectsJSON contains only
+// entries whose names are present in current writeback rows for this parent.
+type WebDAVWritebackRemoteSnapshot struct {
+	ID          uint      `json:"id" gorm:"primaryKey"`
+	ParentKey   string    `json:"parent_key" gorm:"size:64;uniqueIndex"`
+	Parent      string    `json:"parent" gorm:"type:text"`
+	ObjectsJSON string    `json:"objects_json" gorm:"type:longtext"`
+	ObjectCount int       `json:"object_count"`
+	RefreshedAt time.Time `json:"refreshed_at" gorm:"index"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}

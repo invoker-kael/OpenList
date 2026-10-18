@@ -25,6 +25,7 @@ import (
 	cipher "github.com/SheltonZhu/115driver/pkg/crypto/ec115"
 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
+	"github.com/go-resty/resty/v2"
 	"github.com/pkg/errors"
 )
 
@@ -38,6 +39,7 @@ func (d *Pan115) login() error {
 		},
 	}
 	d.client = driver115.New(opts...)
+	d.applyRateLimit()
 	cr := &driver115.Credential{}
 	if d.QRCodeToken != "" {
 		s := &driver115.QRCodeSession{
@@ -57,6 +59,15 @@ func (d *Pan115) login() error {
 		return errors.New("missing cookie or qrcode account")
 	}
 	return d.client.LoginCheck()
+}
+
+func (d *Pan115) applyRateLimit() {
+	if d.client == nil || d.limiter == nil {
+		return
+	}
+	d.client.Client.OnBeforeRequest(func(_ *resty.Client, req *resty.Request) error {
+		return d.limiter.Wait(req.Context())
+	})
 }
 
 func (d *Pan115) getFiles(fileId string) ([]FileObj, error) {
