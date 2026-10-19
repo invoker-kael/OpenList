@@ -75,7 +75,7 @@ func TestApplyCgroupMemoryLimitV1(t *testing.T) {
 	files := map[string]string{
 		"/sys/fs/cgroup/memory/memory.limit_in_bytes": "8589934592",
 		"/sys/fs/cgroup/memory/memory.usage_in_bytes": "7516192768",
-		"/sys/fs/cgroup/memory/memory.stat":            "inactive_file 1073741824\ntotal_inactive_file 6442450944\n",
+		"/sys/fs/cgroup/memory/memory.stat":           "inactive_file 1073741824\ntotal_inactive_file 6442450944\n",
 	}
 	applyCgroupMemoryLimit(stat, func(path string) ([]byte, error) {
 		value, ok := files[path]
