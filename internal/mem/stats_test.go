@@ -31,6 +31,26 @@ func TestApplyCgroupMemoryLimit(t *testing.T) {
 	}
 }
 
+func TestApplyCgroupMemoryLimitReclaimableFileCache(t *testing.T) {
+	stat := &gopsutilmem.VirtualMemoryStat{Total: 16 << 30, Available: 10 << 30}
+	files := map[string]string{
+		"/sys/fs/cgroup/memory.max":     "8589934592",
+		"/sys/fs/cgroup/memory.current": "8589934592",
+		"/sys/fs/cgroup/memory.stat":    "inactive_file 7516192768\n",
+	}
+	applyCgroupMemoryLimit(stat, func(path string) ([]byte, error) {
+		value, ok := files[path]
+		if !ok {
+			return nil, errors.New("file not found")
+		}
+		return []byte(value), nil
+	})
+
+	if stat.Available != 7<<30 {
+		t.Fatalf("Available = %d, want %d", stat.Available, uint64(7<<30))
+	}
+}
+
 func TestApplyCgroupMemoryLimitExhausted(t *testing.T) {
 	stat := &gopsutilmem.VirtualMemoryStat{Total: 16 << 30, Available: 10 << 30}
 	files := map[string]string{
@@ -55,6 +75,7 @@ func TestApplyCgroupMemoryLimitV1(t *testing.T) {
 	files := map[string]string{
 		"/sys/fs/cgroup/memory/memory.limit_in_bytes": "8589934592",
 		"/sys/fs/cgroup/memory/memory.usage_in_bytes": "7516192768",
+		"/sys/fs/cgroup/memory/memory.stat":            "inactive_file 1073741824\ntotal_inactive_file 6442450944\n",
 	}
 	applyCgroupMemoryLimit(stat, func(path string) ([]byte, error) {
 		value, ok := files[path]
@@ -64,7 +85,7 @@ func TestApplyCgroupMemoryLimitV1(t *testing.T) {
 		return []byte(value), nil
 	})
 
-	if stat.Total != 8<<30 || stat.Available != 1<<30 {
+	if stat.Total != 8<<30 || stat.Available != 7<<30 {
 		t.Fatalf("v1 cgroup stats = Total %d, Available %d", stat.Total, stat.Available)
 	}
 }
