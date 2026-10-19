@@ -5,6 +5,8 @@ on:
     branches: ["feature/cloudsync-writeback"]
     paths:
       - "internal/writeback/**"
+      - "internal/mem/**"
+      - "internal/bootstrap/config.go"
       - "internal/model/webdav_writeback.go"
       - "internal/db/db.go"
       - "internal/conf/**"
@@ -17,6 +19,8 @@ on:
     branches: ["main"]
     paths:
       - "internal/writeback/**"
+      - "internal/mem/**"
+      - "internal/bootstrap/config.go"
       - "server/webdav/**"
       - "server/common/proxy.go"
       - "server/common/proxy_test.go"
@@ -52,6 +56,10 @@ jobs:
       - name: Format preview
         run: |
           files=(
+            internal/mem/stats.go
+            internal/mem/stats_test.go
+            internal/mem/utils.go
+            internal/bootstrap/config.go
             internal/model/webdav_writeback.go
             internal/db/db.go
             internal/conf/config.go
@@ -88,7 +96,7 @@ jobs:
           fi
 
       - name: Unit and compile tests
-        run: go test ./internal/writeback ./server/webdav ./server/common ./server/handles ./server ./drivers/115 ./drivers/115_open
+        run: go test ./internal/mem ./internal/bootstrap ./internal/writeback ./server/webdav ./server/common ./server/handles ./server ./drivers/115 ./drivers/115_open
 
       - name: Format gate
         run: git diff --exit-code

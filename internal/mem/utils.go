@@ -8,7 +8,6 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/pkg/singleflight"
-	"github.com/shirou/gopsutil/v4/mem"
 )
 
 var ErrNotEnoughMemory = errors.New("not enough memory")
@@ -18,7 +17,7 @@ func MemoryGrowCheck(growSize uint64) error {
 		return ErrNotEnoughMemory
 	}
 	r, err, _ := singleflight.AnyGroup.Do("MemoryGrowCheck", func() (any, error) {
-		m, err := mem.VirtualMemory()
+		m, err := VirtualMemory()
 		if err != nil {
 			return nil, err
 		}

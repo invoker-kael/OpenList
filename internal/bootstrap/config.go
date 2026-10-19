@@ -10,10 +10,10 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	internalmem "github.com/OpenListTeam/OpenList/v4/internal/mem"
 	"github.com/OpenListTeam/OpenList/v4/internal/net"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/caarlos0/env/v9"
-	"github.com/shirou/gopsutil/v4/mem"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -103,7 +103,7 @@ func InitConfig() {
 		net.DefaultConcurrencyLimit = &net.ConcurrencyLimit{Limit: uint32(conf.Conf.MaxConcurrency)}
 	}
 
-	memStat, _ := mem.VirtualMemory()
+	memStat, _ := internalmem.VirtualMemory()
 	if memStat != nil {
 		log.Infof("total memory: %dMB, available: %dMB", memStat.Total>>20, memStat.Available>>20)
 		if conf.Conf.MinFreeMemory < 0 {
