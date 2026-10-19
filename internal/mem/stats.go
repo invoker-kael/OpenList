@@ -11,8 +11,8 @@ import (
 type memoryFileReader func(string) ([]byte, error)
 
 type cgroupMemoryFiles struct {
-	limit  string
-	usage  string
+	limit   string
+	usage   string
 	unified bool
 }
 
