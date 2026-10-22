@@ -218,15 +218,15 @@ func setupUploadLifecycleTest(t *testing.T) (*gorm.DB, string) {
 	conf.Conf = &conf.Config{
 		Database: conf.Database{Type: "sqlite"},
 		WebDAVWriteback: conf.WebDAVWritebackConfig{
-			Enabled:                  true,
-			SpoolDir:                 spoolDir,
-			Workers:                  1,
-			UploadWorkers:            1,
-			LargeUploadWorkers:       1,
-			ProviderProbeWorkers:     1,
-			RetryInitialSeconds:      1,
-			RetryMaxSeconds:          2,
-			VerifyIntervalSeconds:    1,
+			Enabled:               true,
+			SpoolDir:              spoolDir,
+			Workers:               1,
+			UploadWorkers:         1,
+			LargeUploadWorkers:    1,
+			ProviderProbeWorkers:  1,
+			RetryInitialSeconds:   1,
+			RetryMaxSeconds:       2,
+			VerifyIntervalSeconds: 1,
 		},
 	}
 	database, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
