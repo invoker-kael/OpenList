@@ -2252,18 +2252,13 @@ func TestSpoolAdmissionRequired(t *testing.T) {
 	}
 }
 
-func TestCompletedSpoolPressureReclaimRespectsCacheDisable(t *testing.T) {
+func TestCompletedSpoolPressureReclaimRequiresConfiguration(t *testing.T) {
 	oldConf := conf.Conf
 	defer func() { conf.Conf = oldConf }()
 
-	conf.Conf = &conf.Config{WebDAVWriteback: conf.WebDAVWritebackConfig{CompletedCacheTTLMinutes: 30}}
+	conf.Conf = &conf.Config{}
 	if !completedSpoolPressureReclaimEnabled() {
-		t.Fatal("normal completed-cache mode should allow emergency reclaim before 507")
-	}
-
-	conf.Conf.WebDAVWriteback.CompletedCacheTTLMinutes = -1
-	if completedSpoolPressureReclaimEnabled() {
-		t.Fatal("negative completed cache TTL explicitly disables pressure reclaim")
+		t.Fatal("configured writeback should allow emergency reclaim before 507")
 	}
 
 	conf.Conf = nil

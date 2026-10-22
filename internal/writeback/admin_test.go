@@ -38,7 +38,6 @@ func validAdminConfig() conf.WebDAVWritebackConfig {
 		RetryInitialSeconds:         30,
 		RetryMaxSeconds:             1800,
 		VerifyIntervalSeconds:       5,
-		CompletedCacheTTLMinutes:    30,
 		CompletedRemoteProbeSeconds: 1800,
 		ProviderSnapshotTTLSeconds:  600,
 	}
@@ -54,7 +53,6 @@ func TestValidateAdminConfigRejectsUnsafeValues(t *testing.T) {
 		{"reservation chunk zero", func(c *conf.WebDAVWritebackConfig) { c.IncomingReservationChunkMB = 0 }},
 		{"retry max before initial", func(c *conf.WebDAVWritebackConfig) { c.RetryMaxSeconds = c.RetryInitialSeconds - 1 }},
 		{"verify interval zero", func(c *conf.WebDAVWritebackConfig) { c.VerifyIntervalSeconds = 0 }},
-		{"invalid negative cache ttl", func(c *conf.WebDAVWritebackConfig) { c.CompletedCacheTTLMinutes = -2 }},
 		{"empty spool directory", func(c *conf.WebDAVWritebackConfig) { c.SpoolDir = "" }},
 	}
 	for _, tt := range tests {
@@ -68,9 +66,8 @@ func TestValidateAdminConfigRejectsUnsafeValues(t *testing.T) {
 	}
 }
 
-func TestValidateAdminConfigPreservesDocumentedSentinels(t *testing.T) {
+func TestValidateAdminConfigPreservesProviderAndCapacitySentinels(t *testing.T) {
 	cfg := validAdminConfig()
-	cfg.CompletedCacheTTLMinutes = -1
 	cfg.ProviderSnapshotTTLSeconds = -1
 	cfg.MaxPendingSpoolMB = 0
 	cfg.ReserveFreeSpaceMB = 0
@@ -230,7 +227,6 @@ func setupUploadLifecycleTest(t *testing.T) (*gorm.DB, string) {
 			RetryInitialSeconds:      1,
 			RetryMaxSeconds:          2,
 			VerifyIntervalSeconds:    1,
-			CompletedCacheTTLMinutes: 30,
 		},
 	}
 	database, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
@@ -310,6 +306,37 @@ func reloadUploadLifecycleRow(t *testing.T, database *gorm.DB, id uint) model.We
 	return row
 }
 
+func assertCompletedSpoolReleased(t *testing.T, spoolPath string, row model.WebDAVWritebackObject) {
+	t.Helper()
+	if row.SpoolPath != "" {
+		t.Fatalf("completed row still references spool %q", row.SpoolPath)
+	}
+	if spoolPath == "" {
+		t.Fatal("expected original spool path")
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("completed spool still exists or returned unexpected error: %v", err)
+	}
+}
+
+func TestCleanupCompletedReleasesLegacySpool(t *testing.T) {
+	database, spoolDir := setupUploadLifecycleTest(t)
+	row := createUploadLifecycleRow(t, database, spoolDir, "legacy completed payload")
+	completedAt := time.Now().Add(-time.Second)
+	if err := database.Model(&model.WebDAVWritebackObject{}).Where("id = ?", row.ID).Updates(map[string]any{
+		"state":                        StateCompleted,
+		"completed_at":                 &completedAt,
+		"provider_upload_completed_at": &completedAt,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	(&workerManager{}).cleanupCompleted()
+
+	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	assertCompletedSpoolReleased(t, row.SpoolPath, saved)
+}
+
 func TestProcessUploadCompletesOnProviderSuccessWithoutPostUploadVerification(t *testing.T) {
 	database, spoolDir := setupUploadLifecycleTest(t)
 	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
@@ -334,6 +361,7 @@ func TestProcessUploadCompletesOnProviderSuccessWithoutPostUploadVerification(t 
 	manager.processUpload(&row)
 
 	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	assertCompletedSpoolReleased(t, row.SpoolPath, saved)
 	if saved.State != StateCompleted || saved.ProviderUploadCompletedAt == nil {
 		t.Fatalf("provider success state=%q completed_at=%v, want completed", saved.State, saved.ProviderUploadCompletedAt)
 	}
@@ -367,6 +395,7 @@ func TestProcessUploadSkipsPUTWhenFreshListHasExactContent(t *testing.T) {
 	manager.processUpload(&row)
 
 	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	assertCompletedSpoolReleased(t, row.SpoolPath, saved)
 	if saved.State != StateCompleted || saved.RemoteSHA1 != row.PayloadSHA1 || saved.ProviderUploadAttempts != 0 {
 		t.Fatalf("existing exact object state=%q remote_sha1=%q attempts=%d", saved.State, saved.RemoteSHA1, saved.ProviderUploadAttempts)
 	}
@@ -404,6 +433,7 @@ func TestProcessUploadUsesRecentRemoteIndexBeforeFreshList(t *testing.T) {
 	manager.processUpload(&row)
 
 	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	assertCompletedSpoolReleased(t, row.SpoolPath, saved)
 	if saved.State != StateCompleted || saved.RemoteObjectID != remote.ID || saved.ProviderUploadAttempts != 0 {
 		t.Fatalf("cached exact match state=%q object_id=%q attempts=%d", saved.State, saved.RemoteObjectID, saved.ProviderUploadAttempts)
 	}
@@ -448,6 +478,7 @@ func TestProcessUploadProviderErrorKeepsSpoolAndExactRetryMatchAvoidsSecondPut(t
 
 	manager.processUpload(&failedAttempt)
 	saved := reloadUploadLifecycleRow(t, database, row.ID)
+	assertCompletedSpoolReleased(t, row.SpoolPath, saved)
 	if saved.State != StateCompleted || saved.RemoteSHA1 != hash {
 		t.Fatalf("retry matching existing object did not complete: state=%q remote_sha1=%q", saved.State, saved.RemoteSHA1)
 	}

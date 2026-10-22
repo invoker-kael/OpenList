@@ -82,9 +82,6 @@ func ValidateAdminConfig(cfg conf.WebDAVWritebackConfig) error {
 	if cfg.VerifyIntervalSeconds <= 0 {
 		return fmt.Errorf("verification interval must be greater than 0")
 	}
-	if cfg.CompletedCacheTTLMinutes < -1 {
-		return fmt.Errorf("completed_cache_ttl_minutes must be -1 (disabled) or non-negative")
-	}
 	if cfg.CompletedRemoteProbeSeconds < 0 {
 		return fmt.Errorf("completed_remote_probe_seconds must not be negative")
 	}

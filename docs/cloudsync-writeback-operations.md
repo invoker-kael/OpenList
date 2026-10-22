@@ -5,10 +5,10 @@
 ## Normal flow
 
 1. OpenList receives the complete WebDAV `PUT`, writes it durably to the local spool, and acknowledges Cloud Sync.
-2. Before uploading to 115, OpenList checks a recent MySQL remote-index snapshot for an exact same-name, size and SHA-1 match. If none is available, it performs a fresh parent `LIST`. An exact match completes without another upload; cached misses never prove that a remote file is absent.
-3. Otherwise OpenList uploads the local spool. A successful provider API response completes the task; normal uploads do not wait for a second `LIST`.
+2. Before uploading to 115, OpenList checks a recent MySQL remote-index snapshot for an exact same-name, size and SHA-1 match. If none is available, it performs a fresh parent `LIST`. An exact match completes without another upload and immediately releases the local spool; cached misses never prove that a remote file is absent.
+3. Otherwise OpenList uploads the local spool. A successful provider API response completes the task and immediately releases the local spool; normal uploads do not wait for a second `LIST`.
 4. Timeouts, rate limits, WAF responses, and API errors keep the durable spool in **Processing** and retry with backoff. Before a retry, OpenList performs a fresh `LIST` to catch an upload accepted by 115 whose response was lost. Provider/API errors never mean that the file is absent.
-5. Completed objects are checked only at a low frequency after the local cache is released. Any same-name size + SHA-1 match keeps the object completed. API errors or missing SHA-1 do not count as missing; three consecutive successful fresh LISTs without a match are required before Cloud Sync sees the path as missing and resends it.
+5. Completed objects are checked only at a low frequency after the local spool is released on completion. Any same-name size + SHA-1 match keeps the object completed. API errors or missing SHA-1 do not count as missing; three consecutive successful fresh LISTs without a match are required before Cloud Sync sees the path as missing and resends it.
 
 A repeated PUT with the same size and SHA-1 coalesces into the existing generation, including after completion. Different content starts a new generation. This lets Cloud Sync resend without creating another task or transmitting the same payload to 115 again.
 

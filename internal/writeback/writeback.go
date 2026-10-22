@@ -2399,7 +2399,7 @@ func (r *incomingReservation) flushConsumedLocked() {
 }
 
 func completedSpoolPressureReclaimEnabled() bool {
-	return conf.Conf != nil && conf.Conf.WebDAVWriteback.CompletedCacheTTLMinutes >= 0
+	return conf.Conf != nil
 }
 
 // completedSpoolOldestFirst orders reclaimable payloads by when the current
@@ -8024,12 +8024,14 @@ func (m *workerManager) completeProviderUpload(row *model.WebDAVWritebackObject,
 	if row == nil {
 		return false
 	}
+	spoolPath := row.SpoolPath
 	providerProbeCooldowns.success(row.Parent)
 	res := db.GetDb().Model(&model.WebDAVWritebackObject{}).
 		Where("id = ? AND generation = ? AND state = ? AND canonical_state = ?",
 			row.ID, row.Generation, StateUploading, CanonicalStateAcked).
 		Updates(map[string]any{
 			"state":                        StateCompleted,
+			"spool_path":                   "",
 			"paused":                       false,
 			"retry_at":                     nil,
 			"last_error":                   "",
@@ -8068,6 +8070,8 @@ func (m *workerManager) completeProviderUpload(row *model.WebDAVWritebackObject,
 	}
 
 	row.State = StateCompleted
+	row.SpoolPath = ""
+	removeSpoolIfUnreferenced(spoolPath)
 	row.Paused = false
 	row.RetryAt = nil
 	row.LastError = ""
@@ -8467,12 +8471,14 @@ func (m *workerManager) completeRemoteVerification(row *model.WebDAVWritebackObj
 
 func (m *workerManager) completeRemoteVerificationAt(row *model.WebDAVWritebackObject, remote model.Obj, allowedStates []string, requireHash bool, observedAt time.Time) bool {
 	now := time.Now()
+	spoolPath := row.SpoolPath
 	evidence, matched := matchedRemoteVerificationEvidence(row, remote, observedAt, requireHash)
 	if !matched {
 		return false
 	}
 	updates := map[string]any{
 		"state":                   StateCompleted,
+		"spool_path":              "",
 		"paused":                  false,
 		"completed_at":            &now,
 		"retry_at":                nil,
@@ -8496,6 +8502,8 @@ func (m *workerManager) completeRemoteVerificationAt(row *model.WebDAVWritebackO
 	if res.Error != nil || res.RowsAffected == 0 {
 		return false
 	}
+	row.SpoolPath = ""
+	removeSpoolIfUnreferenced(spoolPath)
 	clearManualPause(row.ID, row.Generation)
 	// History is deliberately best-effort and runs only after correctness state
 	// has committed. A History failure must never turn a provider success into a
@@ -9192,11 +9200,7 @@ func CleanupCompletedCacheNow() (int, error) {
 }
 
 func (m *workerManager) cleanupCompleted() {
-	ttl := conf.Conf.WebDAVWriteback.CompletedCacheTTLMinutes
-	if ttl < 0 {
-		return
-	}
-	cutoff := time.Now().Add(-time.Duration(ttl) * time.Minute)
+	cutoff := time.Now()
 	for batch := 0; batch < completedCleanupMaxBatches; batch++ {
 		selected, released, _, err := releaseCompletedSpoolBatch(cutoff, completedCleanupBatchSize)
 		if err != nil {

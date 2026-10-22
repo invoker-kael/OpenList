@@ -40,7 +40,6 @@ type webDAVWritebackSummary struct {
 	CompletedCacheBytes       int64                                  `json:"completed_cache_bytes"`
 	MaxPendingSpoolBytes      uint64                                 `json:"max_pending_spool_bytes"`
 	ReserveFreeSpaceBytes     uint64                                 `json:"reserve_free_space_bytes"`
-	CompletedCacheTTLMinutes  int                                    `json:"completed_cache_ttl_minutes"`
 	DiskTotalBytes            uint64                                 `json:"disk_total_bytes"`
 	DiskUsedBytes             uint64                                 `json:"disk_used_bytes"`
 	DiskFreeBytes             uint64                                 `json:"disk_free_bytes"`
@@ -92,7 +91,6 @@ type webDAVWritebackSettingsUpdate struct {
 	UploadWorkers               int    `json:"upload_workers"`
 	LargeUploadWorkers          int    `json:"large_upload_workers"`
 	ProviderProbeWorkers        int    `json:"provider_probe_workers"`
-	CompletedCacheTTLMinutes    int    `json:"completed_cache_ttl_minutes"`
 	CompletedRemoteProbeSeconds int    `json:"completed_remote_probe_seconds"`
 	CloudSyncSettleMillis       int    `json:"cloudsync_settle_millis"`
 	CloudSyncPlaceholderMillis  int    `json:"cloudsync_placeholder_millis"`
@@ -250,7 +248,6 @@ func WebDAVWritebackMonitorSummary(c *gin.Context) {
 		CompletedCacheBytes:       completedCacheBytes,
 		MaxPendingSpoolBytes:      conf.Conf.WebDAVWriteback.MaxPendingSpoolMB * uint64(1024*1024),
 		ReserveFreeSpaceBytes:     conf.Conf.WebDAVWriteback.ReserveFreeSpaceMB * uint64(1024*1024),
-		CompletedCacheTTLMinutes:  conf.Conf.WebDAVWriteback.CompletedCacheTTLMinutes,
 		DiskTotalBytes:            runtimeStats.DiskTotalBytes,
 		DiskUsedBytes:             runtimeStats.DiskUsedBytes,
 		DiskFreeBytes:             runtimeStats.DiskFreeBytes,
@@ -316,7 +313,6 @@ func webDAVWritebackSettingsFromConfig(cfg conf.WebDAVWritebackConfig, restartFi
 			UploadWorkers:               cfg.UploadWorkers,
 			LargeUploadWorkers:          cfg.LargeUploadWorkers,
 			ProviderProbeWorkers:        cfg.ProviderProbeWorkers,
-			CompletedCacheTTLMinutes:    cfg.CompletedCacheTTLMinutes,
 			CompletedRemoteProbeSeconds: cfg.CompletedRemoteProbeSeconds,
 			CloudSyncSettleMillis:       cfg.CloudSyncSettleMillis,
 			CloudSyncPlaceholderMillis:  cfg.CloudSyncPlaceholderMillis,
@@ -351,7 +347,6 @@ func WebDAVWritebackSaveSettings(c *gin.Context) {
 	next.UploadWorkers = req.UploadWorkers
 	next.LargeUploadWorkers = req.LargeUploadWorkers
 	next.ProviderProbeWorkers = req.ProviderProbeWorkers
-	next.CompletedCacheTTLMinutes = req.CompletedCacheTTLMinutes
 	next.CompletedRemoteProbeSeconds = req.CompletedRemoteProbeSeconds
 	next.CloudSyncSettleMillis = req.CloudSyncSettleMillis
 	next.CloudSyncPlaceholderMillis = req.CloudSyncPlaceholderMillis

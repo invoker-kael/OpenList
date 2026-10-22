@@ -5,10 +5,10 @@
 ## 正常流程
 
 1. OpenList 收到完整 WebDAV `PUT` 后，先把文件持久写入本地 spool，再向 Cloud Sync 确认。
-2. 上传 115 前，OpenList 先检查 MySQL 中未过期的远端索引；若没有同名、Size、SHA1 完全匹配项，再执行父目录 fresh `LIST`。精确匹配会直接完成，不再上传；缓存未命中不会被当作远端文件不存在。
-3. 如果没有匹配项，OpenList 上传本地 spool。115 API 成功响应后任务直接完成；正常上传不再等待第二次 `LIST`。
+2. 上传 115 前，OpenList 先检查 MySQL 中未过期的远端索引；若没有同名、Size、SHA1 完全匹配项，再执行父目录 fresh `LIST`。精确匹配会直接完成、不再上传，并立即释放本地 spool；缓存未命中不会被当作远端文件不存在。
+3. 如果没有匹配项，OpenList 上传本地 spool。115 API 成功响应后任务直接完成并立即释放本地 spool；正常上传不再等待第二次 `LIST`.
 4. 超时、限流、WAF 和 API 错误会保留 spool，并在**处理中**退避重试。每次重试前 fresh `LIST`，检查 115 是否已接收文件但响应丢失。Provider/API 错误不能当作文件不存在。
-5. 本地缓存释放后，已完成文件才会进入低频 Fresh LIST 巡检。任意同名 Size+SHA1 匹配都会保持完成；API 错误或缺少 SHA1 不计为缺失；连续三次成功 Fresh LIST 都没有匹配，才会向 Cloud Sync 暴露缺失路径并等待重传。
+5. 任务完成并立即释放本地 spool 后，已完成文件才会进入低频 Fresh LIST 巡检。任意同名 Size+SHA1 匹配都会保持完成；API 错误或缺少 SHA1 不计为缺失；连续三次成功 Fresh LIST 都没有匹配，才会向 Cloud Sync 暴露缺失路径并等待重传。
 
 相同路径、Size 和 SHA1 的重复 PUT 会合并到原有代次，包括已经完成的任务，不会新建任务或再次上传 115。内容不同才建立新代次。因此 Cloud Sync 可以全量重传，而相同内容不会造成重复 115 上传。
 
