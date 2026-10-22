@@ -340,6 +340,7 @@ func TestCleanupCompletedReleasesLegacySpool(t *testing.T) {
 func TestProcessUploadCompletesOnProviderSuccessWithoutPostUploadVerification(t *testing.T) {
 	database, spoolDir := setupUploadLifecycleTest(t)
 	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
+	originalSpoolPath := row.SpoolPath
 	listCalls, putCalls := 0, 0
 	manager := &workerManager{
 		ctx:         context.Background(),
@@ -361,7 +362,7 @@ func TestProcessUploadCompletesOnProviderSuccessWithoutPostUploadVerification(t 
 	manager.processUpload(&row)
 
 	saved := reloadUploadLifecycleRow(t, database, row.ID)
-	assertCompletedSpoolReleased(t, row.SpoolPath, saved)
+	assertCompletedSpoolReleased(t, originalSpoolPath, saved)
 	if saved.State != StateCompleted || saved.ProviderUploadCompletedAt == nil {
 		t.Fatalf("provider success state=%q completed_at=%v, want completed", saved.State, saved.ProviderUploadCompletedAt)
 	}
@@ -376,6 +377,7 @@ func TestProcessUploadCompletesOnProviderSuccessWithoutPostUploadVerification(t 
 func TestProcessUploadSkipsPUTWhenFreshListHasExactContent(t *testing.T) {
 	database, spoolDir := setupUploadLifecycleTest(t)
 	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
+	originalSpoolPath := row.SpoolPath
 	remote := &model.Object{
 		Name:     row.Name,
 		Size:     row.Size,
@@ -395,7 +397,7 @@ func TestProcessUploadSkipsPUTWhenFreshListHasExactContent(t *testing.T) {
 	manager.processUpload(&row)
 
 	saved := reloadUploadLifecycleRow(t, database, row.ID)
-	assertCompletedSpoolReleased(t, row.SpoolPath, saved)
+	assertCompletedSpoolReleased(t, originalSpoolPath, saved)
 	if saved.State != StateCompleted || saved.RemoteSHA1 != row.PayloadSHA1 || saved.ProviderUploadAttempts != 0 {
 		t.Fatalf("existing exact object state=%q remote_sha1=%q attempts=%d", saved.State, saved.RemoteSHA1, saved.ProviderUploadAttempts)
 	}
@@ -407,6 +409,7 @@ func TestProcessUploadSkipsPUTWhenFreshListHasExactContent(t *testing.T) {
 func TestProcessUploadUsesRecentRemoteIndexBeforeFreshList(t *testing.T) {
 	database, spoolDir := setupUploadLifecycleTest(t)
 	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
+	originalSpoolPath := row.SpoolPath
 	remote := &model.Object{
 		ID:       "cached-115-object",
 		Name:     row.Name,
@@ -433,7 +436,7 @@ func TestProcessUploadUsesRecentRemoteIndexBeforeFreshList(t *testing.T) {
 	manager.processUpload(&row)
 
 	saved := reloadUploadLifecycleRow(t, database, row.ID)
-	assertCompletedSpoolReleased(t, row.SpoolPath, saved)
+	assertCompletedSpoolReleased(t, originalSpoolPath, saved)
 	if saved.State != StateCompleted || saved.RemoteObjectID != remote.ID || saved.ProviderUploadAttempts != 0 {
 		t.Fatalf("cached exact match state=%q object_id=%q attempts=%d", saved.State, saved.RemoteObjectID, saved.ProviderUploadAttempts)
 	}
@@ -445,6 +448,7 @@ func TestProcessUploadUsesRecentRemoteIndexBeforeFreshList(t *testing.T) {
 func TestProcessUploadProviderErrorKeepsSpoolAndExactRetryMatchAvoidsSecondPut(t *testing.T) {
 	database, spoolDir := setupUploadLifecycleTest(t)
 	row := createUploadLifecycleRow(t, database, spoolDir, "durable payload")
+	originalSpoolPath := row.SpoolPath
 	hash := row.PayloadSHA1
 	listCalls, putCalls := 0, 0
 	remote := &model.Object{Name: row.Name, Size: row.Size, HashInfo: utils.NewHashInfo(utils.SHA1, hash)}
@@ -478,7 +482,7 @@ func TestProcessUploadProviderErrorKeepsSpoolAndExactRetryMatchAvoidsSecondPut(t
 
 	manager.processUpload(&failedAttempt)
 	saved := reloadUploadLifecycleRow(t, database, row.ID)
-	assertCompletedSpoolReleased(t, row.SpoolPath, saved)
+	assertCompletedSpoolReleased(t, originalSpoolPath, saved)
 	if saved.State != StateCompleted || saved.RemoteSHA1 != hash {
 		t.Fatalf("retry matching existing object did not complete: state=%q remote_sha1=%q", saved.State, saved.RemoteSHA1)
 	}
