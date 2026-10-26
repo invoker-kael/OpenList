@@ -89,7 +89,6 @@ type webDAVWritebackSettingsUpdate struct {
 	IncomingReservationChunkMB  uint64 `json:"incoming_reservation_chunk_mb"`
 	Workers                     int    `json:"workers"`
 	UploadWorkers               int    `json:"upload_workers"`
-	LargeUploadWorkers          int    `json:"large_upload_workers"`
 	ProviderProbeWorkers        int    `json:"provider_probe_workers"`
 	CompletedRemoteProbeSeconds int    `json:"completed_remote_probe_seconds"`
 	CloudSyncSettleMillis       int    `json:"cloudsync_settle_millis"`
@@ -311,7 +310,6 @@ func webDAVWritebackSettingsFromConfig(cfg conf.WebDAVWritebackConfig, restartFi
 			IncomingReservationChunkMB:  cfg.IncomingReservationChunkMB,
 			Workers:                     cfg.Workers,
 			UploadWorkers:               cfg.UploadWorkers,
-			LargeUploadWorkers:          cfg.LargeUploadWorkers,
 			ProviderProbeWorkers:        cfg.ProviderProbeWorkers,
 			CompletedRemoteProbeSeconds: cfg.CompletedRemoteProbeSeconds,
 			CloudSyncSettleMillis:       cfg.CloudSyncSettleMillis,
@@ -345,7 +343,6 @@ func WebDAVWritebackSaveSettings(c *gin.Context) {
 	next.IncomingReservationChunkMB = req.IncomingReservationChunkMB
 	next.Workers = req.Workers
 	next.UploadWorkers = req.UploadWorkers
-	next.LargeUploadWorkers = req.LargeUploadWorkers
 	next.ProviderProbeWorkers = req.ProviderProbeWorkers
 	next.CompletedRemoteProbeSeconds = req.CompletedRemoteProbeSeconds
 	next.CloudSyncSettleMillis = req.CloudSyncSettleMillis
