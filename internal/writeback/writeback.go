@@ -5280,7 +5280,6 @@ func spoolIsActive(spoolPath string) bool {
 type workerJob struct {
 	id          uint
 	upload      bool
-	largeUpload bool
 }
 
 type providerRefreshCall struct {
@@ -5825,7 +5824,6 @@ type workerManager struct {
 	wake              chan struct{}
 	jobs              chan workerJob
 	uploads           chan struct{}
-	largeUploads      chan struct{}
 	providerProbes    chan struct{}
 	verificationSlots chan struct{}
 	inflight          sync.Map
@@ -5870,10 +5868,6 @@ func uploadWorkerLimit(workers, configured int) int {
 	return boundedWorkerLimit(workers, configured)
 }
 
-func largeUploadWorkerLimit(workers, configured int) int {
-	return boundedWorkerLimit(workers, configured)
-}
-
 func providerProbeWorkerLimit(workers, configured int) int {
 	return boundedWorkerLimit(workers, configured)
 }
@@ -5905,21 +5899,6 @@ func providerUploadCandidate(row *model.WebDAVWritebackObject) bool {
 		!row.IsDir &&
 		row.State == StateQueued &&
 		!queuedReplicaMove(row)
-}
-
-func multipartProviderUploadCandidate(row *model.WebDAVWritebackObject) bool {
-	return row != nil &&
-		!row.IsDir &&
-		row.State == StateQueued &&
-		row.SpoolPath != "" &&
-		row.Size > open115MultipartChunkSize
-}
-
-func largeProviderUploadCandidate(row *model.WebDAVWritebackObject, requireHash func(string) bool) bool {
-	if !multipartProviderUploadCandidate(row) {
-		return false
-	}
-	return requireHash != nil && requireHash(row.Path)
 }
 
 func tryReserveWorkerSlot(slots chan struct{}) (reserved bool, allowed bool) {
@@ -6043,15 +6022,10 @@ func startWorker(cleanupOrphans bool) {
 	workerCtx, cancel := context.WithCancel(context.Background())
 	workers := max(1, conf.Conf.WebDAVWriteback.Workers)
 	uploadWorkers := uploadWorkerLimit(workers, conf.Conf.WebDAVWriteback.UploadWorkers)
-	largeUploadWorkers := largeUploadWorkerLimit(workers, conf.Conf.WebDAVWriteback.LargeUploadWorkers)
 	providerProbeWorkers := providerProbeWorkerLimit(workers, conf.Conf.WebDAVWriteback.ProviderProbeWorkers)
 	var uploads chan struct{}
 	if uploadWorkers < workers {
 		uploads = make(chan struct{}, uploadWorkers)
-	}
-	var largeUploads chan struct{}
-	if largeUploadWorkers < workers {
-		largeUploads = make(chan struct{}, largeUploadWorkers)
 	}
 	providerProbes := make(chan struct{}, providerProbeWorkers)
 	m := &workerManager{
@@ -6061,7 +6035,6 @@ func startWorker(cleanupOrphans bool) {
 		wake:              make(chan struct{}, 1),
 		jobs:              make(chan workerJob, max(4, workers*4)),
 		uploads:           uploads,
-		largeUploads:      largeUploads,
 		providerProbes:    providerProbes,
 		verificationSlots: make(chan struct{}, providerProbeWorkers),
 	}
@@ -7007,20 +6980,10 @@ func (m *workerManager) dispatch() bool {
 				continue
 			}
 			job.upload = reserved
-			if largeProviderUploadCandidate(row, providerRequiresPayloadHash) {
-				largeReserved, largeAllowed := tryReserveWorkerSlot(m.largeUploads)
-				if !largeAllowed {
-					releaseWorkerSlot(m.uploads, job.upload)
-					m.inflight.Delete(id)
-					continue
-				}
-				job.largeUpload = largeReserved
-			}
 		}
 		select {
 		case m.jobs <- job:
 		default:
-			releaseWorkerSlot(m.largeUploads, job.largeUpload)
 			releaseWorkerSlot(m.uploads, job.upload)
 			m.inflight.Delete(id)
 			return true
@@ -7039,7 +7002,6 @@ func (m *workerManager) worker() {
 			if !m.consumeBatchCompleted(job.id) {
 				m.processSafely(job.id)
 			}
-			releaseWorkerSlot(m.largeUploads, job.largeUpload)
 			releaseWorkerSlot(m.uploads, job.upload)
 			m.inflight.Delete(job.id)
 			m.batchCompleted.Delete(job.id)

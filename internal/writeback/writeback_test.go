@@ -74,23 +74,6 @@ func TestProviderProbeWorkerLimit(t *testing.T) {
 	}
 }
 
-func TestLargeUploadWorkerLimit(t *testing.T) {
-	for _, tc := range []struct {
-		workers    int
-		configured int
-		want       int
-	}{
-		{workers: 4, configured: 2, want: 2},
-		{workers: 4, configured: 0, want: 4},
-		{workers: 4, configured: 8, want: 4},
-		{workers: 1, configured: 2, want: 1},
-	} {
-		if got := largeUploadWorkerLimit(tc.workers, tc.configured); got != tc.want {
-			t.Fatalf("largeUploadWorkerLimit(%d, %d)=%d, want %d", tc.workers, tc.configured, got, tc.want)
-		}
-	}
-}
-
 func TestMatchingVerificationRowsUsesOneParentSnapshot(t *testing.T) {
 	shaA := strings.Repeat("a", 40)
 	shaB := strings.Repeat("b", 40)
@@ -410,59 +393,16 @@ func TestProviderUploadCandidate(t *testing.T) {
 	}
 }
 
-func TestLargeProviderUploadCandidate(t *testing.T) {
-	large := &model.WebDAVWritebackObject{
-		State:     StateQueued,
-		Size:      open115MultipartChunkSize + 1,
-		Path:      "/large.bin",
-		SpoolPath: "/spool/large.data",
-	}
-	calls := 0
-	requireHash := func(p string) bool {
-		calls++
-		return p == "/large.bin"
-	}
-	if !largeProviderUploadCandidate(large, requireHash) {
-		t.Fatal("large queued 115 upload should consume a large-upload slot")
-	}
-	if calls != 1 {
-		t.Fatalf("large provider classification calls=%d, want 1", calls)
-	}
-
-	calls = 0
-	small := *large
-	small.Size = open115MultipartChunkSize
-	if largeProviderUploadCandidate(&small, requireHash) {
-		t.Fatal("single-part-sized upload should stay on the normal worker pool")
-	}
-	if calls != 0 {
-		t.Fatalf("small upload unexpectedly resolved provider hash capability %d times", calls)
-	}
-
-	calls = 0
-	large.State = StateVerifying
-	if largeProviderUploadCandidate(large, requireHash) {
-		t.Fatal("verification must not consume a large-upload transfer slot")
-	}
-	if calls != 0 {
-		t.Fatalf("verification unexpectedly resolved provider hash capability %d times", calls)
-	}
-
-	large.State = StateQueued
-	large.RetryCount = 2
-	if largeProviderUploadCandidate(large, func(string) bool { return false }) {
-		t.Fatal("large retry on a provider without required payload hash should not be throttled")
-	}
-
-	large.RetryCount = 0
-	large.SpoolPath = ""
-	large.CleanupPath = "/old/large.bin"
-	calls = 0
-	if largeProviderUploadCandidate(large, requireHash) {
-		t.Fatal("large metadata-only MOVE must not consume the multipart upload slot")
-	}
-	if calls != 0 {
-		t.Fatalf("replica MOVE unexpectedly resolved provider capability %d times", calls)
+func TestProviderUploadCandidateUsesSamePoolForEveryFileSize(t *testing.T) {
+	for _, size := range []int64{1, open115MultipartChunkSize, open115MultipartChunkSize + 1} {
+		row := &model.WebDAVWritebackObject{
+			State:     StateQueued,
+			Size:      size,
+			SpoolPath: "/spool/file.data",
+		}
+		if !providerUploadCandidate(row) {
+			t.Fatalf("queued file with size %d should use the shared upload pool", size)
+		}
 	}
 }
 
