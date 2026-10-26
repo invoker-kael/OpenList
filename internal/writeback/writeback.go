@@ -5278,8 +5278,8 @@ func spoolIsActive(spoolPath string) bool {
 }
 
 type workerJob struct {
-	id          uint
-	upload      bool
+	id     uint
+	upload bool
 }
 
 type providerRefreshCall struct {

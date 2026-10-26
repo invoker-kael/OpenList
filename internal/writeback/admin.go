@@ -54,7 +54,6 @@ func ValidateAdminConfig(cfg conf.WebDAVWritebackConfig) error {
 	}
 	for name, value := range map[string]int{
 		"upload_workers":         cfg.UploadWorkers,
-		"large_upload_workers":   cfg.LargeUploadWorkers,
 		"provider_probe_workers": cfg.ProviderProbeWorkers,
 	} {
 		if value < 1 || value > cfg.Workers {
@@ -106,9 +105,6 @@ func RestartRequiredFields(before, after conf.WebDAVWritebackConfig) []string {
 	}
 	if before.UploadWorkers != after.UploadWorkers {
 		fields = append(fields, "upload_workers")
-	}
-	if before.LargeUploadWorkers != after.LargeUploadWorkers {
-		fields = append(fields, "large_upload_workers")
 	}
 	if before.ProviderProbeWorkers != after.ProviderProbeWorkers {
 		fields = append(fields, "provider_probe_workers")
