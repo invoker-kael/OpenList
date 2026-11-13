@@ -6005,6 +6005,7 @@ func wake() {
 
 func Start() {
 	startWorker(true)
+	resumeReconciliationJobs()
 }
 
 func startWorker(cleanupOrphans bool) {

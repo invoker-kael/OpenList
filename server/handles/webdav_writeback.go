@@ -351,6 +351,14 @@ func WebDAVWritebackSaveSettings(c *gin.Context) {
 	next.RetryMaxSeconds = req.RetryMaxSeconds
 	next.VerifyIntervalSeconds = req.VerifyIntervalSeconds
 	next.ProviderSnapshotTTLSeconds = req.ProviderSnapshotTTLSeconds
+	if before.Enabled && !next.Enabled {
+		release, err := writeback.LockForWritebackDisable()
+		if err != nil {
+			common.ErrorResp(c, err, http.StatusConflict)
+			return
+		}
+		defer release()
+	}
 	if err := writeback.ValidateAdminConfig(next); err != nil {
 		common.ErrorResp(c, err, http.StatusBadRequest)
 		return

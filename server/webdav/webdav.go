@@ -81,9 +81,47 @@ func rejectWebDAVMutationDuringWritebackRebuild(w http.ResponseWriter, r *http.R
 	return true
 }
 
+func webDAVMethodAllowedDuringReconciliation(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, "PROPFIND", "MKCOL", "LOCK", "UNLOCK":
+		return true
+	default:
+		return false
+	}
+}
+
+func rejectWebDAVMutationDuringReconciliation(w http.ResponseWriter, r *http.Request, p string) (bool, error) {
+	if !writeback.Enabled() || webDAVMethodAllowedDuringReconciliation(r.Method) {
+		return false, nil
+	}
+	blocked, err := writeback.ReconciliationBlocksMutation(p)
+	if err != nil || !blocked {
+		return false, err
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(writeback.ReceiveRetrySeconds()))
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte(StatusText(http.StatusServiceUnavailable)))
+	return true, nil
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if writeback.Enabled() && writeback.Rebuilding() && rejectWebDAVMutationDuringWritebackRebuild(w, r) {
 		return
+	}
+	if writeback.Enabled() && !webDAVMethodAllowedDuringReconciliation(r.Method) {
+		if reqPath, _, pathErr := h.stripPrefix(r.URL.Path); pathErr == nil {
+			if user, ok := r.Context().Value(conf.UserKey).(*model.User); ok && user != nil {
+				if reqPath, pathErr = user.JoinPath(reqPath); pathErr == nil {
+					if rejected, blockErr := rejectWebDAVMutationDuringReconciliation(w, r, reqPath); rejected {
+						return
+					} else if blockErr != nil {
+						w.WriteHeader(http.StatusInternalServerError)
+						_, _ = w.Write([]byte(StatusText(http.StatusInternalServerError)))
+						return
+					}
+				}
+			}
+		}
 	}
 
 	status, err := http.StatusBadRequest, errUnsupportedMethod
@@ -299,15 +337,32 @@ func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) (status 
 		return http.StatusForbidden, err
 	}
 	allow := "OPTIONS, LOCK, PUT, MKCOL"
-	fi, found, deleted, wbErr := writeback.Canonical(reqPath)
-	if wbErr != nil {
-		return http.StatusInternalServerError, wbErr
+	var fi model.Obj
+	var found, inventoryActive bool
+	var wbErr error
+	if writeback.Enabled() {
+		fi, found, inventoryActive, wbErr = writeback.ReconciliationViewObject(reqPath)
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
 	}
-	if !found {
-		fi, err = fs.Get(ctx, reqPath, &fs.GetArgs{})
-	} else if deleted {
-		fi = nil
-		err = errs.ObjectNotFound
+	deleted := inventoryActive && !found
+	if inventoryActive {
+		if deleted {
+			fi = nil
+			err = errs.ObjectNotFound
+		}
+	} else {
+		fi, found, deleted, wbErr = writeback.Canonical(reqPath)
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
+		if !found {
+			fi, err = fs.Get(ctx, reqPath, &fs.GetArgs{})
+		} else if deleted {
+			fi = nil
+			err = errs.ObjectNotFound
+		}
 	}
 	if err == nil && fi != nil {
 		if fi.IsDir() {
@@ -344,7 +399,37 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 	if !common.CanAccess(user, meta, reqPath, password) {
 		return http.StatusForbidden, errs.PermissionDenied
 	}
-	fi, found, deleted, wbErr := writeback.Canonical(reqPath)
+	var fi model.Obj
+	var found, inventoryActive bool
+	var wbErr error
+	if writeback.Enabled() {
+		fi, found, inventoryActive, wbErr = writeback.ReconciliationViewObject(reqPath)
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
+	}
+	deleted := inventoryActive && !found
+	if inventoryActive {
+		if deleted {
+			return http.StatusNotFound, errs.ObjectNotFound
+		}
+		if fi.IsDir() {
+			if r.Method == http.MethodHead {
+				w.Header().Set("Content-Type", "httpd/unix-directory")
+				w.Header().Set("Content-Length", "0")
+				return http.StatusOK, nil
+			}
+			return http.StatusMethodNotAllowed, nil
+		}
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.FormatInt(fi.GetSize(), 10))
+			w.Header().Set("Last-Modified", fi.ModTime().UTC().Format(http.TimeFormat))
+			return http.StatusOK, nil
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(writeback.ReceiveRetrySeconds()))
+		return http.StatusServiceUnavailable, nil
+	}
+	fi, found, deleted, wbErr = writeback.Canonical(reqPath)
 	if wbErr != nil {
 		return http.StatusInternalServerError, wbErr
 	}
@@ -597,6 +682,42 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	if !common.CanWrite(user, parentMeta, parentPath) {
 		return http.StatusForbidden, errs.PermissionDenied
 	}
+	mimeType := r.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = utils.GetMimeType(reqPath)
+	}
+	writebackModTime := h.getWritebackHeaderTime(r, "X-OC-Mtime")
+	writebackCreateTime := h.getWritebackHeaderTime(r, "X-OC-Ctime")
+	created, inventoryHandled := false, false
+	var inventoryErr error
+	if writeback.Enabled() {
+		created, inventoryHandled, inventoryErr = writeback.CaptureReconciliationPut(
+			ctx, reqPath, r.Body, size, writebackModTime, writebackCreateTime, mimeType,
+		)
+	}
+	if inventoryHandled {
+		if inventoryErr != nil {
+			drainBody = false
+			r.Close = true
+			if errors.Is(inventoryErr, writeback.ErrReconciliationPathConflict) {
+				return http.StatusConflict, inventoryErr
+			}
+			if errors.Is(inventoryErr, writeback.ErrReconciliationNotCollecting) || errors.Is(inventoryErr, writeback.ErrRebuildInProgress) {
+				w.Header().Set("Retry-After", strconv.Itoa(writeback.ReceiveRetrySeconds()))
+				return http.StatusServiceUnavailable, inventoryErr
+			}
+			return http.StatusInternalServerError, inventoryErr
+		}
+		if created {
+			return http.StatusCreated, nil
+		}
+		return http.StatusNoContent, nil
+	}
+	if inventoryErr != nil {
+		drainBody = false
+		r.Close = true
+		return http.StatusInternalServerError, inventoryErr
+	}
 	var canonicalTarget writeback.CanonicalSnapshot
 	if writeback.Enabled() {
 		canonical, wbErr := writeback.CanonicalBatch(parentPath, reqPath)
@@ -659,17 +780,11 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 		return http.StatusMethodNotAllowed, nil
 	}
 
-	mimeType := r.Header.Get("Content-Type")
-	if mimeType == "" {
-		mimeType = utils.GetMimeType(reqPath)
-	}
 	if writeback.Enabled() {
 		// Only explicitly supplied client timestamps may mutate an existing
 		// canonical generation. The legacy WebDAV helpers intentionally fall
 		// back to time.Now()/mtime for synchronous uploads, which would make a
 		// header-less Cloud Sync retry look like a metadata change.
-		writebackModTime := h.getWritebackHeaderTime(r, "X-OC-Mtime")
-		writebackCreateTime := h.getWritebackHeaderTime(r, "X-OC-Ctime")
 		row, created, wbErr := writeback.Commit(ctx, reqPath, r.Body, size, writebackModTime, writebackCreateTime, mimeType)
 		if wbErr != nil {
 			if errors.Is(wbErr, writeback.ErrReceiveInProgress) || errors.Is(wbErr, writeback.ErrRebuildInProgress) {
@@ -783,6 +898,50 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 
 	if r.ContentLength > 0 {
 		return http.StatusUnsupportedMediaType, nil
+	}
+	if writeback.Enabled() {
+		parentPath := path.Dir(reqPath)
+		parentObj, parentFound, inventoryActive, inventoryErr := writeback.ReconciliationViewObject(parentPath)
+		if inventoryErr != nil {
+			return http.StatusInternalServerError, inventoryErr
+		}
+		if inventoryActive {
+			if !parentFound || parentObj == nil || !parentObj.IsDir() {
+				return http.StatusConflict, errs.ObjectNotFound
+			}
+			if _, exists, _, viewErr := writeback.ReconciliationViewObject(reqPath); viewErr != nil {
+				return http.StatusInternalServerError, viewErr
+			} else if exists {
+				return http.StatusMethodNotAllowed, nil
+			}
+			parentMeta, metaErr := op.GetNearestMeta(parentPath)
+			if metaErr != nil && !errors.Is(errors.Cause(metaErr), errs.MetaNotFound) {
+				return http.StatusInternalServerError, metaErr
+			}
+			if !user.CanWriteContent() && !common.CanWriteContentBypassUserPerms(parentMeta, parentPath) {
+				return http.StatusForbidden, errs.PermissionDenied
+			}
+			if !common.CanWrite(user, parentMeta, parentPath) {
+				return http.StatusForbidden, errs.PermissionDenied
+			}
+			created, handled, recordErr := writeback.RecordReconciliationDirectory(ctx, reqPath, time.Now())
+			if handled {
+				if recordErr != nil {
+					if errors.Is(recordErr, writeback.ErrReconciliationNotCollecting) || errors.Is(recordErr, writeback.ErrRebuildInProgress) {
+						w.Header().Set("Retry-After", strconv.Itoa(writeback.ReceiveRetrySeconds()))
+						return http.StatusServiceUnavailable, recordErr
+					}
+					if errors.Is(recordErr, writeback.ErrReconciliationPathConflict) {
+						return http.StatusConflict, recordErr
+					}
+					return http.StatusInternalServerError, recordErr
+				}
+				if created {
+					return http.StatusCreated, nil
+				}
+				return http.StatusMethodNotAllowed, nil
+			}
+		}
 	}
 
 	// RFC 4918 9.3.1: MKCOL can only create an unmapped URL. In write-back
@@ -1097,6 +1256,18 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 	if err != nil {
 		return http.StatusForbidden, err
 	}
+	if writeback.Enabled() {
+		for _, target := range []string{src, dst} {
+			blocked, blockErr := writeback.ReconciliationBlocksMutation(target)
+			if blockErr != nil {
+				return http.StatusInternalServerError, blockErr
+			}
+			if blocked {
+				w.Header().Set("Retry-After", strconv.Itoa(writeback.ReceiveRetrySeconds()))
+				return http.StatusServiceUnavailable, nil
+			}
+		}
+	}
 
 	if r.Method == "COPY" {
 		release, status, err := h.confirmLocks(r, "", dst)
@@ -1399,8 +1570,15 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus 
 			return http.StatusInternalServerError, err
 		}
 		if writeback.Enabled() {
-			if err := writeback.RefreshLockNull(ctx, ld.Root, now, duration); err != nil {
-				return http.StatusInternalServerError, err
+			_, _, inventoryActive, inventoryErr := writeback.ReconciliationViewObject(ld.Root)
+			if inventoryErr != nil {
+				return http.StatusInternalServerError, inventoryErr
+			}
+			if !inventoryActive {
+				if err := writeback.RefreshLockNull(ctx, ld.Root, now, duration); err != nil {
+					return http.StatusInternalServerError, err
+				}
+			}
 			}
 		}
 
@@ -1472,7 +1650,11 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus 
 				h.LockSystem.Unlock(now, token)
 			}
 		}()
-		if createLockNull {
+		_, _, inventoryActive, inventoryErr := writeback.ReconciliationViewObject(reqPath)
+		if inventoryErr != nil {
+			return http.StatusInternalServerError, inventoryErr
+		}
+		if createLockNull && !inventoryActive {
 			_, lockNullCreated, wbErr := writeback.CommitLockNull(ctx, reqPath, now, duration)
 			if wbErr != nil {
 				return http.StatusInternalServerError, wbErr
@@ -1538,8 +1720,14 @@ func (h *Handler) handleUnlock(w http.ResponseWriter, r *http.Request) (status i
 	switch err = h.LockSystem.Unlock(time.Now(), t); err {
 	case nil:
 		if writeback.Enabled() {
-			if wbErr := writeback.ReleaseLockNull(ctx, reqPath); wbErr != nil {
+			_, _, inventoryActive, inventoryErr := writeback.ReconciliationViewObject(reqPath)
+			if inventoryErr != nil {
+				return http.StatusInternalServerError, inventoryErr
+			}
+			if !inventoryActive {
+				if wbErr := writeback.ReleaseLockNull(ctx, reqPath); wbErr != nil {
 				log.Warnf("released WebDAV lock but failed to remove lock-null shadow for %s: %v", reqPath, wbErr)
+				}
 			}
 		}
 		return http.StatusNoContent, err
@@ -1575,9 +1763,21 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 	if !common.CanAccess(user, meta, reqPath, password) {
 		return http.StatusForbidden, errs.PermissionDenied
 	}
-	fi, found, deleted, wbErr := writeback.Canonical(reqPath)
-	if wbErr != nil {
-		return http.StatusInternalServerError, wbErr
+	var fi model.Obj
+	var found, inventoryActive bool
+	var wbErr error
+	if writeback.Enabled() {
+		fi, found, inventoryActive, wbErr = writeback.ReconciliationViewObject(reqPath)
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
+	}
+	deleted := inventoryActive && !found
+	if !inventoryActive {
+		fi, found, deleted, wbErr = writeback.Canonical(reqPath)
+		if wbErr != nil {
+			return http.StatusInternalServerError, wbErr
+		}
 	}
 	if deleted {
 		return http.StatusNotFound, errs.ObjectNotFound

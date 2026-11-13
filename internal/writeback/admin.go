@@ -553,9 +553,19 @@ func StartRebuildAllTaskRecords() bool {
 }
 
 func startRebuildTask(rebuild func() (RebuildAllResult, error)) bool {
-	if !beginRebuild() {
+	if !rebuildGate.TryLock() {
 		return false
 	}
+	run, err := currentReconciliation()
+	if err != nil || run != nil {
+		rebuildGate.Unlock()
+		return false
+	}
+	if !beginRebuild() {
+		rebuildGate.Unlock()
+		return false
+	}
+	rebuildGate.Unlock()
 	go func() {
 		defer endRebuild()
 		result, err := rebuild()
@@ -577,9 +587,14 @@ func startRebuildTask(rebuild func() (RebuildAllResult, error)) bool {
 }
 
 func RebuildAllTaskRecords() (RebuildAllResult, error) {
-	StopRemoteIndexRefresh()
 	rebuildGate.Lock()
 	defer rebuildGate.Unlock()
+	if run, err := currentReconciliation(); err != nil {
+		return RebuildAllResult{}, err
+	} else if run != nil {
+		return RebuildAllResult{}, errors.New("cannot rebuild writeback records during reconciliation")
+	}
+	StopRemoteIndexRefresh()
 
 	Stop()
 	defer startWorker(false)

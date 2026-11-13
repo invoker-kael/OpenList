@@ -206,6 +206,13 @@ func admin(g *gin.RouterGroup) {
 	webdavWriteback.POST("/verify-now", handles.WebDAVWritebackVerifyNow)
 	webdavWriteback.POST("/remote-index/refresh", handles.WebDAVWritebackRemoteIndexRefresh)
 	webdavWriteback.POST("/rebuild-all", handles.WebDAVWritebackRebuildAll)
+	webdavWriteback.GET("/reconciliation", handles.WebDAVWritebackReconciliation)
+	webdavWriteback.GET("/reconciliation/candidates", handles.WebDAVWritebackReconciliationCandidates)
+	webdavWriteback.POST("/reconciliation/start", handles.WebDAVWritebackReconciliationStart)
+	webdavWriteback.POST("/reconciliation/finish-collection", handles.WebDAVWritebackReconciliationFinishCollection)
+	webdavWriteback.POST("/reconciliation/delete-extras", handles.WebDAVWritebackReconciliationDeleteExtras)
+	webdavWriteback.POST("/reconciliation/finish", handles.WebDAVWritebackReconciliationFinish)
+	webdavWriteback.POST("/reconciliation/cancel", handles.WebDAVWritebackReconciliationCancel)
 }
 
 func fsAndShare(g *gin.RouterGroup) {

@@ -36,6 +36,16 @@ func slashClean(name string) string {
 
 func resourceObject(ctx context.Context, name string) (model.Obj, error) {
 	if writeback.Enabled() {
+		obj, found, active, err := writeback.ReconciliationViewObject(name)
+		if err != nil {
+			return nil, err
+		}
+		if active {
+			if !found {
+				return nil, errs.ObjectNotFound
+			}
+			return obj, nil
+		}
 		obj, found, deleted, err := writeback.Canonical(name)
 		if err != nil {
 			return nil, err
@@ -411,23 +421,34 @@ func walkFS(ctx context.Context, depth int, name string, info model.Obj, walkFn 
 	// snapshots are refreshed once and coalesced by parent.
 	listCtx := context.WithValue(ctx, conf.MetaKey, meta)
 	var objs []model.Obj
+	inventoryActive := false
 	if writeback.Enabled() {
-		objs, _, err = writeback.ProviderListForWebDAV(listCtx, name)
+		objs, inventoryActive, err = writeback.ReconciliationChildren(name)
+		if err != nil {
+			return walkFn(name, info, err)
+		}
+		if err == nil && !inventoryActive {
+			objs, _, err = writeback.ProviderListForWebDAV(listCtx, name)
+		}
 	} else {
 		objs, err = fs.List(listCtx, name, &fs.ListArgs{})
 	}
 	if writeback.Enabled() {
-		remoteReliable := err == nil
-		_, canonicalParent := info.(*writeback.CanonicalObject)
-		overlaid, hasWriteback, overlayErr := writeback.OverlayListChildren(listCtx, name, objs, remoteReliable)
-		if overlayErr != nil {
-			return walkFn(name, info, overlayErr)
-		}
-		// A just-created canonical directory is a valid empty collection even
-		// before an eventually-consistent provider can list it. Reuse the parent
-		// object already resolved by PROPFIND instead of re-reading its DB row.
-		if remoteReliable || hasWriteback || canonicalParent {
-			objs = overlaid
+		if !inventoryActive {
+			remoteReliable := err == nil
+			_, canonicalParent := info.(*writeback.CanonicalObject)
+			overlaid, hasWriteback, overlayErr := writeback.OverlayListChildren(listCtx, name, objs, remoteReliable)
+			if overlayErr != nil {
+				return walkFn(name, info, overlayErr)
+			}
+			// A just-created canonical directory is a valid empty collection even
+			// before an eventually-consistent provider can list it. Reuse the parent
+			// object already resolved by PROPFIND instead of re-reading its DB row.
+			if remoteReliable || hasWriteback || canonicalParent {
+				objs = overlaid
+				err = nil
+			}
+		} else {
 			err = nil
 		}
 	}
