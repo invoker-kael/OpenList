@@ -33,10 +33,10 @@ jobs:
           platforms: linux/amd64
           build-args: |
             FRONTEND_REPO=invoker-kael/OpenList-Frontend
-            FRONTEND_REF=ede40b48ae38a4df7d728a4097fa77f8b7a2da7b
+            FRONTEND_REF=0d3e058996495552f5ebaabcfa76302eb34e0348
             FRONTEND_I18N_URL=https://github.com/OpenListTeam/OpenList-Frontend/releases/download/v4.2.7/i18n.tar.gz
           push: true
           tags: |
             invokerkael/openlist:cloudsync-writeback
-            invokerkael/openlist:v4.2.7-cloudsync-359cd500b6eb-ui-ede40b48ae38
+            invokerkael/openlist:v4.2.7-cloudsync-359cd500b6eb-ui-0d3e05899649
           provenance: false
