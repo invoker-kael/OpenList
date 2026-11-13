@@ -1579,7 +1579,6 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus 
 					return http.StatusInternalServerError, err
 				}
 			}
-			}
 		}
 
 	} else {
