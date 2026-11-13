@@ -1725,7 +1725,7 @@ func (h *Handler) handleUnlock(w http.ResponseWriter, r *http.Request) (status i
 			}
 			if !inventoryActive {
 				if wbErr := writeback.ReleaseLockNull(ctx, reqPath); wbErr != nil {
-				log.Warnf("released WebDAV lock but failed to remove lock-null shadow for %s: %v", reqPath, wbErr)
+					log.Warnf("released WebDAV lock but failed to remove lock-null shadow for %s: %v", reqPath, wbErr)
 				}
 			}
 		}
