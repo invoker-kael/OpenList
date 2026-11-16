@@ -1447,3 +1447,74 @@ func TestReconciliationWebDAVViewStaysEmptyUntilCollectionEnds(t *testing.T) {
 		t.Fatalf("post-collection children = (%v, %v, %v), want one manifest item", children, active, err)
 	}
 }
+
+func TestSupportedReconciliationDriverNames(t *testing.T) {
+	for _, name := range []string{"115 Cloud", "115 Open"} {
+		if !isSupportedReconciliationDriver(name) {
+			t.Errorf("registered 115 driver %q was rejected", name)
+		}
+	}
+	for _, name := range []string{"115", "115_open", "Local"} {
+		if isSupportedReconciliationDriver(name) {
+			t.Errorf("unsupported driver %q was accepted", name)
+		}
+	}
+}
+
+func TestClearReconciliationRemovesOnlyTerminalTaskMetadata(t *testing.T) {
+	database, _ := setupUploadLifecycleTest(t)
+	run := model.WebDAVWritebackReconcileRun{Root: "/backup", State: ReconcileStateCompleted}
+	if err := database.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	entry := model.WebDAVWritebackReconcileEntry{RunID: run.ID, PathKey: pathKey("/backup/file.bin"), Path: "/backup/file.bin"}
+	if err := database.Create(&entry).Error; err != nil {
+		t.Fatal(err)
+	}
+	retained := model.WebDAVWritebackObject{
+		PathKey: pathKey("/backup/keep.bin"), Path: "/backup/keep.bin",
+		State: StateCompleted, CanonicalState: CanonicalStateAcked,
+	}
+	if err := database.Create(&retained).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	canClear, err := ReconciliationCanClear(run.ID)
+	if err != nil || !canClear {
+		t.Fatalf("completed task clearable = (%v, %v), want (true, nil)", canClear, err)
+	}
+	if err := ClearReconciliation(run.ID); err != nil {
+		t.Fatalf("clear completed task: %v", err)
+	}
+	var runs, entries int64
+	if err := database.Model(&model.WebDAVWritebackReconcileRun{}).Count(&runs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Model(&model.WebDAVWritebackReconcileEntry{}).Count(&entries).Error; err != nil {
+		t.Fatal(err)
+	}
+	if runs != 0 || entries != 0 {
+		t.Fatalf("task metadata remains after clear: runs=%d entries=%d", runs, entries)
+	}
+	if err := database.Take(&retained, "path_key = ?", retained.PathKey).Error; err != nil {
+		t.Fatalf("clearing task altered ordinary writeback state: %v", err)
+	}
+}
+
+func TestClearReconciliationRejectsActiveTask(t *testing.T) {
+	database, _ := setupUploadLifecycleTest(t)
+	run := model.WebDAVWritebackReconcileRun{Root: "/backup", State: ReconcileStateCollecting}
+	if err := database.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearReconciliation(run.ID); err == nil {
+		t.Fatal("active inventory task was cleared")
+	}
+	var remaining int64
+	if err := database.Model(&model.WebDAVWritebackReconcileRun{}).Where("id = ?", run.ID).Count(&remaining).Error; err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Fatal("active inventory task was removed")
+	}
+}

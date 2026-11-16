@@ -37,6 +37,12 @@ The rebuild request returns promptly and runs in the background. A current PUT f
 
 After the active PUTs, remote-index refresh and worker stop, rebuild clears OpenList's writeback objects, history, receive fences, reservations, provider-operation records, cached remote-index snapshots, and local `.part` / `.data` spool files, including orphans. It clears in-memory provider caches and starts the worker again. It never deletes or changes files on 115.
 
+## Manual Cloud Sync inventory
+
+The separate inventory page shows whether a task is active and reports collected files/bytes, scanned directories, remote files, matches, missing items, deletion candidates, and completed deletions. Finish collection and start the 115 comparison as separate actions.
+
+The clear button is available only after a task is completed or canceled. It removes that task's record and manifest only; it does not touch 115 files or normal Writeback rows. Cancel an active task first where cancellation is available; received paths are preserved as missing so Cloud Sync can resend them.
+
 ## Database and diagnostics
 
 Write-back state uses the configured MySQL database. Admin API access requires OpenList authentication. Diagnose row counts and spool references before considering database repair; do not clear writeback rows or spool files while OpenList is active.

@@ -483,6 +483,10 @@ func RecordReconciliationDirectory(ctx context.Context, p string, modTime time.T
 	return created, true, err
 }
 
+func isSupportedReconciliationDriver(name string) bool {
+	return name == "115 Cloud" || name == "115 Open"
+}
+
 func StartReconciliation(root string) (*model.WebDAVWritebackReconcileRun, error) {
 	if !Enabled() {
 		return nil, errors.New("WebDAV writeback is disabled")
@@ -499,8 +503,8 @@ func StartReconciliation(root string) (*model.WebDAVWritebackReconcileRun, error
 	targetStorageID := targetMeta.ID
 	targetDriver := targetMeta.Driver
 	targetMountPath := targetMeta.MountPath
-	if targetDriver != "115" && targetDriver != "115_open" {
-		return nil, errors.New("the reconciliation root must use the 115 or 115 Open storage driver")
+	if !isSupportedReconciliationDriver(targetDriver) {
+		return nil, errors.New("reconciliation requires the 115 Cloud or 115 Open storage driver")
 	}
 	bestMount, matchingStorages := "", 0
 	for _, storage := range op.GetAllStorages() {
@@ -832,6 +836,52 @@ func ReconciliationCanCancel(runID uint) (bool, error) {
 		return false, err
 	}
 	return run.State == ReconcileStateCollecting || run.State == ReconcileStateCollected || run.State == ReconcileStateCompareError || run.State == ReconcileStatePreview, nil
+}
+
+func ReconciliationCanClear(runID uint) (bool, error) {
+	var run model.WebDAVWritebackReconcileRun
+	if err := db.GetDb().Take(&run, runID).Error; err != nil {
+		return false, err
+	}
+	return run.State == ReconcileStateCompleted || run.State == ReconcileStateCanceled, nil
+}
+
+// ClearReconciliation removes only a terminal inventory task and its manifest.
+// It never changes writeback objects or contacts the provider.
+func ClearReconciliation(runID uint) error {
+	if !rebuildGate.TryLock() {
+		return errors.New("wait until WebDAV writes and task transitions are idle")
+	}
+	defer rebuildGate.Unlock()
+
+	reconciliationJobs.Lock()
+	running := reconciliationJobs.runs[runID]
+	reconciliationJobs.Unlock()
+	if running {
+		return errors.New("wait for the inventory worker to finish before clearing the task")
+	}
+
+	return db.GetDb().Transaction(func(tx *gorm.DB) error {
+		var run model.WebDAVWritebackReconcileRun
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Take(&run, runID).Error; err != nil {
+			return err
+		}
+		if run.State != ReconcileStateCompleted && run.State != ReconcileStateCanceled {
+			return errors.New("only completed or canceled inventory tasks can be cleared")
+		}
+		var active int64
+		if err := tx.Model(&model.WebDAVWritebackReconcileRun{}).
+			Where("state IN ?", activeReconciliationStates()).Count(&active).Error; err != nil {
+			return err
+		}
+		if active != 0 {
+			return errors.New("finish or cancel the active inventory task before clearing history")
+		}
+		if err := tx.Where("run_id = ?", run.ID).Delete(&model.WebDAVWritebackReconcileEntry{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&run).Error
+	})
 }
 
 func ReconciliationCandidateCount() (int64, error) {

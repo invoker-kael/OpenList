@@ -30,21 +30,30 @@ func WebDAVWritebackReconciliation(c *gin.Context) {
 		common.ErrorResp(c, err, http.StatusInternalServerError)
 		return
 	}
+	active := run != nil
+	if !active {
+		run, err = writeback.LatestReconciliation()
+	}
 	var candidates int64
 	canCancel := false
-	if run == nil {
-		run, err = writeback.LatestReconciliation()
-	} else {
-		candidates, err = writeback.ReconciliationCandidateCount()
-		if err == nil {
-			canCancel, err = writeback.ReconciliationCanCancel(run.ID)
+	canClear := false
+	if err == nil && run != nil {
+		canClear, err = writeback.ReconciliationCanClear(run.ID)
+		if err == nil && active {
+			candidates, err = writeback.ReconciliationCandidateCount()
+			if err == nil {
+				canCancel, err = writeback.ReconciliationCanCancel(run.ID)
+			}
 		}
 	}
 	if err != nil {
 		common.ErrorResp(c, err, http.StatusInternalServerError)
 		return
 	}
-	common.SuccessResp(c, gin.H{"run": run, "candidate_count": candidates, "can_cancel": canCancel})
+	common.SuccessResp(c, gin.H{
+		"run": run, "has_task": run != nil, "active": active,
+		"candidate_count": candidates, "can_cancel": canCancel, "can_clear": canClear,
+	})
 }
 
 func WebDAVWritebackReconciliationCandidates(c *gin.Context) {
@@ -138,6 +147,23 @@ func WebDAVWritebackReconciliationFinish(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, gin.H{"finished": true})
+}
+
+func WebDAVWritebackReconciliationClear(c *gin.Context) {
+	var req webDAVReconciliationAction
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	if err := writeback.ClearReconciliation(req.RunID); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			common.ErrorResp(c, err, http.StatusNotFound)
+			return
+		}
+		common.ErrorResp(c, err, http.StatusConflict)
+		return
+	}
+	common.SuccessResp(c, gin.H{"cleared": true})
 }
 
 func WebDAVWritebackReconciliationCancel(c *gin.Context) {

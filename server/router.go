@@ -214,6 +214,7 @@ func admin(g *gin.RouterGroup) {
 	webdavWriteback.POST("/reconciliation/delete-extras", handles.WebDAVWritebackReconciliationDeleteExtras)
 	webdavWriteback.POST("/reconciliation/finish", handles.WebDAVWritebackReconciliationFinish)
 	webdavWriteback.POST("/reconciliation/cancel", handles.WebDAVWritebackReconciliationCancel)
+	webdavWriteback.POST("/reconciliation/clear", handles.WebDAVWritebackReconciliationClear)
 }
 
 func fsAndShare(g *gin.RouterGroup) {
