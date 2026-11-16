@@ -210,6 +210,7 @@ func admin(g *gin.RouterGroup) {
 	webdavWriteback.GET("/reconciliation/candidates", handles.WebDAVWritebackReconciliationCandidates)
 	webdavWriteback.POST("/reconciliation/start", handles.WebDAVWritebackReconciliationStart)
 	webdavWriteback.POST("/reconciliation/finish-collection", handles.WebDAVWritebackReconciliationFinishCollection)
+	webdavWriteback.POST("/reconciliation/start-comparison", handles.WebDAVWritebackReconciliationStartComparison)
 	webdavWriteback.POST("/reconciliation/delete-extras", handles.WebDAVWritebackReconciliationDeleteExtras)
 	webdavWriteback.POST("/reconciliation/finish", handles.WebDAVWritebackReconciliationFinish)
 	webdavWriteback.POST("/reconciliation/cancel", handles.WebDAVWritebackReconciliationCancel)

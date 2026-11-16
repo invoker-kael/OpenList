@@ -1381,3 +1381,70 @@ func TestCompletedRemoteReconciliationAcceptsAnyMatchingSameNameObject(t *testin
 		t.Fatalf("matching same-name object did not preserve completion: state=%q canonical=%q verify_count=%d verified_at=%v remote_generation=%d", row.State, row.CanonicalState, row.VerifyCount, row.RemoteVerifiedAt, row.RemoteGeneration)
 	}
 }
+
+
+func TestFinishReconciliationCollectionWaitsForExplicitComparison(t *testing.T) {
+	database, _ := setupUploadLifecycleTest(t)
+	run := model.WebDAVWritebackReconcileRun{Root: "/backup", State: ReconcileStateCollecting}
+	if err := database.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	finished, err := FinishReconciliationCollection(run.ID)
+	if err != nil || !finished {
+		t.Fatalf("finish collection = (%v, %v), want (true, nil)", finished, err)
+	}
+	if err := database.Take(&run, run.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if run.State != ReconcileStateCollected {
+		t.Fatalf("run state = %q, want %q", run.State, ReconcileStateCollected)
+	}
+	reconciliationJobs.Lock()
+	started := reconciliationJobs.runs[run.ID]
+	reconciliationJobs.Unlock()
+	if started {
+		t.Fatal("comparison started automatically when collection ended")
+	}
+}
+
+func TestReconciliationWebDAVViewStaysEmptyUntilCollectionEnds(t *testing.T) {
+	database, _ := setupUploadLifecycleTest(t)
+	run := model.WebDAVWritebackReconcileRun{Root: "/backup", State: ReconcileStateCollecting}
+	if err := database.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	entry := model.WebDAVWritebackReconcileEntry{
+		RunID: run.ID, PathKey: pathKey("/backup/file.bin"), ParentKey: pathKey("/backup"),
+		Path: "/backup/file.bin", Parent: "/backup", Name: "file.bin", LocalPresent: true,
+		Size: 4, SHA1: strings.Repeat("a", 40),
+	}
+	if err := database.Create(&entry).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	root, found, active, err := ReconciliationViewObject("/backup")
+	if err != nil || !found || !active || root == nil {
+		t.Fatalf("reconciliation root = (%v, %v, %v, %v), want existing active root", root, found, active, err)
+	}
+	object, found, active, err := ReconciliationViewObject("/backup/file.bin")
+	if err != nil || found || !active || object != nil {
+		t.Fatalf("collected file visible during collection = (%v, %v, %v, %v), want hidden active path", object, found, active, err)
+	}
+	children, active, err := ReconciliationChildren("/backup")
+	if err != nil || !active || len(children) != 0 {
+		t.Fatalf("collection children = (%v, %v, %v), want an active empty listing", children, active, err)
+	}
+
+	if err := database.Model(&run).Update("state", ReconcileStateCollected).Error; err != nil {
+		t.Fatal(err)
+	}
+	object, found, active, err = ReconciliationViewObject("/backup/file.bin")
+	if err != nil || !found || !active || object == nil {
+		t.Fatalf("collected file after collection = (%v, %v, %v, %v), want visible manifest item", object, found, active, err)
+	}
+	children, active, err = ReconciliationChildren("/backup")
+	if err != nil || !active || len(children) != 1 {
+		t.Fatalf("post-collection children = (%v, %v, %v), want one manifest item", children, active, err)
+	}
+}

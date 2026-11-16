@@ -99,6 +99,20 @@ func WebDAVWritebackReconciliationFinishCollection(c *gin.Context) {
 	common.SuccessResp(c, gin.H{"started": started})
 }
 
+
+func WebDAVWritebackReconciliationStartComparison(c *gin.Context) {
+	var req webDAVReconciliationAction
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	started, err := writeback.StartReconciliationComparison(req.RunID)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusConflict)
+		return
+	}
+	common.SuccessResp(c, gin.H{"started": started})
+}
 func WebDAVWritebackReconciliationDeleteExtras(c *gin.Context) {
 	var req webDAVReconciliationAction
 	if err := c.ShouldBindJSON(&req); err != nil {

@@ -25,6 +25,7 @@ import (
 
 const (
 	ReconcileStateCollecting   = "collecting"
+	ReconcileStateCollected    = "collected"
 	ReconcileStateComparing    = "comparing"
 	ReconcileStateCompareError = "compare_failed"
 	ReconcileStatePreview      = "preview"
@@ -65,6 +66,7 @@ var reconciliationJobs = struct {
 func activeReconciliationStates() []string {
 	return []string{
 		ReconcileStateCollecting,
+		ReconcileStateCollected,
 		ReconcileStateComparing,
 		ReconcileStateCompareError,
 		ReconcileStatePreview,
@@ -135,6 +137,9 @@ func ReconciliationViewObject(p string) (model.Obj, bool, bool, error) {
 	root := utils.FixAndCleanPath(run.Root)
 	if p == root {
 		return reconciliationCanonicalObject(run.ID, root, path.Base(root), 0, true, run.UpdatedAt, ""), true, true, nil
+	}
+	if run.State == ReconcileStateCollecting {
+		return nil, false, true, nil
 	}
 	var entry model.WebDAVWritebackReconcileEntry
 	err = db.GetDb().Where("run_id = ? AND path_key = ? AND local_present = ?", run.ID, pathKey(p), true).Take(&entry).Error
@@ -241,6 +246,9 @@ func ReconciliationChildren(parent string) ([]model.Obj, bool, error) {
 	run, applies, err := reconciliationForPath(parent)
 	if err != nil || !applies || run == nil {
 		return nil, false, err
+	}
+	if run.State == ReconcileStateCollecting {
+		return []model.Obj{}, true, nil
 	}
 	var entries []model.WebDAVWritebackReconcileEntry
 	if err := db.GetDb().Where("run_id = ? AND parent_key = ? AND local_present = ?", run.ID, pathKey(parent), true).
@@ -657,14 +665,47 @@ func FinishReconciliationCollection(runID uint) (bool, error) {
 	if run.ID != runID {
 		return false, errors.New("the reconciliation run changed; refresh before continuing")
 	}
-	if run.State != ReconcileStateCollecting && run.State != ReconcileStateCompareError && run.State != ReconcileStateDeleteError {
+	if run.State == ReconcileStateCompareError || run.State == ReconcileStateDeleteError {
+		return startReconciliationComparisonLocked(run)
+	}
+	if run.State != ReconcileStateCollecting {
 		return false, nil
 	}
 	now := time.Now()
 	res := db.GetDb().Model(&model.WebDAVWritebackReconcileRun{}).
-		Where("id = ? AND state IN ?", run.ID, []string{ReconcileStateCollecting, ReconcileStateCompareError, ReconcileStateDeleteError}).
+		Where("id = ? AND state = ?", run.ID, ReconcileStateCollecting).
 		Updates(map[string]any{
-			"state": ReconcileStateComparing, "last_error": "", "collection_ended_at": &now,
+			"state": ReconcileStateCollected, "last_error": "", "collection_ended_at": &now,
+		})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
+}
+
+func StartReconciliationComparison(runID uint) (bool, error) {
+	if !rebuildGate.TryLock() {
+		return false, errors.New("wait for active Cloud Sync PUT requests to finish")
+	}
+	defer rebuildGate.Unlock()
+	run, err := currentReconciliation()
+	if err != nil || run == nil {
+		return false, err
+	}
+	if run.ID != runID {
+		return false, errors.New("the reconciliation run changed; refresh before continuing")
+	}
+	return startReconciliationComparisonLocked(run)
+}
+
+func startReconciliationComparisonLocked(run *model.WebDAVWritebackReconcileRun) (bool, error) {
+	if run.State != ReconcileStateCollected && run.State != ReconcileStateCompareError && run.State != ReconcileStateDeleteError {
+		return false, nil
+	}
+	res := db.GetDb().Model(&model.WebDAVWritebackReconcileRun{}).
+		Where("id = ? AND state IN ?", run.ID, []string{ReconcileStateCollected, ReconcileStateCompareError, ReconcileStateDeleteError}).
+		Updates(map[string]any{
+			"state": ReconcileStateComparing, "last_error": "",
 			"compared_at": nil, "remote_files": 0, "matched_files": 0,
 			"missing_files": 0, "extra_files": 0, "unknown_files": 0,
 			"scanned_directories": 0,
@@ -678,7 +719,6 @@ func FinishReconciliationCollection(runID uint) (bool, error) {
 	startReconciliationJob(run.ID, runReconciliationComparison)
 	return true, nil
 }
-
 func CancelReconciliation(runID uint) error {
 	if !rebuildGate.TryLock() {
 		return errors.New("wait for active Cloud Sync PUT requests to finish")
@@ -689,7 +729,7 @@ func CancelReconciliation(runID uint) error {
 	err := db.GetDb().Transaction(func(tx *gorm.DB) error {
 		var run model.WebDAVWritebackReconcileRun
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND state IN ?", runID, []string{
-			ReconcileStateCollecting, ReconcileStateCompareError, ReconcileStatePreview,
+			ReconcileStateCollecting, ReconcileStateCollected, ReconcileStateCompareError, ReconcileStatePreview,
 		}).Take(&run).Error; err != nil {
 			return err
 		}
@@ -791,7 +831,7 @@ func ReconciliationCanCancel(runID uint) (bool, error) {
 	if err := db.GetDb().Take(&run, runID).Error; err != nil {
 		return false, err
 	}
-	return run.State == ReconcileStateCollecting || run.State == ReconcileStateCompareError || run.State == ReconcileStatePreview, nil
+	return run.State == ReconcileStateCollecting || run.State == ReconcileStateCollected || run.State == ReconcileStateCompareError || run.State == ReconcileStatePreview, nil
 }
 
 func ReconciliationCandidateCount() (int64, error) {
