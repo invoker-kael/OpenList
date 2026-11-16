@@ -1382,7 +1382,6 @@ func TestCompletedRemoteReconciliationAcceptsAnyMatchingSameNameObject(t *testin
 	}
 }
 
-
 func TestFinishReconciliationCollectionWaitsForExplicitComparison(t *testing.T) {
 	database, _ := setupUploadLifecycleTest(t)
 	run := model.WebDAVWritebackReconcileRun{Root: "/backup", State: ReconcileStateCollecting}
