@@ -29,14 +29,22 @@ func ListUsers(c *gin.Context) {
 	})
 }
 
+func isValidNewUserRole(role int) bool {
+	return role == model.GENERAL || role == model.ADMIN
+}
+
 func CreateUser(c *gin.Context) {
 	var req model.User
 	if err := c.ShouldBind(&req); err != nil {
 		common.ErrorResp(c, err, 400)
 		return
 	}
-	if req.IsAdmin() || req.IsGuest() {
-		common.ErrorStrResp(c, "admin or guest user can not be created", 400, true)
+	if !isValidNewUserRole(req.Role) {
+		message := "invalid user role"
+		if req.IsGuest() {
+			message = "guest user can not be created"
+		}
+		common.ErrorStrResp(c, message, 400, true)
 		return
 	}
 	req.SetPassword(req.Password)
