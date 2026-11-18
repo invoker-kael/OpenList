@@ -12,6 +12,8 @@ on:
       - "internal/conf/**"
       - "server/webdav/**"
       - "server/handles/webdav_writeback.go"
+      - "server/handles/user.go"
+      - "server/handles/user_test.go"
       - "server/router.go"
       - "drivers/115/**"
       - ".github/workflows/writeback.yml"
@@ -24,6 +26,8 @@ on:
       - "server/webdav/**"
       - "server/common/proxy.go"
       - "server/common/proxy_test.go"
+      - "server/handles/user.go"
+      - "server/handles/user_test.go"
       - "drivers/115_open/**"
       - "drivers/115/**"
       - "internal/model/webdav_writeback.go"
@@ -81,6 +85,8 @@ jobs:
             server/common/proxy.go
             server/common/proxy_test.go
             server/handles/webdav_writeback.go
+            server/handles/user.go
+            server/handles/user_test.go
             server/router.go
             drivers/115/driver.go
             drivers/115/driver_test.go
